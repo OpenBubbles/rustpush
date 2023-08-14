@@ -1,0 +1,23 @@
+[package]
+name = "rustpush"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+lazy_static = "1.4.0"
+plist = "1.5.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "default-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+openssl = "0.10.56"
+uuid = { version = "1.4.1", features = ["v4"] }
+base64 = "0.21.2"
+regex = "1.9.3"
+tokio-rustls = "0.24.1"
+rustls = { version = "0.21.6", features = ["dangerous_configuration"] }
+rustls-pemfile = "1.0.3"
+rand = "0.8.5"
+ringbuf = "0.3.3"
+serde_json = "1.0.104"
