@@ -6,6 +6,7 @@ use ids::user::{IDSState, get_handles};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use util::{base64_encode, base64_decode};
+use crate::ids::identity::IDSIdentity;
 
 use crate::apns::APNSConnection;
 use crate::ids::user::IDSUser;
@@ -34,7 +35,7 @@ async fn main() {
     connection.submitter.set_state(1).await;
     connection.submitter.filter(&["com.apple.madrid"]).await;
 
-    let user = if let Some(state) = saved_state.as_ref() {
+    let mut user = if let Some(state) = saved_state.as_ref() {
         IDSUser::restore_authentication(connection.clone(), state.auth.clone())
     } else {
         let stdin = io::stdin();
@@ -57,6 +58,17 @@ async fn main() {
             code.trim().to_string()
         }).await.unwrap()
     };
+
+    if user.state.identity.is_none() {
+        println!("Registering new identity...");
+        print!("Enter validation data: ");
+        io::stdout().flush().await.unwrap();
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin);
+        let mut validation = String::new();
+        reader.read_line(&mut validation).await.unwrap();
+        user.state.identity = Some(IDSIdentity::new(&validation, &user, &connection.state).await.unwrap())
+    }
 
     let state = SavedState {
         push: connection.state.clone(),

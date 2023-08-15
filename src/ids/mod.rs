@@ -4,6 +4,7 @@ use crate::bags::BagError;
 
 pub mod user;
 mod signing;
+pub mod identity;
 
 #[derive(Debug)]
 pub enum IDSError {
@@ -12,7 +13,8 @@ pub enum IDSError {
     RequestError(reqwest::Error),
     AuthError(plist::Value),
     BagError(BagError),
-    CertError(plist::Dictionary)
+    CertError(plist::Dictionary),
+    RegisterFailed(u64)
 }
 
 impl From<BagError> for IDSError {

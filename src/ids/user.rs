@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde::Deserialize;
 use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
 
-use super::IDSError;
+use super::{IDSError, identity::IDSIdentity};
 
 
 
@@ -146,9 +146,10 @@ pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APN
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSState {
-    auth_keypair: KeyPair,
-    user_id: String,
-    handles: Vec<String>
+    pub auth_keypair: KeyPair,
+    pub user_id: String,
+    pub handles: Vec<String>,
+    pub identity: Option<IDSIdentity>
 }
 
 pub struct IDSUser {
@@ -171,8 +172,9 @@ impl IDSUser {
             conn,
             state: IDSState {
                 auth_keypair,
-                user_id: username.to_string(),
-                handles
+                user_id,
+                handles,
+                identity: None
             }
         })
     }

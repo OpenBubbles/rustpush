@@ -8,7 +8,7 @@ use uuid::Uuid;
 use serde::Serialize;
 use regex::Regex;
 
-use crate::util::{plist_to_string, plist_to_buf, KeyPair};
+use crate::util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value};
 
 
 #[derive(Debug)]
@@ -90,14 +90,6 @@ fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInf
         serial_number: "WindowSerial".to_string(),
         unique_device_id: Uuid::new_v4().to_string()
     })
-}
-
-fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
-    let mut curr_val = val;
-    for el in path {
-        curr_val = curr_val.as_dictionary()?.get(el)?;
-    }
-    Some(curr_val)
 }
 
 // Generates an APNs push certificate by talking to Albert

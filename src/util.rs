@@ -1,10 +1,18 @@
 use std::io::Cursor;
 
 use base64::engine::general_purpose;
-use plist::Error;
+use plist::{Error, Value};
 use base64::Engine;
 use rustls::{Certificate, PrivateKey};
 use serde::{Serialize, Deserialize};
+
+pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
+    let mut curr_val = val;
+    for el in path {
+        curr_val = curr_val.as_dictionary()?.get(el)?;
+    }
+    Some(curr_val)
+}
 
 // both in der
 #[derive(Serialize, Deserialize, Clone)]
@@ -26,7 +34,7 @@ pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 pub fn base64_decode(data: &str) -> Vec<u8> {
-    general_purpose::STANDARD.decode(data).unwrap()
+    general_purpose::STANDARD.decode(data.trim()).unwrap()
 }
 
 pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, Error> {
