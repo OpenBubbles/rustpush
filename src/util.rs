@@ -7,6 +7,9 @@ use base64::Engine;
 pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
+pub fn base64_decode(data: &str) -> Vec<u8> {
+    general_purpose::STANDARD.decode(data).unwrap()
+}
 
 pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, Error> {
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())

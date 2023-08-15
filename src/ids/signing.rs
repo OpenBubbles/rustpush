@@ -29,7 +29,7 @@ fn create_payload(bag_key: &str, query_string: &str, push_token: &[u8], payload:
             query_string.as_bytes().to_vec(),
             (payload.len() as u32).to_be_bytes().to_vec(),
             payload.to_vec(),
-            push_token.len().to_be_bytes().to_vec(),
+            (push_token.len() as u32).to_be_bytes().to_vec(),
             push_token.to_vec()
         ].concat(),
         nonce
@@ -43,6 +43,7 @@ fn sign_payload(private_key: &[u8], bag_key: &str, query_string: &str, push_toke
     signer.set_rsa_padding(Padding::PKCS1)?;
 
     let (payload, nonce) = create_payload(bag_key, query_string, push_token, payload);
+
     let signature = [[0x1,0x1].to_vec(), signer.sign_oneshot_to_vec(&payload)?].concat();
 
     Ok((signature, nonce))

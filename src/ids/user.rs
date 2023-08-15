@@ -120,7 +120,7 @@ struct HandleResult {
     handles: Vec<ResultHandle>
 }
 
-async fn get_handles(user_id: &str, auth_keypair: &(Vec<u8>, Vec<u8>), push_state: &APNSState) -> Result<Vec<String>, IDSError> {
+pub async fn get_handles(user_id: &str, auth_keypair: &(Vec<u8>, Vec<u8>), push_state: &APNSState) -> Result<Vec<String>, IDSError> {
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true).build().unwrap();
