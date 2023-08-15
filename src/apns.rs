@@ -10,7 +10,7 @@ use std::net::ToSocketAddrs;
 use tokio::io::split;
 use serde::{Serialize, Deserialize};
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair};
 
 #[derive(Debug)]
 struct APNSPayload {
@@ -151,8 +151,7 @@ pub struct APNSConnection {
 // serialize this to JSON to save state
 #[derive(Serialize, Deserialize, Clone)]
 pub struct APNSState {
-    pub private_key: Vec<u8>,
-    pub cert: Vec<u8>,
+    pub keypair: KeyPair,
     pub token: Option<Vec<u8>>
 }
 
@@ -201,8 +200,8 @@ impl APNSConnection {
         let mut config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(DangerousVerifier()))
-            .with_client_auth_cert(vec![Certificate(state.cert.clone())], 
-                    PrivateKey(state.private_key.clone()))?;
+            .with_client_auth_cert(vec![state.keypair.rustls_cert()], 
+            state.keypair.rustls_key())?;
         config.alpn_protocols.push(b"apns-security-v2".to_vec());
 
         let connector = TlsConnector::from(Arc::new(config));
@@ -238,10 +237,9 @@ impl APNSConnection {
         let mut state = match state {
             Some(state) => state,
             None => {
-                let (private_key, cert) = generate_push_cert().await.unwrap();
+                let keypair = generate_push_cert().await.unwrap();
                 APNSState {
-                    private_key,
-                    cert,
+                    keypair,
                     token: None
                 }
             }

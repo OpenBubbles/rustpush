@@ -6,7 +6,7 @@ use plist::{Value, Data};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
+use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
 
 use super::IDSError;
 
@@ -84,7 +84,7 @@ fn gen_csr(priv_key: &PKey<Private>) -> Result<Vec<u8>, IDSError> {
 }
 
 /* result is in der format (private, public) */
-async fn get_auth_cert(user_id: &str, token: &str) -> Result<(Vec<u8>, Vec<u8>), IDSError> {
+async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, IDSError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let body = AuthCertRequest {
         authentication_data: AuthCertData { auth_token: token.to_string() },
@@ -108,7 +108,7 @@ async fn get_auth_cert(user_id: &str, token: &str) -> Result<(Vec<u8>, Vec<u8>),
         return Err(IDSError::CertError(protocol.clone()))
     }
     let cert = protocol.get("cert").unwrap().as_data().unwrap().to_vec();
-    Ok((private_key.private_key_to_der()?, cert))
+    Ok(KeyPair { cert: cert, private: private_key.private_key_to_der()? })
 }
 
 #[derive(Deserialize)]
@@ -120,7 +120,7 @@ struct HandleResult {
     handles: Vec<ResultHandle>
 }
 
-pub async fn get_handles(user_id: &str, auth_keypair: &(Vec<u8>, Vec<u8>), push_state: &APNSState) -> Result<Vec<String>, IDSError> {
+pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, IDSError> {
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true).build().unwrap();
@@ -137,7 +137,6 @@ pub async fn get_handles(user_id: &str, auth_keypair: &(Vec<u8>, Vec<u8>), push_
             .await?;
     
     let data = resp.bytes().await?;
-    println!("data {}", std::str::from_utf8(&data).unwrap());
     let parsed: HandleResult = plist::from_bytes(&data)?;
     let handles: Vec<String> = parsed.handles.iter().map(|h| h.uri.clone()).collect();
 
@@ -147,7 +146,7 @@ pub async fn get_handles(user_id: &str, auth_keypair: &(Vec<u8>, Vec<u8>), push_
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSState {
-    auth_keypair: (Vec<u8>, Vec<u8>),
+    auth_keypair: KeyPair,
     user_id: String,
     handles: Vec<String>
 }

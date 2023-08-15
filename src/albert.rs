@@ -8,7 +8,7 @@ use uuid::Uuid;
 use serde::Serialize;
 use regex::Regex;
 
-use crate::util::{plist_to_string, plist_to_buf};
+use crate::util::{plist_to_string, plist_to_buf, KeyPair};
 
 
 #[derive(Debug)]
@@ -102,7 +102,7 @@ fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
 
 // Generates an APNs push certificate by talking to Albert
 // Returns (private key PEM, certificate PEM) (actual data buffers)
-pub async fn generate_push_cert() -> Result<(Vec<u8>, Vec<u8>), CertGenError> {
+pub async fn generate_push_cert() -> Result<KeyPair, CertGenError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let activation_info = build_activation_info(private_key.as_ref())?;
 
@@ -141,6 +141,8 @@ pub async fn generate_push_cert() -> Result<(Vec<u8>, Vec<u8>), CertGenError> {
     let protocol = plist::Value::from_reader(Cursor::new(protocol_raw.as_str()))?;
     let certificate = get_nested_value(&protocol, &["device-activation", "activation-record", "DeviceCertificate"]).unwrap().as_data().unwrap();
 
-    Ok((private_key.rsa().unwrap().private_key_to_der()?,
-        rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec())).unwrap().into_iter().nth(0).unwrap()))
+    Ok(KeyPair {
+        private: private_key.rsa().unwrap().private_key_to_der()?,
+        cert: rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec())).unwrap().into_iter().nth(0).unwrap()
+    })
 }

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use openssl::{rsa::Padding, pkey::PKey, hash::MessageDigest, sign::Signer};
 use reqwest::RequestBuilder;
 
-use crate::{apns::APNSState, util::base64_encode};
+use crate::{apns::APNSState, util::{base64_encode, KeyPair}};
 use rand::Rng;
 
 use super::IDSError;
@@ -49,18 +49,18 @@ fn sign_payload(private_key: &[u8], bag_key: &str, query_string: &str, push_toke
     Ok((signature, nonce))
 }
 
-pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: &(Vec<u8>, Vec<u8>), push_state: &APNSState, auth_number: Option<u8>) -> Result<RequestBuilder, IDSError> {
+pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: &KeyPair, push_state: &APNSState, auth_number: Option<u8>) -> Result<RequestBuilder, IDSError> {
     let push_token = push_state.token.as_ref().unwrap();
     
-    let (push_sig, push_nonce) = sign_payload(&push_state.private_key, bag_key, "", push_token, body)?;
+    let (push_sig, push_nonce) = sign_payload(&push_state.keypair.private, bag_key, "", push_token, body)?;
     let req = req.header("x-push-sig", base64_encode(&push_sig))
         .header("x-push-nonce", base64_encode(&push_nonce))
-        .header("x-push-cert", base64_encode(&push_state.cert))
+        .header("x-push-cert", base64_encode(&push_state.keypair.cert))
         .header("x-push-token", base64_encode(&push_token));
 
-    let (auth_sig, auth_nonce) = sign_payload(&auth_key.0, bag_key, "", push_token, body)?;
+    let (auth_sig, auth_nonce) = sign_payload(&auth_key.private, bag_key, "", push_token, body)?;
     let postfix = if let Some(auth_number) = auth_number { format!("-{}", auth_number) } else { "".to_string() };
     Ok(req.header("x-auth-sig".to_owned() + &postfix, base64_encode(&auth_sig))
         .header("x-auth-nonce".to_owned() + &postfix, base64_encode(&auth_nonce))
-        .header("x-auth-cert".to_owned() + &postfix, base64_encode(&push_state.cert)))
+        .header("x-auth-cert".to_owned() + &postfix, base64_encode(&auth_key.cert)))
 }

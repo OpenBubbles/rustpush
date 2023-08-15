@@ -3,6 +3,24 @@ use std::io::Cursor;
 use base64::engine::general_purpose;
 use plist::Error;
 use base64::Engine;
+use rustls::{Certificate, PrivateKey};
+use serde::{Serialize, Deserialize};
+
+// both in der
+#[derive(Serialize, Deserialize, Clone)]
+pub struct KeyPair {
+    pub cert: Vec<u8>,
+    pub private: Vec<u8>
+}
+
+impl KeyPair {
+    pub fn rustls_cert(&self) -> Certificate {
+        Certificate(self.cert.clone())
+    }
+    pub fn rustls_key(&self) -> PrivateKey {
+        PrivateKey(self.private.clone())
+    }
+}
 
 pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
