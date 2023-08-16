@@ -13,7 +13,7 @@ use serde::Deserialize;
 pub struct IDSIdentity {
     signing_key: Vec<u8>,
     encryption_key: Vec<u8>,
-    id_keypair: KeyPair
+    pub id_keypair: KeyPair
 }
 
 fn encode(encryption_key: &PKey<Private>, signing_key: &PKey<Private>) -> Vec<u8> {

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
-use openssl::sha::Sha1;
+use openssl::sha::{Sha1, sha1};
 use ringbuf::{HeapConsumer, HeapRb};
 use rustls::{Certificate, PrivateKey, client::{ServerCertVerifier, ServerCertVerified}};
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::Mutex};
@@ -13,9 +13,9 @@ use serde::{Serialize, Deserialize};
 use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair};
 
 #[derive(Debug)]
-struct APNSPayload {
-    id: u8,
-    fields: Vec<(u8, Vec<u8>)>
+pub struct APNSPayload {
+    pub id: u8,
+    pub fields: Vec<(u8, Vec<u8>)>
 }
 
 impl APNSPayload {
@@ -50,7 +50,7 @@ impl APNSPayload {
         }))
     }
 
-    fn get_field(&self, field: u8) -> Option<&Vec<u8>> {
+    pub fn get_field(&self, field: u8) -> Option<&Vec<u8>> {
         self.fields.iter().find(|f| f.0 == field).map(|i| &i.1)
     }
 
@@ -81,6 +81,16 @@ impl APNSSubmitter {
         self.send_payload(0x14, vec![(1, state.to_be_bytes().to_vec()), (2, magic_num.to_be_bytes().to_vec())]).await;
     }
 
+    async fn send_message(&self, topic: &str, payload: &[u8]) {
+        let id = rand::thread_rng().gen::<[u8; 4]>();
+        self.send_payload(0x0A, vec![
+            (4, id.to_vec()),
+            (1, sha1(topic.as_bytes()).to_vec()),
+            (2, self.1.clone()),
+            (3, payload.to_vec())
+        ]).await;
+    }
+
     async fn keep_alive(&self) {
         self.send_payload(0x0C, vec![]).await;
         println!("Sending keep alive");
@@ -103,7 +113,7 @@ impl APNSSubmitter {
     }
 }
 
-struct APNSReader(Arc<Mutex<Vec<APNSPayload>>>);
+pub struct APNSReader(Arc<Mutex<Vec<APNSPayload>>>);
 
 impl APNSReader {
     fn new(mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter) -> APNSReader {
@@ -111,7 +121,9 @@ impl APNSReader {
         let reader_clone = reader.clone();
         tokio::spawn(async move {
             loop {
-                let Ok(payload) = APNSPayload::read(&mut read).await else {
+                let result = APNSPayload::read(&mut read).await;
+                let Ok(payload) = result else {
+                    println!("conn broken? {:?}", result);
                     break // maybe conn broken?
                 };
                 let Some(payload) = payload else {
@@ -128,11 +140,14 @@ impl APNSReader {
         APNSReader(reader)
     }
 
-    async fn wait_find(&self, id: u8) -> APNSPayload {
+    pub async fn wait_find_pred<F>(&self, mut p: F) -> APNSPayload
+    where
+        F: FnMut(&APNSPayload) -> bool,
+    {
         let mut interval = time::interval(Duration::from_millis(100));
         loop {
             let mut locked = self.0.lock().await;
-            let item = locked.iter().position(|item| item.id == id);
+            let item = locked.iter().position(|item| p(item));
             if let Some(item) = item {
                 return locked.remove(item);
             }
@@ -140,12 +155,16 @@ impl APNSReader {
             interval.tick().await;
         }
     }
+
+    pub async fn wait_find(&self, id: u8) -> APNSPayload {
+        self.wait_find_pred(|item| item.id == id).await
+    }
 }
 
 pub struct APNSConnection {
     pub submitter: APNSSubmitter,
     pub state: APNSState,
-    reader: APNSReader
+    pub reader: APNSReader
 }
 
 // serialize this to JSON to save state
@@ -221,6 +240,14 @@ impl APNSConnection {
         println!("Connected to APNs ({})", host);
 
         Ok(connection)
+    }
+
+    pub async fn send_message(&self, topic: &str, payload: &[u8]) {
+        self.submitter.send_message(topic, payload).await;
+        let msg = self.reader.wait_find(0x0B).await;
+        if msg.get_field(8).unwrap()[0] != 0x0 {
+            panic!("Failed to send message");
+        }
     }
 
     fn init_conn(write: APNSSubmitter) {

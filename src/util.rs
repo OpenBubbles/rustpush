@@ -47,3 +47,10 @@ pub fn plist_to_buf<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     plist::to_writer_xml(writer, &value)?;
     Ok(buf)
 }
+
+pub fn plist_to_bin<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    let writer = Cursor::new(&mut buf);
+    plist::to_writer_binary(writer, &value)?;
+    Ok(buf)
+}

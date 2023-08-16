@@ -1,6 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{time::{SystemTime, UNIX_EPOCH}, collections::HashMap};
 
 use openssl::{rsa::Padding, pkey::PKey, hash::MessageDigest, sign::Signer};
+use plist::Dictionary;
 use reqwest::RequestBuilder;
 
 use crate::{apns::APNSState, util::{base64_encode, KeyPair}};
@@ -63,4 +64,13 @@ pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: 
     Ok(req.header("x-auth-sig".to_owned() + &postfix, base64_encode(&auth_sig))
         .header("x-auth-nonce".to_owned() + &postfix, base64_encode(&auth_nonce))
         .header("x-auth-cert".to_owned() + &postfix, base64_encode(&auth_key.cert)))
+}
+
+pub fn add_id_signature(headers: &mut Dictionary, body: &[u8], bag_key: &str, id_key: &KeyPair, push_token: &[u8]) -> Result<(), IDSError> {
+    let (id_sig, id_nonce) = sign_payload(&id_key.private, bag_key, "", push_token, body)?;
+    headers.insert("x-id-sig".to_string(), base64_encode(&id_sig).into());
+    headers.insert("x-id-nonce".to_string(), base64_encode(&id_nonce).into());
+    headers.insert("x-id-cert".to_string(), base64_encode(&id_key.cert).into());
+    headers.insert("x-push-token".to_string(), base64_encode(&push_token).into());
+    Ok(())
 }

@@ -1,14 +1,17 @@
 use std::{rc::Rc, io::Cursor, future::Future};
 
 use base64::{engine::general_purpose, Engine};
+use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, error::ErrorStack, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
-use plist::{Value, Data};
+use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
+use std::io::Write;
+use std::io::Read;
+use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair, plist_to_bin}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
 
-use super::{IDSError, identity::IDSIdentity};
+use super::{IDSError, identity::IDSIdentity, signing::add_id_signature};
 
 
 
@@ -157,6 +160,11 @@ pub struct IDSUser {
     pub state: IDSState
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct LookupReq {
+    uris: Vec<String>
+}
+
 impl IDSUser {
     pub fn restore_authentication(conn: Rc<APNSConnection>, state: IDSState) -> IDSUser {
         IDSUser { conn, state }
@@ -177,5 +185,80 @@ impl IDSUser {
                 identity: None
             }
         })
+    }
+
+    pub async fn register_id(&mut self, state: &APNSState, validation: &str) -> Result<(), IDSError> {
+        self.state.identity = Some(IDSIdentity::new(&validation, self, state).await?);
+        Ok(())
+    }
+
+    pub async fn lookup(&self, conn: Rc<APNSConnection>, query: Vec<String>) -> Result<(), IDSError> {
+        let body = plist_to_string(&LookupReq { uris: query })?;
+
+        // gzip encode
+        let header = HeaderBuilder::new().modification_time(0).finish();
+        let options = EncodeOptions::new().header(header);
+        let mut encoder = Encoder::with_options(Vec::new(), options)?;
+        encoder.write_all(body.as_bytes())?;
+        let encoded = encoder.finish().into_result()?;
+
+        let handle = self.state.handles.first().unwrap();
+        let mut headers = Dictionary::from_iter([
+            ("x-id-self-uri", Value::String(handle.clone())),
+            ("x-protocol-version", "1640".into())
+        ].into_iter());
+
+        add_id_signature(&mut headers, &encoded, "id-query", 
+            &self.state.identity.as_ref().unwrap().id_keypair, &conn.state.token.as_ref().unwrap())?;
+        
+        let msg_id = rand::thread_rng().gen::<[u8; 16]>();
+        let ids_bag = get_bag(IDS_BAG).await?;
+
+        let request = Value::Dictionary(Dictionary::from_iter([
+            ("cT", Value::String("application/x-apple-plist".to_string())),
+            ("U", Value::Data(msg_id.to_vec())),
+            ("c", 96.into()),
+            ("u", ids_bag.get("id-query").unwrap().as_string().unwrap().into()),
+            ("h", headers.into()),
+            ("v", 2.into()),
+            ("b", Value::Data(encoded))
+        ].into_iter()));
+        println!("sending msg");
+        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?).await;
+        println!("finding msg");
+
+        let response = conn.reader.wait_find_pred(|x| {
+            if x.id != 0x0A {
+                return false
+            }
+            let Some(body) = x.get_field(3) else {
+                return false
+            };
+            let loaded: Value = plist::from_bytes(body).unwrap();
+            let resp_id = loaded.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
+            return resp_id == msg_id
+        }).await;
+
+        println!("found msg");
+
+        let data = response.get_field(3).unwrap();
+        let loaded: Value = plist::from_bytes(data).unwrap();
+        
+        // gzip decode
+        let mut decoder = Decoder::new(loaded.as_dictionary().unwrap().get("b").unwrap().as_data().unwrap()).unwrap();
+        let mut decoded_data = Vec::new();
+        decoder.read_to_end(&mut decoded_data).unwrap();
+
+        let loaded: Value = plist::from_bytes(&decoded_data).unwrap();
+        let dict = loaded.as_dictionary().unwrap();
+        let status = dict.get("status").unwrap().as_unsigned_integer().unwrap();
+        if status != 0 {
+            return Err(IDSError::LookupFailed(status))
+        }
+
+        let results = dict.get("results").unwrap().as_dictionary().unwrap();
+        println!("results {:?}", results);
+
+        Ok(())
     }
 }

@@ -3,10 +3,14 @@ use std::rc::Rc;
 
 use apns::APNSState;
 use ids::user::{IDSState, get_handles};
+use imessage::IMClient;
+use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use util::{base64_encode, base64_decode};
 use crate::ids::identity::IDSIdentity;
+
+use tokio::time::{sleep, Duration};
 
 use crate::apns::APNSConnection;
 use crate::ids::user::IDSUser;
@@ -16,6 +20,7 @@ mod albert;
 mod apns;
 mod ids;
 mod util;
+mod imessage;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -67,8 +72,17 @@ async fn main() {
         let mut reader = BufReader::new(stdin);
         let mut validation = String::new();
         reader.read_line(&mut validation).await.unwrap();
-        user.state.identity = Some(IDSIdentity::new(&validation, &user, &connection.state).await.unwrap())
+        user.register_id(&connection.state, &validation).await.unwrap();
     }
+
+    //let lookup = user.lookup(connection.clone(), vec!["tel:+17203818329".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
+
+    let user = Rc::new(user);
+    let client = IMClient::new(connection.clone(), user.clone());
+
+    sleep(Duration::from_millis(10000)).await;
+    
+    
 
     let state = SavedState {
         push: connection.state.clone(),

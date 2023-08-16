@@ -1,3 +1,5 @@
+use std::io;
+
 use openssl::error::ErrorStack;
 
 use crate::bags::BagError;
@@ -14,7 +16,15 @@ pub enum IDSError {
     AuthError(plist::Value),
     BagError(BagError),
     CertError(plist::Dictionary),
-    RegisterFailed(u64)
+    RegisterFailed(u64),
+    IoError(io::Error),
+    LookupFailed(u64)
+}
+
+impl From<io::Error> for IDSError {
+    fn from(value: io::Error) -> Self {
+        IDSError::IoError(value)
+    }
 }
 
 impl From<BagError> for IDSError {
