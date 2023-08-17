@@ -1,4 +1,4 @@
-use std::{rc::Rc, io::Cursor, future::Future};
+use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap};
 
 use base64::{engine::general_purpose, Engine};
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
@@ -9,9 +9,9 @@ use serde::Serialize;
 use serde::Deserialize;
 use std::io::Write;
 use std::io::Read;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair, plist_to_bin}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
+use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair, plist_to_bin, gzip, ungzip}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
 
-use super::{IDSError, identity::IDSIdentity, signing::add_id_signature};
+use super::{IDSError, identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
 
 
@@ -165,6 +165,36 @@ struct LookupReq {
     uris: Vec<String>
 }
 
+
+// IDSLookup
+#[derive(Serialize, Deserialize, Clone)]
+struct IDSLookupResp {
+    status: u64,
+    results: Option<HashMap<String, IDSLookupResResp>>
+}
+#[derive(Serialize, Deserialize, Clone)]
+struct IDSLookupResResp {
+    identities: Vec<IDSIdentityRespRes>
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+struct IDSClientData {
+    public_message_identity_key: Data
+}
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "kebab-case")]
+struct IDSIdentityRespRes {
+    client_data: Option<IDSClientData>,
+    push_token: Data,
+    session_token: Data
+}
+
+pub struct IDSIdentityResult {
+    pub identity: IDSPublicIdentity,
+    pub push_token: Vec<u8>,
+    pub session_token: Vec<u8>
+}
+
 impl IDSUser {
     pub fn restore_authentication(conn: Rc<APNSConnection>, state: IDSState) -> IDSUser {
         IDSUser { conn, state }
@@ -192,15 +222,11 @@ impl IDSUser {
         Ok(())
     }
 
-    pub async fn lookup(&self, conn: Rc<APNSConnection>, query: Vec<String>) -> Result<(), IDSError> {
+    pub async fn lookup(&self, conn: Rc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, IDSError> {
         let body = plist_to_string(&LookupReq { uris: query })?;
 
         // gzip encode
-        let header = HeaderBuilder::new().modification_time(0).finish();
-        let options = EncodeOptions::new().header(header);
-        let mut encoder = Encoder::with_options(Vec::new(), options)?;
-        encoder.write_all(body.as_bytes())?;
-        let encoded = encoder.finish().into_result()?;
+        let encoded = gzip(body.as_bytes())?;
 
         let handle = self.state.handles.first().unwrap();
         let mut headers = Dictionary::from_iter([
@@ -223,9 +249,7 @@ impl IDSUser {
             ("v", 2.into()),
             ("b", Value::Data(encoded))
         ].into_iter()));
-        println!("sending msg");
-        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?).await;
-        println!("finding msg");
+        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await;
 
         let response = conn.reader.wait_find_pred(|x| {
             if x.id != 0x0A {
@@ -235,30 +259,38 @@ impl IDSUser {
                 return false
             };
             let loaded: Value = plist::from_bytes(body).unwrap();
-            let resp_id = loaded.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
+            let Some(resp_id) = loaded.as_dictionary().unwrap().get("U") else {
+                return false
+            };
+            let resp_id = resp_id.as_data().unwrap();
             return resp_id == msg_id
         }).await;
-
-        println!("found msg");
 
         let data = response.get_field(3).unwrap();
         let loaded: Value = plist::from_bytes(data).unwrap();
         
         // gzip decode
-        let mut decoder = Decoder::new(loaded.as_dictionary().unwrap().get("b").unwrap().as_data().unwrap()).unwrap();
-        let mut decoded_data = Vec::new();
-        decoder.read_to_end(&mut decoded_data).unwrap();
+        let decoded_data = ungzip(loaded.as_dictionary().unwrap().get("b").unwrap().as_data().unwrap())?;
 
-        let loaded: Value = plist::from_bytes(&decoded_data).unwrap();
-        let dict = loaded.as_dictionary().unwrap();
-        let status = dict.get("status").unwrap().as_unsigned_integer().unwrap();
-        if status != 0 {
-            return Err(IDSError::LookupFailed(status))
+        let lookup_resp: IDSLookupResp = plist::from_bytes(&decoded_data).unwrap();
+        if lookup_resp.status != 0 {
+            return Err(IDSError::LookupFailed(lookup_resp.status))
         }
 
-        let results = dict.get("results").unwrap().as_dictionary().unwrap();
-        println!("results {:?}", results);
+        let reps = lookup_resp.results.unwrap();
+        
+        let answer: HashMap<String, Vec<IDSIdentityResult>> = HashMap::from_iter(reps.iter().map(|(id, resp)| {
+            (id.clone(), resp.identities.iter().filter(|identity| identity.client_data.is_some())
+                .map(|identity| {
+                    let key: Vec<u8> = identity.client_data.as_ref().unwrap().public_message_identity_key.clone().into();
+                    IDSIdentityResult {
+                        identity: IDSPublicIdentity::decode(&key).unwrap(),
+                        push_token: identity.push_token.clone().into(),
+                        session_token: identity.session_token.clone().into()
+                    }
+                }).collect())
+        }));
 
-        Ok(())
+        Ok(answer)
     }
 }

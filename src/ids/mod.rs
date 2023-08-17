@@ -1,6 +1,6 @@
 use std::io;
 
-use openssl::error::ErrorStack;
+use openssl::{error::ErrorStack, aes::KeyError};
 
 use crate::bags::BagError;
 
@@ -18,7 +18,14 @@ pub enum IDSError {
     CertError(plist::Dictionary),
     RegisterFailed(u64),
     IoError(io::Error),
-    LookupFailed(u64)
+    LookupFailed(u64),
+    KeyError(KeyError)
+}
+
+impl From<KeyError> for IDSError {
+    fn from(value: KeyError) -> Self {
+        IDSError::KeyError(value)
+    }
 }
 
 impl From<io::Error> for IDSError {

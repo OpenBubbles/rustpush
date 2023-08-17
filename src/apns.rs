@@ -62,13 +62,32 @@ impl APNSPayload {
     }
 }
 
+struct InnerSubmitter {
+    stream: WriteHalf<TlsStream<TcpStream>>,
+    token: Vec<u8>
+}
+
 #[derive(Clone)]
-pub struct APNSSubmitter(Arc<Mutex<WriteHalf<TlsStream<TcpStream>>>>, Vec<u8> /* token */);
+pub struct APNSSubmitter(Arc<Mutex<InnerSubmitter>>);
 
 impl APNSSubmitter {
+    fn make(stream: WriteHalf<TlsStream<TcpStream>>) -> APNSSubmitter {
+        APNSSubmitter(Arc::new(Mutex::new(InnerSubmitter { stream, token: vec![] })))
+    }
+
+    async fn token(&self) -> Vec<u8> {
+        let locked = self.0.lock().await;
+        locked.token.clone()
+    }
+
+    async fn set_token(&self, token: &[u8]) {
+        let mut locked = self.0.lock().await;
+        locked.token = token.to_vec();
+    }
+
     async fn write_data(&self, buf: &[u8]) {
         let mut locked = self.0.lock().await;
-        locked.write(buf).await.unwrap();
+        locked.stream.write(buf).await.unwrap();
     }
 
     async fn send_payload(&self, id: u8, fields: Vec<(u8, Vec<u8>)>) {
@@ -81,12 +100,13 @@ impl APNSSubmitter {
         self.send_payload(0x14, vec![(1, state.to_be_bytes().to_vec()), (2, magic_num.to_be_bytes().to_vec())]).await;
     }
 
-    async fn send_message(&self, topic: &str, payload: &[u8]) {
-        let id = rand::thread_rng().gen::<[u8; 4]>();
+    async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) {
+        let rand = rand::thread_rng().gen::<[u8; 4]>();
+        let id = id.unwrap_or(&rand);
         self.send_payload(0x0A, vec![
             (4, id.to_vec()),
             (1, sha1(topic.as_bytes()).to_vec()),
-            (2, self.1.clone()),
+            (2, self.token().await),
             (3, payload.to_vec())
         ]).await;
     }
@@ -98,12 +118,12 @@ impl APNSSubmitter {
 
     async fn send_ack(&self, id: &[u8]) {
         println!("Sending ack for {:?}", id);
-        self.send_payload(0x0B, vec![(1, self.1.clone()), (4, id.to_vec()), (8, vec![0x0])]).await;
+        self.send_payload(0x0B, vec![(1, self.token().await), (4, id.to_vec()), (8, vec![0x0])]).await;
     }
     
     pub async fn filter(&self, topics: &[&str]) {
         println!("Sending filter for {:?}", topics);
-        let mut fields = vec![(1, self.1.clone())];
+        let mut fields = vec![(1, self.token().await)];
         for topic in topics {
             let mut hasher = Sha1::new();
             hasher.update(topic.as_bytes());
@@ -242,8 +262,8 @@ impl APNSConnection {
         Ok(connection)
     }
 
-    pub async fn send_message(&self, topic: &str, payload: &[u8]) {
-        self.submitter.send_message(topic, payload).await;
+    pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) {
+        self.submitter.send_message(topic, payload, id).await;
         let msg = self.reader.wait_find(0x0B).await;
         if msg.get_field(8).unwrap()[0] != 0x0 {
             panic!("Failed to send message");
@@ -273,7 +293,7 @@ impl APNSConnection {
         };
         let stream = APNSConnection::connect(&state).await?;
         let (read, writer) = split(stream);
-        let mut writer = APNSSubmitter(Arc::new(Mutex::new(writer)), vec![]);
+        let mut writer = APNSSubmitter::make(writer);
         let reader = APNSReader::new(read, writer.clone());
 
         // connect
@@ -300,7 +320,7 @@ impl APNSConnection {
         } else {
             panic!("no token!")
         };
-        writer.1 = token.clone();
+        writer.set_token(&token).await;
 
         println!("Recieved connect response with token {:?}", token);
 

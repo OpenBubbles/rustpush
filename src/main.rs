@@ -78,9 +78,12 @@ async fn main() {
     //let lookup = user.lookup(connection.clone(), vec!["tel:+17203818329".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
 
     let user = Rc::new(user);
-    let client = IMClient::new(connection.clone(), user.clone());
+    let mut client = IMClient::new(connection.clone(), user.clone());
 
-    sleep(Duration::from_millis(10000)).await;
+    let mut msg = client.new_msg("woah test", &["tel:+17203818329".to_string()]);
+    client.send(&mut msg).await.unwrap();
+
+    //sleep(Duration::from_millis(10000)).await;
     
     
 

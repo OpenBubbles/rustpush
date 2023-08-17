@@ -1,10 +1,12 @@
 use std::io::Cursor;
 
 use base64::engine::general_purpose;
+use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use plist::{Error, Value};
 use base64::Engine;
 use rustls::{Certificate, PrivateKey};
 use serde::{Serialize, Deserialize};
+use std::io::{Write, Read};
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
     let mut curr_val = val;
@@ -53,4 +55,19 @@ pub fn plist_to_bin<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     let writer = Cursor::new(&mut buf);
     plist::to_writer_binary(writer, &value)?;
     Ok(buf)
+}
+
+pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let header = HeaderBuilder::new().modification_time(0).finish();
+    let options = EncodeOptions::new().header(header);
+    let mut encoder = Encoder::with_options(Vec::new(), options)?;
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish().into_result()?)
+}
+
+pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut decoder = Decoder::new(bytes)?;
+    let mut decoded_data = Vec::new();
+    decoder.read_to_end(&mut decoded_data)?;
+    Ok(decoded_data)
 }
