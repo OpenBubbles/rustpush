@@ -187,6 +187,7 @@ impl IMClient {
         let hmac = PKey::hmac(&rand)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;
         let result = signer.sign_oneshot_to_vec(&[
+            raw.to_vec(),
             vec![0x02],
             self.user.state.identity.as_ref().unwrap().public().hash().to_vec(),
             key.hash().to_vec()
@@ -197,7 +198,12 @@ impl IMClient {
             result[..5].to_vec()
         ].concat();
 
-        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, None, raw).unwrap();
+        let nonce = [
+            vec![0; 15],
+            vec![0x1]
+        ].concat();
+
+        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&nonce), raw).unwrap();
 
         let encryption_key = PKey::from_rsa(key.encryption_key.clone())?;
 
@@ -205,7 +211,6 @@ impl IMClient {
             aes_key,
             encrypted_sym[..100].to_vec()
         ].concat();
-        println!("enc body {:x?}", payload);
         let mut encrypter = Encrypter::new(&encryption_key)?;
         encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
         encrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
@@ -219,7 +224,6 @@ impl IMClient {
             encrypted,
             encrypted_sym[100..].to_vec()
         ].concat();
-        println!("done body {:x?}", payload);
 
         let sig = self.user.state.identity.as_ref().unwrap().sign(&payload)?;
         let payload = [
