@@ -78,19 +78,26 @@ async fn main() {
     //let lookup = user.lookup(connection.clone(), vec!["tel:+17203818329".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
 
     let user = Rc::new(user);
-    let mut client = IMClient::new(connection.clone(), user.clone());
+    let mut client = IMClient::new(connection.clone(), user.clone()).await;
 
-    let mut msg = client.new_msg("woah test", &["tel:+17203818329".to_string()]);
-    client.send(&mut msg).await.unwrap();
+    //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
+    //let mut msg = client.new_msg("woah test", &["mailto:jjtech@jjtech.dev".to_string()]);
+    //client.send(&mut msg).await.unwrap();
 
     //sleep(Duration::from_millis(10000)).await;
     
-    
+    loop {
+        let msg = client.recieve().await;
+        if let Some(msg) = msg {
+            println!("[{}]: {}", msg.sender, msg.text);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
 
-    let state = SavedState {
+    /*let state = SavedState {
         push: connection.state.clone(),
         auth: user.state.clone()
     };
     let serialized = serde_json::to_string(&state).unwrap();
-    fs::write("config.json", serialized).await.unwrap();
+    fs::write("config.json", serialized).await.unwrap();*/
 }

@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, pkey_ctx::PkeyCtx, sha::sha256, sign::Signer, hash::MessageDigest};
+use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, pkey_ctx::PkeyCtx, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
 use tokio::io::AsyncReadExt;
 
@@ -49,6 +49,13 @@ impl IDSPublicIdentity {
         ].concat();
 
         sha256(&result)
+    }
+
+    pub fn verify(&self, data: &[u8], sig: &[u8]) -> Result<bool, IDSError> {
+        let signing_key = PKey::from_ec_key(self.signing_key.clone()).unwrap();
+
+        let mut verifier = Verifier::new(MessageDigest::sha1(), signing_key.as_ref())?;
+        Ok(verifier.verify_oneshot(sig, data)?)
     }
 }
 
@@ -185,9 +192,13 @@ impl IDSIdentity {
         })
     }
 
+    pub fn priv_enc_key(&self) -> PKey<Private> {
+        PKey::private_key_from_der(&self.encryption_key).unwrap()
+    }
+
     pub fn public(&self) -> IDSPublicIdentity {
         let signing_key = PKey::private_key_from_der(&self.signing_key).unwrap();
-        let encryption_key = PKey::private_key_from_der(&self.encryption_key).unwrap();
+        let encryption_key = self.priv_enc_key();
 
         let eckey = signing_key.ec_key().unwrap();
         let group = eckey.group();

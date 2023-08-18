@@ -3,7 +3,7 @@ use std::{collections::HashMap, io, sync::Arc, time::Duration};
 use openssl::sha::{Sha1, sha1};
 use ringbuf::{HeapConsumer, HeapRb};
 use rustls::{Certificate, PrivateKey, client::{ServerCertVerifier, ServerCertVerified}};
-use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::Mutex};
+use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
 use std::net::ToSocketAddrs;
@@ -12,7 +12,7 @@ use serde::{Serialize, Deserialize};
 
 use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct APNSPayload {
     pub id: u8,
     pub fields: Vec<(u8, Vec<u8>)>
@@ -133,11 +133,21 @@ impl APNSSubmitter {
     }
 }
 
-pub struct APNSReader(Arc<Mutex<Vec<APNSPayload>>>);
+enum WaitingCb {
+    OneShot(oneshot::Sender<APNSPayload>),
+    Cont(mpsc::Sender<APNSPayload>)
+}
+
+struct WaitingTask {
+    waiting_for: Box<dyn Fn(&APNSPayload) -> bool + Send + Sync>,
+    when: WaitingCb,
+}
+
+pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>);
 
 impl APNSReader {
     fn new(mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter) -> APNSReader {
-        let reader = Arc::new(Mutex::new(vec![]));
+        let reader: Arc<Mutex<Vec<WaitingTask>>> = Arc::new(Mutex::new(vec![]));
         let reader_clone = reader.clone();
         tokio::spawn(async move {
             loop {
@@ -153,18 +163,54 @@ impl APNSReader {
                     println!("Sending automatic ACK");
                     write.send_ack(payload.get_field(4).unwrap()).await;
                 }
+                
                 println!("Recieved payload");
-                reader_clone.lock().await.push(payload);
+                let mut locked = reader_clone.lock().await;
+                let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
+                    if (item.waiting_for)(&payload) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }).collect();
+                for idx in remove_idxs.iter().rev() {
+                    match &locked.get(*idx).unwrap().when {
+                        WaitingCb::OneShot(cb) => {
+                            let WaitingCb::OneShot(cb) = locked.remove(*idx).when else {
+                                panic!("no")
+                            };
+                            cb.send(payload.clone()).unwrap();
+                        },
+                        WaitingCb::Cont(cb) => {
+                            cb.send(payload.clone()).await.unwrap();
+                        }
+                    }
+                }
             }
         });
         APNSReader(reader)
     }
 
-    pub async fn wait_find_pred<F>(&self, mut p: F) -> APNSPayload
+    pub async fn register_for<F>(&self, p: F) -> Receiver<APNSPayload>
     where
-        F: FnMut(&APNSPayload) -> bool,
+        F: Fn(&APNSPayload) -> bool + Send + Sync + 'static,
     {
-        let mut interval = time::interval(Duration::from_millis(100));
+        let mut locked = self.0.lock().await;
+        let (tx, rx) = mpsc::channel(20);
+        locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::Cont(tx) });
+        rx
+    }
+
+    pub async fn wait_find_pred<F>(&self, p: F) -> APNSPayload
+    where
+        F: Fn(&APNSPayload) -> bool + Send + Sync + 'static,
+    {
+        let mut locked = self.0.lock().await;
+        let (tx, rx) = oneshot::channel();
+        locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
+        drop(locked);
+        rx.await.unwrap()
+        /*let mut interval = time::interval(Duration::from_millis(100));
         loop {
             let mut locked = self.0.lock().await;
             let item = locked.iter().position(|item| p(item));
@@ -173,11 +219,11 @@ impl APNSReader {
             }
             drop(locked);
             interval.tick().await;
-        }
+        }*/
     }
 
     pub async fn wait_find(&self, id: u8) -> APNSPayload {
-        self.wait_find_pred(|item| item.id == id).await
+        self.wait_find_pred(move |item| item.id == id).await
     }
 }
 
@@ -293,7 +339,7 @@ impl APNSConnection {
         };
         let stream = APNSConnection::connect(&state).await?;
         let (read, writer) = split(stream);
-        let mut writer = APNSSubmitter::make(writer);
+        let writer = APNSSubmitter::make(writer);
         let reader = APNSReader::new(read, writer.clone());
 
         // connect

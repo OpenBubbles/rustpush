@@ -1,12 +1,13 @@
-use std::{rc::Rc, fmt, collections::HashMap, hash::Hash, vec};
+use std::{rc::Rc, fmt, collections::HashMap, hash::Hash, vec, io::Cursor};
 
-use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, aes::AesKey, encrypt::Encrypter, symm::{Cipher, Mode, encrypt}, rsa::Padding};
+use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, aes::AesKey, encrypt::{Encrypter, Decrypter}, symm::{Cipher, Mode, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::{Value, Dictionary, Data};
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc::Receiver;
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{apns::APNSConnection, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::{IDSPublicIdentity, self}}, util::{plist_to_bin, gzip, ungzip}};
 
 
 pub struct BalloonBody {
@@ -16,11 +17,11 @@ pub struct BalloonBody {
 
 // represents an IMessage
 pub struct IMessage {
-    text: String,
+    pub text: String,
     xml: Option<String>,
     participants: Vec<String>,
-    sender: String,
-    id: Option<String>,
+    pub sender: String,
+    id: Option<Uuid>,
     group_id: Option<String>,
     body: Option<BalloonBody>,
     effect: Option<String>,
@@ -51,7 +52,7 @@ struct RawIMessage {
 impl IMessage {
     fn sanity_check(&mut self) {
         if self.id.is_none() {
-            self.id = Some(Uuid::new_v4().to_string());
+            self.id = Some(Uuid::new_v4());
         }
         if self.group_id.is_none() {
             self.group_id = Some(Uuid::new_v4().to_string());
@@ -66,7 +67,7 @@ impl IMessage {
             text: self.text.clone(),
             xml: self.xml.clone(),
             participants: self.participants.clone(),
-            id: self.id.clone(),
+            id: self.id.map(|data| data.to_string()).clone(),
             group_id: self.group_id.clone(),
             pv: 0,
             gv: "8".to_string(),
@@ -88,15 +89,15 @@ impl IMessage {
         final_msg
     }
 
-    fn from_raw(bytes: &[u8], sender: String) -> IMessage {
+    fn from_raw(bytes: &[u8], sender: String) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap();
-        let loaded: RawIMessage = plist::from_bytes(&decompressed).unwrap();
-        IMessage {
+        let loaded: RawIMessage = plist::from_bytes(&decompressed).ok()?;
+        Some(IMessage {
             text: loaded.text.clone(),
             xml: loaded.xml.clone(),
             participants: loaded.participants.clone(),
             sender,
-            id: loaded.id.clone(),
+            id: loaded.id.clone().map(|id| Uuid::parse_str(&id).unwrap()),
             group_id: loaded.group_id.clone(),
             body: if let Some(body) = &loaded.b {
                 if let Some(bid) = &loaded.bid {
@@ -105,7 +106,7 @@ impl IMessage {
             } else { None },
             effect: loaded.effect.clone(),
             raw: Some(loaded)
-        }
+        })
     }
 }
 
@@ -145,21 +146,123 @@ struct SendMsg {
     sp: String
 }
 
+#[derive(Serialize, Deserialize)]
+struct RecvMsg {
+    #[serde(rename = "P")]
+    payload: Data,
+    #[serde(rename = "sP")]
+    sender: String,
+    #[serde(rename = "t")]
+    token: Data
+}
+
 pub struct IMClient {
     conn: Rc<APNSConnection>,
     user: Rc<IDSUser>,
-    key_cache: HashMap<String, Vec<IDSIdentityResult>>
+    key_cache: HashMap<String, Vec<IDSIdentityResult>>,
+    raw_inbound: Receiver<APNSPayload>
 }
 
+const NORMAL_NONCE: [u8; 16] = [
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+];
+
 impl IMClient {
-    pub fn new(conn: Rc<APNSConnection>, user: Rc<IDSUser>) -> IMClient {
-        IMClient { conn, user, key_cache: HashMap::new() }
+    pub async fn new(conn: Rc<APNSConnection>, user: Rc<IDSUser>) -> IMClient {
+        IMClient {
+            user,
+            key_cache: HashMap::new(),
+            raw_inbound: conn.reader.register_for(|pay| {
+                if pay.id != 0x0A {
+                    return false
+                }
+                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) {
+                    return false
+                }
+                let Some(body) = pay.get_field(3) else {
+                    return false
+                };
+                let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
+                let has_p = load.as_dictionary().unwrap().contains_key("P");
+                has_p
+            }).await,
+            conn
+        }
+    }
+
+    fn parse_payload(payload: &[u8]) -> (&[u8], &[u8]) {
+        let body_len = u16::from_be_bytes(payload[1..3].try_into().unwrap()) as usize;
+        let body = &payload[3..(3 + body_len)];
+        let sig_len = u8::from_be_bytes(payload[(3 + body_len)..(4 + body_len)].try_into().unwrap()) as usize;
+        let sig = &payload[(4 + body_len)..(4 + body_len + sig_len)];
+        (body, sig)
+    }
+
+    async fn verify_payload(&mut self, payload: &[u8], sender: &str, sender_token: &[u8]) -> bool {
+        self.cache_keys(&[sender.to_string()]).await.unwrap();
+
+        let Some(keys) = self.key_cache.get(sender) else {
+            println!("Cannot verify; no public key");
+            return false
+        };
+
+        let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
+            println!("Cannot verify; no public key");
+            return false
+        };
+
+        let (body, sig) = Self::parse_payload(payload);
+        let valid = identity.identity.verify(body, sig).unwrap();
+
+        valid
+    }
+
+    pub async fn decrypt(&self, payload: &[u8]) -> Result<Vec<u8>, IDSError> {
+        let (body, _sig) = Self::parse_payload(payload);
+        
+        let key = self.user.state.identity.as_ref().unwrap().priv_enc_key();
+        let mut decrypter = Decrypter::new(&key)?;
+        decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
+        decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
+        decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
+        let buffer_len = decrypter.decrypt_len(&payload).unwrap();
+        let mut decrypted_asym = vec![0; buffer_len];
+        decrypter.decrypt(&body[..160], &mut decrypted_asym[..])?;
+
+        let decrypted_sym = decrypt(Cipher::aes_128_ctr(), &decrypted_asym[..16], Some(&NORMAL_NONCE), &[
+            decrypted_asym[16..116].to_vec(),
+            body[160..].to_vec()
+        ].concat()).unwrap();
+
+        Ok(decrypted_sym)
+    }
+
+    pub async fn recieve(&mut self) -> Option<IMessage> {
+        let Ok(payload) = self.raw_inbound.try_recv() else {
+            return None
+        };
+
+        let body = payload.get_field(3).unwrap();
+        let loaded: RecvMsg = plist::from_bytes(body).unwrap();
+
+        let payload: Vec<u8> = loaded.payload.into();
+        let token: Vec<u8> = loaded.token.into();
+        if !self.verify_payload(&payload, &loaded.sender, &token).await {
+            panic!("Payload verification failed!");
+        }
+
+        let decrypted = self.decrypt(&payload).await.unwrap();
+        
+        IMessage::from_raw(&decrypted, loaded.sender)
     }
 
     pub async fn cache_keys(&mut self, participants: &[String]) -> Result<(), IDSError> {
         // find participants whose keys need to be fetched
-        let fetch = participants.iter().filter(|p| !self.key_cache.contains_key(*p))
+        let fetch: Vec<String> = participants.iter().filter(|p| !self.key_cache.contains_key(*p))
             .map(|p| p.to_string()).collect();
+        if fetch.len() == 0 {
+            return Ok(())
+        }
         let results = self.user.lookup(self.conn.clone(), fetch).await?;
         for (id, results) in results {
             self.key_cache.insert(id, results);
@@ -198,12 +301,7 @@ impl IMClient {
             result[..5].to_vec()
         ].concat();
 
-        let nonce = [
-            vec![0; 15],
-            vec![0x1]
-        ].concat();
-
-        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&nonce), raw).unwrap();
+        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&NORMAL_NONCE), raw).unwrap();
 
         let encryption_key = PKey::from_rsa(key.encryption_key.clone())?;
 
@@ -268,7 +366,7 @@ impl IMClient {
             ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
             v: 8,
             i: u32::from_be_bytes(msg_id),
-            u: msg_id.to_vec().into(),
+            u: message.id.unwrap().as_bytes().to_vec().into(),
             dtl: payloads,
             sp: message.sender.clone()
         };
