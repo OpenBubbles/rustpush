@@ -5,7 +5,7 @@ use openssl::{error::ErrorStack, aes::KeyError};
 use crate::bags::BagError;
 
 pub mod user;
-mod signing;
+pub mod signing;
 pub mod identity;
 
 #[derive(Debug)]

@@ -23,15 +23,6 @@ pub struct KeyPair {
     pub private: Vec<u8>
 }
 
-impl KeyPair {
-    pub fn rustls_cert(&self) -> Certificate {
-        Certificate(self.cert.clone())
-    }
-    pub fn rustls_key(&self) -> PrivateKey {
-        PrivateKey(self.private.clone())
-    }
-}
-
 pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }

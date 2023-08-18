@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io, sync::Arc, time::Duration};
 
-use openssl::sha::{Sha1, sha1};
+use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use ringbuf::{HeapConsumer, HeapRb};
 use rustls::{Certificate, PrivateKey, client::{ServerCertVerifier, ServerCertVerified}};
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
@@ -10,7 +10,7 @@ use std::net::ToSocketAddrs;
 use tokio::io::split;
 use serde::{Serialize, Deserialize};
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair, ids::signing::generate_nonce};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -260,7 +260,13 @@ pub enum APNSError {
     RustlsError(rustls::Error),
     BagError(BagError),
     IoError(io::Error),
+    SignError(ErrorStack),
     ConnectError
+}
+impl From<ErrorStack> for APNSError {
+    fn from(value: ErrorStack) -> Self {
+        APNSError::SignError(value)
+    }
 }
 impl From<rustls::Error> for APNSError {
     fn from(value: rustls::Error) -> Self {
@@ -281,13 +287,12 @@ impl From<io::Error> for APNSError {
 const APNS_PORT: u16 = 5223;
 
 impl APNSConnection {
-    async fn connect(state: &APNSState) -> Result<TlsStream<TcpStream>, APNSError> {
+    async fn connect() -> Result<TlsStream<TcpStream>, APNSError> {
         let mut config = rustls::ClientConfig::builder()
             .with_safe_defaults()
             .with_custom_certificate_verifier(Arc::new(DangerousVerifier()))
-            .with_client_auth_cert(vec![state.keypair.rustls_cert()], 
-            state.keypair.rustls_key())?;
-        config.alpn_protocols.push(b"apns-security-v2".to_vec());
+            .with_no_client_auth();
+        config.alpn_protocols.push(b"apns-security-v3".to_vec());
 
         let connector = TlsConnector::from(Arc::new(config));
 
@@ -337,20 +342,41 @@ impl APNSConnection {
                 }
             }
         };
-        let stream = APNSConnection::connect(&state).await?;
+        let stream = APNSConnection::connect().await?;
         let (read, writer) = split(stream);
         let writer = APNSSubmitter::make(writer);
         let reader = APNSReader::new(read, writer.clone());
 
         // connect
-        let flags: u32 = 0b01000101;
+        let flags: u32 = 0b01000001;
+
+        let priv_key = PKey::private_key_from_der(&state.keypair.private)?;
+
+        let mut signer = Signer::new(MessageDigest::sha1(), priv_key.as_ref())?;
+        signer.set_rsa_padding(Padding::PKCS1)?;
+        let nonce = generate_nonce(0x0);
+        let signature = [
+            vec![0x1, 0x1],
+            signer.sign_oneshot_to_vec(&nonce)?
+        ].concat();
+        let cert = X509::from_der(&state.keypair.cert)?.public_key()?.public_key_to_der()?;
+
+        let mut fields = vec![
+            (0x2, vec![0x01]),
+            (0x5, flags.to_be_bytes().to_vec()),
+            (0xC, cert),
+            (0xD, nonce),
+            (0xE, signature)
+        ];
+
         if let Some(token) = &state.token {
             println!("Sending connect message with token {:?}", token);
-            writer.send_payload(7, vec![(1, token.clone()), (2, vec![0x01]), (5, flags.to_be_bytes().to_vec())]).await;
+            fields.push((1, token.clone()));
         } else {
             println!("Sending connect message without token");
-            writer.send_payload(7, vec![(2, vec![0x01]), (5, flags.to_be_bytes().to_vec())]).await;
         }
+        
+        writer.send_payload(7, fields).await;
 
         let response = reader.wait_find(8).await;
         if u8::from_be_bytes(response.get_field(1).unwrap().clone().try_into().unwrap()) != 0x00 {

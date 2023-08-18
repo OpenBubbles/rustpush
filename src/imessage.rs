@@ -90,8 +90,9 @@ impl IMessage {
     }
 
     fn from_raw(bytes: &[u8], sender: String) -> Option<IMessage> {
-        let decompressed = ungzip(&bytes).unwrap();
+        let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         let loaded: RawIMessage = plist::from_bytes(&decompressed).ok()?;
+        println!("xml: {:?}", loaded.xml);
         Some(IMessage {
             text: loaded.text.clone(),
             xml: loaded.xml.clone(),

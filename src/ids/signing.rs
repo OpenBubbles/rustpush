@@ -9,17 +9,17 @@ use rand::Rng;
 
 use super::IDSError;
 
-fn generate_nonce() -> Vec<u8> {
+pub fn generate_nonce(key: u8) -> Vec<u8> {
     let start: SystemTime = SystemTime::now();
     let since_the_epoch = start
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs() * 1000; /* round? that's pypush? */
-    [[0x1].to_vec(), since_the_epoch.to_be_bytes().to_vec(), rand::thread_rng().gen::<[u8; 8]>().to_vec()].concat()
+    [[key].to_vec(), since_the_epoch.to_be_bytes().to_vec(), rand::thread_rng().gen::<[u8; 8]>().to_vec()].concat()
 }
 
 fn create_payload(bag_key: &str, query_string: &str, push_token: &[u8], payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let nonce = generate_nonce();
+    let nonce = generate_nonce(0x1);
 
     (
         [
