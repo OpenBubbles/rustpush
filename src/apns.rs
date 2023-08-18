@@ -359,12 +359,11 @@ impl APNSConnection {
             vec![0x1, 0x1],
             signer.sign_oneshot_to_vec(&nonce)?
         ].concat();
-        let cert = X509::from_der(&state.keypair.cert)?.public_key()?.public_key_to_der()?;
 
         let mut fields = vec![
             (0x2, vec![0x01]),
             (0x5, flags.to_be_bytes().to_vec()),
-            (0xC, cert),
+            (0xC, state.keypair.cert.clone()),
             (0xD, nonce),
             (0xE, signature)
         ];
