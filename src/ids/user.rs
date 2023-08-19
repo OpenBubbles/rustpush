@@ -5,7 +5,7 @@ use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, KeyPair, plist_to_bin, gzip, ungzip}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req};
+use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, KeyPair, plist_to_bin, gzip, ungzip, make_reqwest}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req};
 
 use super::{IDSError, identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -22,8 +22,7 @@ async fn attempt_auth(username: &str, password: &str) -> Result<Value, IDSError>
         password: password.to_string()
     };
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true).build().unwrap();
+    let client = make_reqwest();
     let resp = client.post("https://profile.ess.apple.com/WebObjects/VCProfileService.woa/wa/authenticateUser")
             .body(plist_to_string(&request)?)
             .send()
@@ -88,8 +87,7 @@ async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, IDSError> 
     };
     
     let ids_bag = get_bag(IDS_BAG).await?;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true).build().unwrap();
+    let client = make_reqwest();
     let resp = client.post(ids_bag.get("id-authenticate-ds-id").unwrap().as_string().unwrap())
             .header("x-protocol-version", "1630")
             .body(plist_to_string(&body)?)
@@ -117,8 +115,7 @@ struct HandleResult {
 
 pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, IDSError> {
     let ids_bag = get_bag(IDS_BAG).await?;
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true).build().unwrap();
+    let client = make_reqwest();
     let resp = auth_sign_req(
             client.get(ids_bag.get("id-get-handles").unwrap().as_string().unwrap())
             .header("x-protocol-version", "1640")

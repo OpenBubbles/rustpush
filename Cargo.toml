@@ -2,6 +2,7 @@
 name = "rustpush"
 version = "0.1.0"
 edition = "2021"
+default-run = "rustpush-test"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,19 +10,19 @@ edition = "2021"
 lazy_static = "1.4.0"
 plist = "1.5.0"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "default-tls"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
-openssl = "0.10.56"
+openssl = { version = "0.10.56", features = ["vendored"] }
 uuid = { version = "1.4.1", features = ["v4"] }
 base64 = "0.21.2"
 regex = "1.9.3"
 tokio-rustls = "0.24.1"
-rustls = { version = "0.21.6", features = ["dangerous_configuration"] }
+rustls = "0.21.6"
 rustls-pemfile = "1.0.3"
 rand = "0.8.5"
 serde_json = "1.0.104"
 libflate = "2.0.0"
-uniffi = { git = "https://github.com/mozilla/uniffi-rs", features = [ "cli" ] }
+uniffi = { git = "https://github.com/mozilla/uniffi-rs", features = [ "cli", "tokio" ] }
 
 [build-dependencies]
 uniffi = { git = "https://github.com/mozilla/uniffi-rs", features = [ "build" ] }

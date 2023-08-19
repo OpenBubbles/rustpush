@@ -4,6 +4,8 @@ use tokio::sync::Mutex;
 use lazy_static::lazy_static;
 use plist::{Dictionary, Data};
 
+use crate::util::make_reqwest;
+
 #[derive(Debug)]
 pub enum BagError {
     RequestError(reqwest::Error),
@@ -41,8 +43,7 @@ pub async fn get_bag(bag_url: &str) -> Result<Dictionary, BagError> {
         return Ok(bag.clone());
     }
     
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true).build().unwrap();
+    let client = make_reqwest();
     let content = client.get(bag_url).send().await?;
     if !content.status().is_success() {
         return Err(BagError::StatusError(content.status()))

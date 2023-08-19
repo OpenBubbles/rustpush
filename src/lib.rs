@@ -56,7 +56,7 @@ impl From<IDSError> for PushError {
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl PushState {
     #[uniffi::constructor]
     pub fn new() -> Arc<PushState> {

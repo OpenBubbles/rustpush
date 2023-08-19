@@ -8,7 +8,7 @@ use uuid::Uuid;
 use serde::Serialize;
 use regex::Regex;
 
-use crate::util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value};
+use crate::util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest};
 
 
 #[derive(Debug)]
@@ -118,7 +118,7 @@ pub async fn generate_push_cert() -> Result<KeyPair, CertGenError> {
     };
 
     // activate with apple
-    let client = reqwest::Client::new();
+    let client = make_reqwest();
     let form = [("activation-info", plist_to_string(&request)?)];
     let resp = client.post("https://albert.apple.com/WebObjects/ALUnbrick.woa/wa/deviceActivation?device=Windows")
             .form(&form)

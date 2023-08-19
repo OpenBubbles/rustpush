@@ -3,7 +3,7 @@ use std::io::Cursor;
 use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair}, apns::APNSState};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSState};
 
 use super::{IDSError, user::IDSUser, signing::auth_sign_req};
 use serde::Serialize;
@@ -156,8 +156,7 @@ impl IDSIdentity {
         ].into_iter()));
 
         let body = plist_to_string(&body)?;
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true).build().unwrap();
+        let client = make_reqwest();
         let resp = auth_sign_req(
             client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
             .header("x-protocol-version", "1640")

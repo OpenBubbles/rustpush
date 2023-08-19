@@ -1,6 +1,6 @@
 use std::{io, sync::Arc, time::Duration};
 
-use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding};
+use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use rustls::{Certificate, client::{ServerCertVerifier, ServerCertVerified}};
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -9,7 +9,7 @@ use std::net::ToSocketAddrs;
 use tokio::io::split;
 use serde::{Serialize, Deserialize};
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair, ids::signing::generate_nonce};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::{KeyPair, base64_encode}, ids::signing::generate_nonce};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -239,21 +239,6 @@ pub struct APNSState {
     pub token: Option<Vec<u8>>
 }
 
-struct DangerousVerifier();
-impl ServerCertVerifier for DangerousVerifier {
-    fn verify_server_cert(
-            &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &rustls::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: std::time::SystemTime,
-        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-}
-
 #[derive(Debug)]
 pub enum APNSError {
     RustlsError(rustls::Error),
@@ -287,9 +272,15 @@ const APNS_PORT: u16 = 5223;
 
 impl APNSConnection {
     async fn connect() -> Result<TlsStream<TcpStream>, APNSError> {
+        let x509 = X509::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert"))?;
+        let certificate = Certificate(x509.to_der()?);
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(&certificate)?;
+
         let mut config = rustls::ClientConfig::builder()
             .with_safe_defaults()
-            .with_custom_certificate_verifier(Arc::new(DangerousVerifier()))
+            .with_root_certificates(root_store)
             .with_no_client_auth();
         config.alpn_protocols.push(b"apns-security-v3".to_vec());
 
@@ -302,7 +293,7 @@ impl APNSConnection {
         let addr = (host.as_str(), APNS_PORT).to_socket_addrs()?.next().ok_or(io::Error::from(io::ErrorKind::NotFound))?;
         let stream = TcpStream::connect(&addr).await?;
 
-        let domain = rustls::ServerName::try_from(host.as_str())
+        let domain = rustls::ServerName::try_from(bag.get("APNSCourierHostname").unwrap().as_string().unwrap())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid dnsname"))?;
         
         let connection = connector.connect(domain, stream).await?;

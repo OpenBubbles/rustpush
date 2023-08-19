@@ -4,8 +4,27 @@ use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use plist::{Error, Value};
 use base64::Engine;
+use reqwest::{Client, Certificate};
 use serde::{Serialize, Deserialize};
 use std::io::{Write, Read};
+
+pub fn make_reqwest() -> Client {
+    let certificates = vec![
+        Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
+    ];
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false);
+
+    for certificate in certificates.into_iter() {
+        builder = builder.add_root_certificate(certificate);
+    }
+
+    builder.build().unwrap()
+}
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
     let mut curr_val = val;
