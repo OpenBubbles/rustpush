@@ -1,10 +1,9 @@
 use std::io::Cursor;
 
-use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, pkey_ctx::PkeyCtx, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
+use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
-use tokio::io::AsyncReadExt;
 
-use crate::{util::{base64_decode, plist_to_string, get_nested_value, KeyPair}, apns::APNSState};
+use crate::{util::{base64_decode, plist_to_string, KeyPair}, apns::APNSState};
 
 use super::{IDSError, user::IDSUser, signing::auth_sign_req};
 use serde::Serialize;

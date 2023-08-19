@@ -41,7 +41,7 @@ async fn main() {
     connection.submitter.filter(&["com.apple.madrid"]).await;
 
     let mut user = if let Some(state) = saved_state.as_ref() {
-        IDSUser::restore_authentication(connection.clone(), state.auth.clone())
+        IDSUser::restore_authentication(state.auth.clone())
     } else {
         let stdin = io::stdin();
         print!("Username: ");
@@ -77,6 +77,13 @@ async fn main() {
 
     //let lookup = user.lookup(connection.clone(), vec!["tel:+17203818329".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
 
+    let state = SavedState {
+        push: connection.state.clone(),
+        auth: user.state.clone()
+    };
+    let serialized = serde_json::to_string(&state).unwrap();
+    fs::write("config.json", serialized).await.unwrap();
+    
     let user = Rc::new(user);
     let mut client = IMClient::new(connection.clone(), user.clone()).await;
 
@@ -93,11 +100,4 @@ async fn main() {
         }
         sleep(Duration::from_millis(100)).await;
     }
-
-    /*let state = SavedState {
-        push: connection.state.clone(),
-        auth: user.state.clone()
-    };
-    let serialized = serde_json::to_string(&state).unwrap();
-    fs::write("config.json", serialized).await.unwrap();*/
 }

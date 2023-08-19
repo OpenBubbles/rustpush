@@ -19,6 +19,5 @@ tokio-rustls = "0.24.1"
 rustls = { version = "0.21.6", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0.3"
 rand = "0.8.5"
-ringbuf = "0.3.3"
 serde_json = "1.0.104"
 libflate = "2.0.0"

@@ -1,15 +1,11 @@
 use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap};
 
-use base64::{engine::general_purpose, Engine};
-use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
-use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, error::ErrorStack, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
+use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
 use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use std::io::Write;
-use std::io::Read;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, base64_encode, KeyPair, plist_to_bin, gzip, ungzip}, bags::{get_bag, IDS_BAG, BagError}, ids::signing::auth_sign_req};
+use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, KeyPair, plist_to_bin, gzip, ungzip}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req};
 
 use super::{IDSError, identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -156,7 +152,6 @@ pub struct IDSState {
 }
 
 pub struct IDSUser {
-    conn: Rc<APNSConnection>,
     pub state: IDSState
 }
 
@@ -196,8 +191,8 @@ pub struct IDSIdentityResult {
 }
 
 impl IDSUser {
-    pub fn restore_authentication(conn: Rc<APNSConnection>, state: IDSState) -> IDSUser {
-        IDSUser { conn, state }
+    pub fn restore_authentication(state: IDSState) -> IDSUser {
+        IDSUser { state }
     }
 
     pub async fn authenticate<Fut: Future<Output = String>, F: FnOnce() -> Fut>
@@ -207,7 +202,6 @@ impl IDSUser {
         let handles = get_handles(&user_id, &auth_keypair, &conn.state).await?;
 
         Ok(IDSUser {
-            conn,
             state: IDSState {
                 auth_keypair,
                 user_id,

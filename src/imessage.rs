@@ -1,13 +1,13 @@
-use std::{rc::Rc, fmt, collections::HashMap, hash::Hash, vec, io::Cursor};
+use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor};
 
-use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, aes::AesKey, encrypt::{Encrypter, Decrypter}, symm::{Cipher, Mode, encrypt, decrypt}, rsa::Padding, sha::sha1};
-use plist::{Value, Dictionary, Data};
+use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
+use plist::Data;
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc::Receiver;
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::{IDSPublicIdentity, self}}, util::{plist_to_bin, gzip, ungzip}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip}};
 
 
 pub struct BalloonBody {

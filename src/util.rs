@@ -4,7 +4,6 @@ use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use plist::{Error, Value};
 use base64::Engine;
-use rustls::{Certificate, PrivateKey};
 use serde::{Serialize, Deserialize};
 use std::io::{Write, Read};
 

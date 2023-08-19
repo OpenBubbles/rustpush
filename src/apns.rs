@@ -1,8 +1,7 @@
-use std::{collections::HashMap, io, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
-use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
-use ringbuf::{HeapConsumer, HeapRb};
-use rustls::{Certificate, PrivateKey, client::{ServerCertVerifier, ServerCertVerified}};
+use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding};
+use rustls::{Certificate, client::{ServerCertVerifier, ServerCertVerified}};
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, time, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
@@ -175,7 +174,7 @@ impl APNSReader {
                 }).collect();
                 for idx in remove_idxs.iter().rev() {
                     match &locked.get(*idx).unwrap().when {
-                        WaitingCb::OneShot(cb) => {
+                        WaitingCb::OneShot(_cb) => {
                             let WaitingCb::OneShot(cb) = locked.remove(*idx).when else {
                                 panic!("no")
                             };
@@ -244,12 +243,12 @@ struct DangerousVerifier();
 impl ServerCertVerifier for DangerousVerifier {
     fn verify_server_cert(
             &self,
-            end_entity: &Certificate,
-            intermediates: &[Certificate],
-            server_name: &rustls::ServerName,
-            scts: &mut dyn Iterator<Item = &[u8]>,
-            ocsp_response: &[u8],
-            now: std::time::SystemTime,
+            _end_entity: &Certificate,
+            _intermediates: &[Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp_response: &[u8],
+            _now: std::time::SystemTime,
         ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
     }

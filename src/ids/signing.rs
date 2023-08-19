@@ -1,4 +1,4 @@
-use std::{time::{SystemTime, UNIX_EPOCH}, collections::HashMap};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use openssl::{rsa::Padding, pkey::PKey, hash::MessageDigest, sign::Signer};
 use plist::Dictionary;
