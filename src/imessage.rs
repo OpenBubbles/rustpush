@@ -1,4 +1,4 @@
-use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor};
+use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc};
 
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::Data;
@@ -9,23 +9,23 @@ use rand::Rng;
 
 use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip}};
 
-
+#[derive(uniffi::Record)]
 pub struct BalloonBody {
     bid: String,
     data: Vec<u8>
 }
 
 // represents an IMessage
+#[derive(uniffi::Record)]
 pub struct IMessage {
     pub text: String,
     xml: Option<String>,
     participants: Vec<String>,
     pub sender: String,
-    id: Option<Uuid>,
+    id: Option<String>,
     group_id: Option<String>,
     body: Option<BalloonBody>,
     effect: Option<String>,
-    raw: Option<RawIMessage>
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,7 +52,7 @@ struct RawIMessage {
 impl IMessage {
     fn sanity_check(&mut self) {
         if self.id.is_none() {
-            self.id = Some(Uuid::new_v4());
+            self.id = Some(Uuid::new_v4().to_string());
         }
         if self.group_id.is_none() {
             self.group_id = Some(Uuid::new_v4().to_string());
@@ -67,7 +67,7 @@ impl IMessage {
             text: self.text.clone(),
             xml: self.xml.clone(),
             participants: self.participants.clone(),
-            id: self.id.map(|data| data.to_string()).clone(),
+            id: self.id.clone(),
             group_id: self.group_id.clone(),
             pv: 0,
             gv: "8".to_string(),
@@ -98,15 +98,14 @@ impl IMessage {
             xml: loaded.xml.clone(),
             participants: loaded.participants.clone(),
             sender,
-            id: loaded.id.clone().map(|id| Uuid::parse_str(&id).unwrap()),
+            id: loaded.id.clone(),
             group_id: loaded.group_id.clone(),
             body: if let Some(body) = &loaded.b {
                 if let Some(bid) = &loaded.bid {
                     Some(BalloonBody { bid: bid.clone(), data: body.clone().into() })
                 } else { None }
             } else { None },
-            effect: loaded.effect.clone(),
-            raw: Some(loaded)
+            effect: loaded.effect.clone()
         })
     }
 }
@@ -158,10 +157,17 @@ struct RecvMsg {
 }
 
 pub struct IMClient {
-    conn: Rc<APNSConnection>,
-    user: Rc<IDSUser>,
+    pub conn: Arc<APNSConnection>,
+    pub user: Arc<IDSUser>,
     key_cache: HashMap<String, Vec<IDSIdentityResult>>,
     raw_inbound: Receiver<APNSPayload>
+}
+
+#[derive(uniffi::Enum)]
+pub enum RecievedMessage {
+    Message {
+        msg: IMessage
+    }
 }
 
 const NORMAL_NONCE: [u8; 16] = [
@@ -169,7 +175,7 @@ const NORMAL_NONCE: [u8; 16] = [
 ];
 
 impl IMClient {
-    pub async fn new(conn: Rc<APNSConnection>, user: Rc<IDSUser>) -> IMClient {
+    pub async fn new(conn: Arc<APNSConnection>, user: Arc<IDSUser>) -> IMClient {
         IMClient {
             user,
             key_cache: HashMap::new(),
@@ -238,11 +244,21 @@ impl IMClient {
         Ok(decrypted_sym)
     }
 
-    pub async fn recieve(&mut self) -> Option<IMessage> {
+    pub async fn recieve(&mut self) -> Option<RecievedMessage> {
         let Ok(payload) = self.raw_inbound.try_recv() else {
             return None
         };
+        self.recieve_payload(payload).await
+    }
 
+    pub async fn recieve_wait(&mut self) -> Option<RecievedMessage> {
+        let Some(payload) = self.raw_inbound.recv().await else {
+            return None
+        };
+        self.recieve_payload(payload).await
+    }
+
+    async fn recieve_payload(&mut self, payload: APNSPayload) -> Option<RecievedMessage> {
         let body = payload.get_field(3).unwrap();
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
 
@@ -254,7 +270,9 @@ impl IMClient {
 
         let decrypted = self.decrypt(&payload).await.unwrap();
         
-        IMessage::from_raw(&decrypted, loaded.sender)
+        IMessage::from_raw(&decrypted, loaded.sender).map(|msg| RecievedMessage::Message {
+            msg
+        })
     }
 
     pub async fn cache_keys(&mut self, participants: &[String]) -> Result<(), IDSError> {
@@ -271,6 +289,11 @@ impl IMClient {
         Ok(())
     }
 
+    pub async fn validate_targets(&mut self, targets: &[String]) -> Result<Vec<String>, IDSError> {
+        self.cache_keys(targets).await?;
+        Ok(targets.iter().filter(|target| self.key_cache.contains_key(*target)).map(|i| i.clone()).collect())
+    }
+
     pub fn new_msg(&self, text: &str, targets: &[String]) -> IMessage {
         IMessage {
             text: text.to_string(),
@@ -280,8 +303,7 @@ impl IMClient {
             id: None,
             group_id: None,
             body: None,
-            effect: None,
-            raw: None
+            effect: None
         }
     }
 
@@ -367,7 +389,7 @@ impl IMClient {
             ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
             v: 8,
             i: u32::from_be_bytes(msg_id),
-            u: message.id.unwrap().as_bytes().to_vec().into(),
+            u: Uuid::new_v4().as_bytes().to_vec().into(),
             dtl: payloads,
             sp: message.sender.clone()
         };

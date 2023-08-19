@@ -19,7 +19,8 @@ pub enum IDSError {
     RegisterFailed(u64),
     IoError(io::Error),
     LookupFailed(u64),
-    KeyError(KeyError)
+    KeyError(KeyError),
+    TwoFaError
 }
 
 impl From<KeyError> for IDSError {

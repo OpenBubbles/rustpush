@@ -1,4 +1,4 @@
-use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap};
+use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap, sync::Arc};
 
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
 use plist::{Value, Data, Dictionary};
@@ -34,17 +34,13 @@ async fn attempt_auth(username: &str, password: &str) -> Result<Value, IDSError>
     Ok(response)
 }
 
-async fn get_auth_token<Fut: Future<Output = String>, F: FnOnce() -> Fut>
-        (username: &str, password: &str, factor_gen: F) -> Result<(String, String), IDSError> {
-    println!("{} {}", username, password);
-    let mut result = attempt_auth(username, password).await?;
+async fn get_auth_token(username: &str, password: &str) -> Result<(String, String), IDSError> {
+    let result = attempt_auth(username, password).await?;
     // attempt 2fa
-    if result.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap() == 5000 {
-        let password = password.to_string() + &factor_gen().await;
-        result = attempt_auth(username, &password).await?;
-    }
-
     let result_dict = result.as_dictionary().unwrap();
+    if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() == 5000 {
+        return Err(IDSError::TwoFaError)
+    }
     if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
         return Err(IDSError::AuthError(result.clone()));
     }
@@ -195,9 +191,8 @@ impl IDSUser {
         IDSUser { state }
     }
 
-    pub async fn authenticate<Fut: Future<Output = String>, F: FnOnce() -> Fut>
-            (conn: Rc<APNSConnection>, username: &str, password: &str, factor_gen: F)-> Result<IDSUser, IDSError> {
-        let (token, user_id) = get_auth_token(username, password, factor_gen).await?;
+    pub async fn authenticate(conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, IDSError> {
+        let (token, user_id) = get_auth_token(username, password).await?;
         let auth_keypair = get_auth_cert(&user_id, &token).await?;
         let handles = get_handles(&user_id, &auth_keypair, &conn.state).await?;
 
@@ -216,7 +211,7 @@ impl IDSUser {
         Ok(())
     }
 
-    pub async fn lookup(&self, conn: Rc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, IDSError> {
+    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, IDSError> {
         let body = plist_to_string(&LookupReq { uris: query })?;
 
         // gzip encode
