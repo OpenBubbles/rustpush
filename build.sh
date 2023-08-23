@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-cargo run --bin uniffi-bindgen generate --library target/release/librustpush.so --language kotlin --out-dir out
 cargo build --lib --target x86_64-linux-android --target i686-linux-android --target armv7-linux-androideabi --target aarch64-linux-android
+cargo run --bin uniffi-bindgen generate --library target/aarch64-linux-android/debug/librustpush.so --language kotlin --out-dir out
 
 mkdir -p jniLibs/arm64-v8a/ && 
     cp target/aarch64-linux-android/debug/librustpush.so jniLibs/arm64-v8a/ &&

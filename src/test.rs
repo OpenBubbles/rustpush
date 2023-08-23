@@ -87,8 +87,6 @@ async fn main() {
         user.register_id(&connection.state, &validation).await.unwrap();
     }
 
-    //let lookup = user.lookup(connection.clone(), vec!["tel:+17203818329".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
-
     let state = SavedState {
         push: connection.state.clone(),
         auth: user.state.clone()
@@ -98,6 +96,9 @@ async fn main() {
     
     let user = Arc::new(user);
     let mut client = IMClient::new(connection.clone(), user.clone()).await;
+
+    //client.validate_targets(&["tel:+17204878766".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
+
 
     //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
     //let mut msg = client.new_msg("woah test", &["mailto:jjtech@jjtech.dev".to_string()]);

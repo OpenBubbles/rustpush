@@ -3,7 +3,7 @@ use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::Data;
 use serde::{Serialize, Deserialize};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::{mpsc::Receiver, Mutex};
 use uuid::Uuid;
 use rand::Rng;
 
@@ -159,8 +159,8 @@ struct RecvMsg {
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub user: Arc<IDSUser>,
-    key_cache: HashMap<String, Vec<IDSIdentityResult>>,
-    raw_inbound: Receiver<APNSPayload>
+    key_cache: Mutex<HashMap<String, Vec<IDSIdentityResult>>>,
+    raw_inbound: Mutex<Receiver<APNSPayload>>
 }
 
 #[derive(uniffi::Enum)]
@@ -178,8 +178,8 @@ impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, user: Arc<IDSUser>) -> IMClient {
         IMClient {
             user,
-            key_cache: HashMap::new(),
-            raw_inbound: conn.reader.register_for(|pay| {
+            key_cache: Mutex::new(HashMap::new()),
+            raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
                     return false
                 }
@@ -192,7 +192,7 @@ impl IMClient {
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let has_p = load.as_dictionary().unwrap().contains_key("P");
                 has_p
-            }).await,
+            }).await),
             conn
         }
     }
@@ -205,10 +205,15 @@ impl IMClient {
         (body, sig)
     }
 
-    async fn verify_payload(&mut self, payload: &[u8], sender: &str, sender_token: &[u8]) -> bool {
+    pub fn get_handles(&self) -> &[String] {
+        &self.user.state.handles
+    }
+
+    async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8]) -> bool {
         self.cache_keys(&[sender.to_string()]).await.unwrap();
 
-        let Some(keys) = self.key_cache.get(sender) else {
+        let cache = self.key_cache.lock().await;
+        let Some(keys) = cache.get(sender) else {
             println!("Cannot verify; no public key");
             return false
         };
@@ -245,20 +250,20 @@ impl IMClient {
     }
 
     pub async fn recieve(&mut self) -> Option<RecievedMessage> {
-        let Ok(payload) = self.raw_inbound.try_recv() else {
+        let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
             return None
         };
         self.recieve_payload(payload).await
     }
 
-    pub async fn recieve_wait(&mut self) -> Option<RecievedMessage> {
-        let Some(payload) = self.raw_inbound.recv().await else {
+    pub async fn recieve_wait(&self) -> Option<RecievedMessage> {
+        let Some(payload) = self.raw_inbound.lock().await.recv().await else {
             return None
         };
         self.recieve_payload(payload).await
     }
 
-    async fn recieve_payload(&mut self, payload: APNSPayload) -> Option<RecievedMessage> {
+    async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
         let body = payload.get_field(3).unwrap();
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
 
@@ -275,33 +280,40 @@ impl IMClient {
         })
     }
 
-    pub async fn cache_keys(&mut self, participants: &[String]) -> Result<(), IDSError> {
+    pub async fn cache_keys(&self, participants: &[String]) -> Result<(), IDSError> {
         // find participants whose keys need to be fetched
-        let fetch: Vec<String> = participants.iter().filter(|p| !self.key_cache.contains_key(*p))
+        let key_cache = self.key_cache.lock().await;
+        let fetch: Vec<String> = participants.iter().filter(|p| !key_cache.contains_key(*p))
             .map(|p| p.to_string()).collect();
         if fetch.len() == 0 {
             return Ok(())
         }
+        drop(key_cache);
         let results = self.user.lookup(self.conn.clone(), fetch).await?;
+        let mut key_cache = self.key_cache.lock().await;
         for (id, results) in results {
-            self.key_cache.insert(id, results);
+            if results.len() == 0 {
+                continue // no results
+            }
+            key_cache.insert(id, results);
         }
         Ok(())
     }
 
-    pub async fn validate_targets(&mut self, targets: &[String]) -> Result<Vec<String>, IDSError> {
+    pub async fn validate_targets(&self, targets: &[String]) -> Result<Vec<String>, IDSError> {
         self.cache_keys(targets).await?;
-        Ok(targets.iter().filter(|target| self.key_cache.contains_key(*target)).map(|i| i.clone()).collect())
+        let key_cache = self.key_cache.lock().await;
+        Ok(targets.iter().filter(|target| key_cache.contains_key(*target)).map(|i| i.clone()).collect())
     }
 
-    pub fn new_msg(&self, text: &str, targets: &[String]) -> IMessage {
+    pub fn new_msg(&self, text: &str, targets: &[String], group_id: &str) -> IMessage {
         IMessage {
             text: text.to_string(),
             xml: None,
             participants: targets.to_vec(),
             sender: self.user.state.handles[0].clone(),
             id: None,
-            group_id: None,
+            group_id: Some(group_id.to_string()),
             body: None,
             effect: None
         }
@@ -358,15 +370,16 @@ impl IMClient {
         Ok(payload)
     }
 
-    pub async fn send(&mut self, message: &mut IMessage) -> Result<(), IDSError> {
+    pub async fn send(&self, message: &mut IMessage) -> Result<(), IDSError> {
         message.sanity_check();
         self.cache_keys(message.participants.as_ref()).await?;
         let raw = message.to_raw();
 
         let mut payloads: Vec<BundledPayload> = vec![];
 
+        let key_cache = self.key_cache.lock().await;
         for participant in &message.participants {
-            for token in self.key_cache.get(participant).unwrap() {
+            for token in key_cache.get(participant).unwrap() {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
                     // don't send to ourself
                     continue;
@@ -381,6 +394,7 @@ impl IMClient {
                 });
             }
         }
+        drop(key_cache);
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = SendMsg {
             fcn: 1,

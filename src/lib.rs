@@ -5,13 +5,13 @@ mod ids;
 mod util;
 mod imessage;
 
-use std::{rc::Rc, future::Future, io::Error, sync::Arc};
+use std::sync::Arc;
 
 use apns::{APNSState, APNSConnection};
 use ids::{user::{IDSState, IDSUser}, IDSError};
 use imessage::{IMClient, IMessage, RecievedMessage};
 use serde::{Serialize, Deserialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 uniffi::setup_scaffolding!();
 
@@ -29,18 +29,22 @@ pub enum RegistrationPhase {
     REGISTERED
 }
 
-struct PushStateInner {
+pub struct InnerPushState {
     conn: Option<Arc<APNSConnection>>,
     user: Option<IDSUser>,
     client: Option<IMClient>
 }
 
 #[derive(uniffi::Object)] 
-pub struct PushState(Mutex<PushStateInner>);
+pub struct PushState (RwLock<InnerPushState>);
 
 #[derive(uniffi::Error)]
 pub enum PushError {
     TwoFaError,
+    AuthError,
+    RegisterFailed {
+        code: u64
+    },
     UnknownError {
         text: String
     }
@@ -51,6 +55,10 @@ impl From<IDSError> for PushError {
         match value {
             IDSError::TwoFaError =>
                 PushError::TwoFaError,
+            IDSError::AuthError(_) =>
+                PushError::AuthError,
+            IDSError::RegisterFailed(err) =>
+                PushError::RegisterFailed { code: err },
             _error => PushError::UnknownError { text: format!("{:?}", _error) }
         }
     }
@@ -60,7 +68,7 @@ impl From<IDSError> for PushError {
 impl PushState {
     #[uniffi::constructor]
     pub fn new() -> Arc<PushState> {
-        Arc::new(PushState(Mutex::new(PushStateInner {
+        Arc::new(PushState(RwLock::new(InnerPushState {
             conn: None,
             user: None,
             client: None
@@ -71,37 +79,48 @@ impl PushState {
         if self.get_phase().await != RegistrationPhase::REGISTERED {
             panic!("Wrong phase! (recv_wait)")
         }
-        let mut inner = self.0.lock().await;
-        inner.client.as_mut().unwrap().recieve_wait().await
+        self.0.read().await.client.as_ref().unwrap().recieve_wait().await
     }
 
     pub async fn send(&self, mut msg: IMessage) -> Result<(), PushError> {
         if self.get_phase().await != RegistrationPhase::REGISTERED {
             panic!("Wrong phase! (send)")
         }
-        let mut inner = self.0.lock().await;
-        inner.client.as_mut().unwrap().send(&mut msg).await?;
+        self.0.read().await.client.as_ref().unwrap().send(&mut msg).await?;
         Ok(())
     }
 
-    pub async fn new_msg(&self, text: String, targets: Vec<String>) -> IMessage {
+    pub async fn get_handles(&self) -> Result<Vec<String>, PushError> {
+        if self.get_phase().await != RegistrationPhase::REGISTERED {
+            panic!("Wrong phase! (send)")
+        }
+        Ok(self.0.read().await.client.as_ref().unwrap().get_handles().to_vec())
+    }
+
+    pub async fn new_msg(&self, text: String, targets: Vec<String>, group_id: String) -> IMessage {
         if self.get_phase().await != RegistrationPhase::REGISTERED {
             panic!("Wrong phase! (new_msg)")
         }
-        let mut inner = self.0.lock().await;
-        inner.client.as_mut().unwrap().new_msg(&text, &targets)
+        self.0.read().await.client.as_ref().unwrap().new_msg(&text, &targets, &group_id)
     }
 
     pub async fn validate_targets(&self, targets: Vec<String>) -> Result<Vec<String>, PushError> {
         if self.get_phase().await != RegistrationPhase::REGISTERED {
             panic!("Wrong phase! (validate_targets)")
         }
-        let mut inner = self.0.lock().await;
-        Ok(inner.client.as_mut().unwrap().validate_targets(&targets).await?)
+        Ok(self.0.read().await.client.as_ref().unwrap().validate_targets(&targets).await?)
+    }
+
+    pub async fn cancel_registration(&self) {
+        if self.get_phase().await != RegistrationPhase::WANTS_VALID_ID {
+            return
+        }
+        let mut inner = self.0.write().await;
+        inner.user = None
     }
 
     pub async fn get_phase(&self) -> RegistrationPhase {
-        let inner = self.0.lock().await;
+        let inner = self.0.read().await;
         if inner.conn.is_none() {
             return RegistrationPhase::NOT_STARTED
         }
@@ -124,7 +143,7 @@ impl PushState {
         let connection = Arc::new(APNSConnection::new(Some(state.push.clone())).await.unwrap());
         connection.submitter.set_state(1).await;
         connection.submitter.filter(&["com.apple.madrid"]).await;
-        let mut inner = self.0.lock().await;
+        let mut inner = self.0.write().await;
         inner.conn = Some(connection);
 
         let user = Arc::new(IDSUser::restore_authentication(state.auth.clone()));
@@ -136,7 +155,7 @@ impl PushState {
         if self.get_phase().await != RegistrationPhase::NOT_STARTED {
             panic!("Wrong phase! (new_push)")
         }
-        let mut inner = self.0.lock().await;
+        let mut inner = self.0.write().await;
         let connection = Arc::new(APNSConnection::new(None).await.unwrap());
         connection.submitter.set_state(1).await;
         connection.submitter.filter(&["com.apple.madrid"]).await;
@@ -147,7 +166,7 @@ impl PushState {
         if self.get_phase().await != RegistrationPhase::WANTS_USER_PASS {
             panic!("Wrong phase! (try_auth)")
         }
-        let mut inner = self.0.lock().await;
+        let mut inner = self.0.write().await;
         inner.user = 
             Some(IDSUser::authenticate(inner.conn.as_ref().unwrap().clone(), username.trim(), password.trim()).await?);
         
@@ -155,12 +174,13 @@ impl PushState {
     }
 
     pub async fn register_ids(&self, validation_data: String) -> Result<(), PushError> {
-        if self.get_phase().await != RegistrationPhase::WANTS_USER_PASS {
+        if self.get_phase().await != RegistrationPhase::WANTS_VALID_ID {
             panic!("Wrong phase! (register_ids)")
         }
-        let mut inner = self.0.lock().await;
+        let mut inner = self.0.write().await;
         let conn_state = inner.conn.as_ref().unwrap().state.clone();
         inner.user.as_mut().unwrap().register_id(&conn_state, &validation_data).await?;
+        inner.client = Some(IMClient::new(inner.conn.as_ref().unwrap().clone(), Arc::new(inner.user.take().unwrap())).await);
         Ok(())
     }
 
@@ -168,10 +188,10 @@ impl PushState {
         if self.get_phase().await != RegistrationPhase::REGISTERED {
             panic!("Wrong phase! (save_push)")
         }
-        let inner = self.0.lock().await;
+        let inner = self.0.read().await;
         let state = SavedState {
             push: inner.conn.as_ref().unwrap().state.clone(),
-            auth: inner.user.as_ref().unwrap().state.clone()
+            auth: inner.client.as_ref().unwrap().user.state.clone()
         };
         serde_json::to_string(&state).unwrap()
     }
