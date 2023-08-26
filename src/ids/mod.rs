@@ -2,7 +2,7 @@ use std::{io, fmt::Display};
 
 use openssl::{error::ErrorStack, aes::KeyError};
 
-use crate::bags::BagError;
+use crate::{bags::BagError, apns::APNSError};
 use thiserror::Error;
 
 pub mod user;
@@ -21,12 +21,19 @@ pub enum IDSError {
     IoError(io::Error),
     LookupFailed(u64),
     KeyError(KeyError),
+    APNsError(APNSError),
     TwoFaError
 }
 
 impl Display for IDSError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", format!("{:?}", self))
+    }
+}
+
+impl From<APNSError> for IDSError {
+    fn from(value: APNSError) -> Self {
+        IDSError::APNsError(value)
     }
 }
 

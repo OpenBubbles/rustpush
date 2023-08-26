@@ -23,6 +23,7 @@ rand = "0.8.5"
 serde_json = "1.0.104"
 libflate = "2.0.0"
 thiserror = "1.0.47"
+async-recursion = "1.0.4"
 
 [[bin]]
 name = "rustpush-test"

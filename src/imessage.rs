@@ -155,6 +155,8 @@ struct RecvMsg {
     sender: String,
     #[serde(rename = "t")]
     token: Data,
+    #[serde(rename = "tP")]
+    target: String,
     #[serde(rename = "U")]
     msg_guid: Data,
 }
@@ -285,7 +287,7 @@ impl IMClient {
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
         println!("xml2: {:?}", plist::Value::from_reader(Cursor::new(&body)));
 
-        let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.sender)) else {
+        let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.target)) else {
             panic!("No identity for sender {}", loaded.sender);
         };
 
@@ -434,7 +436,7 @@ impl IMClient {
         };
 
         let binary = plist_to_bin(&complete)?;
-        self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await;
+        self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
 
         Ok(())
     }

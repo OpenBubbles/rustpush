@@ -36,8 +36,6 @@ async fn main() {
     let saved_state: Option<SavedState> = serde_json::from_str(&data).ok();
 
     let connection = Arc::new(APNSConnection::new(saved_state.as_ref().map(|state| state.push.clone())).await.unwrap());
-    connection.submitter.set_state(1).await;
-    connection.submitter.filter(&["com.apple.madrid"]).await;
 
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
