@@ -1,14 +1,15 @@
-use std::io;
+use std::{io, fmt::Display};
 
 use openssl::{error::ErrorStack, aes::KeyError};
 
 use crate::bags::BagError;
+use thiserror::Error;
 
 pub mod user;
 pub mod signing;
 pub mod identity;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum IDSError {
     SSLError(ErrorStack),
     PlistError(plist::Error),
@@ -21,6 +22,12 @@ pub enum IDSError {
     LookupFailed(u64),
     KeyError(KeyError),
     TwoFaError
+}
+
+impl Display for IDSError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", format!("{:?}", self))
+    }
 }
 
 impl From<KeyError> for IDSError {

@@ -23,8 +23,6 @@ mod ids;
 mod util;
 mod imessage;
 
-uniffi::setup_scaffolding!();
-
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
     push: APNSState,

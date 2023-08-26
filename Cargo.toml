@@ -22,21 +22,12 @@ rustls-pemfile = "1.0.3"
 rand = "0.8.5"
 serde_json = "1.0.104"
 libflate = "2.0.0"
-uniffi = { git = "https://github.com/mozilla/uniffi-rs", features = [ "cli", "tokio" ] }
-
-[build-dependencies]
-uniffi = { git = "https://github.com/mozilla/uniffi-rs", features = [ "build" ] }
+thiserror = "1.0.47"
 
 [[bin]]
 name = "rustpush-test"
 path = "src/test.rs"
 
-[[bin]]
-# This can be whatever name makes sense for your project, but the rest of this tutorial assumes uniffi-bindgen.
-name = "uniffi-bindgen"
-path = "uniffi-bindgen.rs"
-
 [lib]
-crate-type = ["cdylib"]
 name = "rustpush"
 path = "src/lib.rs"
