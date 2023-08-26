@@ -2,7 +2,6 @@
 use std::{rc::Rc, sync::Arc};
 
 use apns::APNSState;
-use ids::user::{IDSState, get_handles};
 use imessage::IMClient;
 use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
@@ -10,6 +9,8 @@ use tokio::io::AsyncWriteExt;
 use util::{base64_encode, base64_decode};
 use crate::ids::IDSError;
 use crate::imessage::RecievedMessage;
+use crate::ids::user::IDSAppleUser;
+use crate::ids::identity::register;
 
 use tokio::time::{sleep, Duration};
 
@@ -26,7 +27,7 @@ mod imessage;
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
     push: APNSState,
-    auth: IDSState
+    users: Vec<IDSUser>
 }
 
 #[tokio::main]
@@ -38,8 +39,8 @@ async fn main() {
     connection.submitter.set_state(1).await;
     connection.submitter.filter(&["com.apple.madrid"]).await;
 
-    let mut user = if let Some(state) = saved_state.as_ref() {
-        IDSUser::restore_authentication(state.auth.clone())
+    let mut users = if let Some(state) = saved_state.as_ref() {
+        state.users.clone()
     } else {
         let stdin = io::stdin();
         print!("Username: ");
@@ -54,10 +55,10 @@ async fn main() {
 
         let mut twofa_code = "".to_string();
         loop {
-            let resp = IDSUser::authenticate(connection.clone(), username.trim(), &(password.trim().to_string() + &twofa_code)).await;
+            let resp = IDSAppleUser::authenticate(connection.clone(), username.trim(), &(password.trim().to_string() + &twofa_code)).await;
             match resp {
                 Ok(user) => {
-                    break user
+                    break vec![user]
                 }
                 Err(IDSError::TwoFaError) => {
                     println!("2fa code: ");
@@ -74,7 +75,7 @@ async fn main() {
         }
     };
 
-    if user.state.identity.is_none() {
+    if users[0].identity.is_none() {
         println!("Registering new identity...");
         print!("Enter validation data: ");
         io::stdout().flush().await.unwrap();
@@ -82,18 +83,18 @@ async fn main() {
         let mut reader = BufReader::new(stdin);
         let mut validation = String::new();
         reader.read_line(&mut validation).await.unwrap();
-        user.register_id(&connection.state, &validation).await.unwrap();
+        register(&validation, &mut users, connection.clone()).await.unwrap();
     }
 
     let state = SavedState {
         push: connection.state.clone(),
-        auth: user.state.clone()
+        users: users.clone()
     };
     let serialized = serde_json::to_string(&state).unwrap();
     fs::write("config.json", serialized).await.unwrap();
     
-    let user = Arc::new(user);
-    let mut client = IMClient::new(connection.clone(), user.clone()).await;
+    let users = Arc::new(users);
+    let mut client = IMClient::new(connection.clone(), users.clone()).await;
 
     //client.validate_targets(&["tel:+17204878766".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
 

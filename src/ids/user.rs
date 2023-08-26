@@ -1,4 +1,4 @@
-use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap, sync::Arc};
+use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap, sync::Arc, fmt::format};
 
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
 use plist::{Value, Data, Dictionary};
@@ -56,10 +56,18 @@ async fn get_auth_token(username: &str, password: &str) -> Result<(String, Strin
 struct AuthCertData {
     auth_token: String
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct AuthPhoneNumber {
+    push_token: Data,
+    sigs: Vec<Data>
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 struct AuthCertRequest {
-    authentication_data: AuthCertData,
+    authentication_data: Value,
     csr: Data,
     realm_user_id: String
 }
@@ -78,17 +86,17 @@ fn gen_csr(priv_key: &PKey<Private>) -> Result<Vec<u8>, IDSError> {
 }
 
 /* result is in der format (private, public) */
-async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, IDSError> {
+async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str) -> Result<KeyPair, IDSError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let body = AuthCertRequest {
-        authentication_data: AuthCertData { auth_token: token.to_string() },
+        authentication_data: auth_data,
         csr: gen_csr(&private_key)?.into(),
         realm_user_id: user_id.to_string()
     };
     
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = make_reqwest();
-    let resp = client.post(ids_bag.get("id-authenticate-ds-id").unwrap().as_string().unwrap())
+    let resp = client.post(ids_bag.get(endpoint_key).unwrap().as_string().unwrap())
             .header("x-protocol-version", "1630")
             .body(plist_to_string(&body)?)
             .send()
@@ -102,6 +110,17 @@ async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, IDSError> 
     }
     let cert = protocol.get("cert").unwrap().as_data().unwrap().to_vec();
     Ok(KeyPair { cert: cert, private: private_key.private_key_to_der()? })
+}
+
+async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, IDSError> {
+    authenticate(user_id, plist::to_value(&AuthCertData { auth_token: token.to_string() })?, "id-authenticate-ds-id").await
+}
+
+async fn get_phone_cert(phone_number: &str, push_token: &[u8], phone_signatures: &[Vec<u8>]) -> Result<KeyPair, IDSError> {
+    authenticate(&format!("P:{}", phone_number), plist::to_value(&AuthPhoneNumber {
+        push_token: push_token.to_vec().into(),
+        sigs: phone_signatures.iter().map(|number| number.clone().into()).collect()
+    })?, "id-authenticate-phone-number").await
 }
 
 #[derive(Deserialize)]
@@ -136,17 +155,23 @@ pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APN
     Ok(handles)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct IDSState {
-    pub auth_keypair: KeyPair,
-    pub user_id: String,
-    pub handles: Vec<String>,
-    pub identity: Option<IDSIdentity>
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub enum IDSUserType {
+    Apple,
+    Phone
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct IDSUser {
-    pub state: IDSState
+    pub auth_keypair: KeyPair,
+    pub user_id: String,
+    pub handles: Vec<String>, // usable handles
+    pub identity: Option<IDSIdentity>,
+    pub user_type: IDSUserType
 }
+
+pub struct IDSAppleUser;
+pub struct IDSPhoneUser;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct LookupReq {
@@ -184,28 +209,9 @@ pub struct IDSIdentityResult {
 }
 
 impl IDSUser {
-    pub fn restore_authentication(state: IDSState) -> IDSUser {
-        IDSUser { state }
-    }
-
-    pub async fn authenticate(conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, IDSError> {
-        let (token, user_id) = get_auth_token(username, password).await?;
-        let auth_keypair = get_auth_cert(&user_id, &token).await?;
-        let handles = get_handles(&user_id, &auth_keypair, &conn.state).await?;
-
-        Ok(IDSUser {
-            state: IDSState {
-                auth_keypair,
-                user_id,
-                handles,
-                identity: None
-            }
-        })
-    }
-
-    pub async fn register_id(&mut self, state: &APNSState, validation: &str) -> Result<(), IDSError> {
-        self.state.identity = Some(IDSIdentity::new(&validation, self, state).await?);
-        Ok(())
+    // possible handles, which may have changed since registration
+    pub async fn possible_handles(&self, conn: Arc<APNSConnection>) -> Result<Vec<String>, IDSError> {
+        get_handles(&self.user_id, &self.auth_keypair, &conn.state).await
     }
 
     pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, IDSError> {
@@ -214,14 +220,14 @@ impl IDSUser {
         // gzip encode
         let encoded = gzip(body.as_bytes())?;
 
-        let handle = self.state.handles.first().unwrap();
+        let handle = self.handles.first().unwrap();
         let mut headers = Dictionary::from_iter([
             ("x-id-self-uri", Value::String(handle.clone())),
             ("x-protocol-version", "1640".into())
         ].into_iter());
 
         add_id_signature(&mut headers, &encoded, "id-query", 
-            &self.state.identity.as_ref().unwrap().id_keypair, &conn.state.token.as_ref().unwrap())?;
+            self.identity.as_ref().unwrap().id_keypair.as_ref().unwrap(), &conn.state.token.as_ref().unwrap())?;
         
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();
         let ids_bag = get_bag(IDS_BAG).await?;
@@ -278,5 +284,35 @@ impl IDSUser {
         }));
 
         Ok(answer)
+    }
+}
+
+impl IDSAppleUser {
+    pub async fn authenticate(conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, IDSError> {
+        let (token, user_id) = get_auth_token(username, password).await?;
+        let auth_keypair = get_auth_cert(&user_id, &token).await?;
+
+        Ok(IDSUser {
+            auth_keypair,
+            user_id,
+            handles: vec![],
+            identity: None,
+            user_type: IDSUserType::Apple
+        })
+    }
+}
+
+impl IDSPhoneUser {
+    pub async fn authenticate(conn: Arc<APNSConnection>, phone_number: &str, phone_sig: &[u8]) -> Result<IDSUser, IDSError> {
+        let auth_keypair = get_phone_cert(phone_number, 
+                conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()]).await?;
+
+        Ok(IDSUser {
+            auth_keypair,
+            user_id: format!("P:{}", phone_number),
+            handles: vec![],
+            identity: None,
+            user_type: IDSUserType::Phone
+        })
     }
 }

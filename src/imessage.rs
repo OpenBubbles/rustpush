@@ -159,11 +159,13 @@ struct RecvMsg {
     msg_guid: Data,
 }
 
+
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
-    pub user: Arc<IDSUser>,
+    pub users: Arc<Vec<IDSUser>>,
     key_cache: Mutex<HashMap<String, Vec<IDSIdentityResult>>>,
-    raw_inbound: Mutex<Receiver<APNSPayload>>
+    raw_inbound: Mutex<Receiver<APNSPayload>>,
+    pub current_handle: Mutex<String>
 }
 
 pub enum RecievedMessage {
@@ -177,9 +179,8 @@ const NORMAL_NONCE: [u8; 16] = [
 ];
 
 impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, user: Arc<IDSUser>) -> IMClient {
+    pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
         IMClient {
-            user,
             key_cache: Mutex::new(HashMap::new()),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
@@ -195,7 +196,9 @@ impl IMClient {
                 let has_p = load.as_dictionary().unwrap().contains_key("P");
                 has_p
             }).await),
-            conn
+            conn,
+            current_handle: Mutex::new(users[0].handles[0].clone()),
+            users,
         }
     }
 
@@ -207,8 +210,15 @@ impl IMClient {
         (body, sig)
     }
 
-    pub fn get_handles(&self) -> &[String] {
-        &self.user.state.handles
+    pub async fn use_handle(&self, handle: &str) {
+        let mut cache = self.key_cache.lock().await;
+        cache.clear();
+        let mut current_identity = self.current_handle.lock().await;
+        *current_identity = handle.to_string();
+    }
+
+    pub fn get_handles(&self) -> Vec<String> {
+        self.users.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
     }
 
     async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8]) -> bool {
@@ -231,10 +241,10 @@ impl IMClient {
         valid
     }
 
-    pub async fn decrypt(&self, payload: &[u8]) -> Result<Vec<u8>, IDSError> {
+    pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, IDSError> {
         let (body, _sig) = Self::parse_payload(payload);
         
-        let key = self.user.state.identity.as_ref().unwrap().priv_enc_key();
+        let key = user.identity.as_ref().unwrap().priv_enc_key();
         let mut decrypter = Decrypter::new(&key)?;
         decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
         decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
@@ -265,10 +275,19 @@ impl IMClient {
         self.recieve_payload(payload).await
     }
 
+    async fn current_user(&self) -> &IDSUser {
+        let current_handle = self.current_handle.lock().await;
+        self.users.iter().find(|user| user.handles.contains(&current_handle)).unwrap()
+    }
+
     async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
         let body = payload.get_field(3).unwrap();
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
         println!("xml2: {:?}", plist::Value::from_reader(Cursor::new(&body)));
+
+        let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.sender)) else {
+            panic!("No identity for sender {}", loaded.sender);
+        };
 
         let payload: Vec<u8> = loaded.payload.clone().into();
         let token: Vec<u8> = loaded.token.clone().into();
@@ -276,7 +295,7 @@ impl IMClient {
             panic!("Payload verification failed!");
         }
 
-        let decrypted = self.decrypt(&payload).await.unwrap();
+        let decrypted = self.decrypt(identity, &payload).await.unwrap();
         
         IMessage::from_raw(&decrypted, &loaded).map(|msg| RecievedMessage::Message {
             msg
@@ -292,7 +311,7 @@ impl IMClient {
             return Ok(())
         }
         drop(key_cache);
-        let results = self.user.lookup(self.conn.clone(), fetch).await?;
+        let results = self.current_user().await.lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
         for (id, results) in results {
             if results.len() == 0 {
@@ -309,12 +328,13 @@ impl IMClient {
         Ok(targets.iter().filter(|target| key_cache.contains_key(*target)).map(|i| i.clone()).collect())
     }
 
-    pub fn new_msg(&self, text: &str, targets: &[String], guid: &str) -> IMessage {
+    pub async fn new_msg(&self, text: &str, targets: &[String], guid: &str) -> IMessage {
+        let current_handle = self.current_handle.lock().await;
         IMessage {
             text: text.to_string(),
             xml: None,
             participants: targets.to_vec(),
-            sender: self.user.state.handles[0].clone(),
+            sender: current_handle.clone(),
             id: Some(guid.to_string()),
             sender_guid: None,
             body: None,
@@ -323,15 +343,16 @@ impl IMClient {
         }
     }
 
-    fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity) -> Result<Vec<u8>, IDSError> {
+    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity) -> Result<Vec<u8>, IDSError> {
         let rand = rand::thread_rng().gen::<[u8; 11]>();
+        let user = self.current_user().await;
 
         let hmac = PKey::hmac(&rand)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;
         let result = signer.sign_oneshot_to_vec(&[
             raw.to_vec(),
             vec![0x02],
-            self.user.state.identity.as_ref().unwrap().public().hash().to_vec(),
+            user.identity.as_ref().unwrap().public().hash().to_vec(),
             key.hash().to_vec()
         ].concat())?;
 
@@ -362,7 +383,7 @@ impl IMClient {
             encrypted_sym[100..].to_vec()
         ].concat();
 
-        let sig = self.user.state.identity.as_ref().unwrap().sign(&payload)?;
+        let sig = user.identity.as_ref().unwrap().sign(&payload)?;
         let payload = [
             vec![0x02],
             (payload.len() as u16).to_be_bytes().to_vec(),
@@ -388,7 +409,7 @@ impl IMClient {
                     // don't send to ourself
                     continue;
                 }
-                let payload = self.encrypt_payload(&raw, &token.identity)?;
+                let payload = self.encrypt_payload(&raw, &token.identity).await?;
                 payloads.push(BundledPayload {
                     participant: participant.clone(),
                     not_me: participant != &message.sender,

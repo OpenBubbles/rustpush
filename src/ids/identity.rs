@@ -1,11 +1,11 @@
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSState};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::{APNSState, APNSConnection}};
 
-use super::{IDSError, user::IDSUser, signing::auth_sign_req};
+use super::{IDSError, user::{IDSUser, IDSPhoneUser, IDSUserType}, signing::auth_sign_req};
 use serde::Serialize;
 use serde::Deserialize;
 
@@ -93,105 +93,32 @@ fn encode(encryption_key: &PKey<Private>, signing_key: &PKey<Private>) -> Vec<u8
 pub struct IDSIdentity {
     signing_key: Vec<u8>,
     encryption_key: Vec<u8>,
-    pub id_keypair: KeyPair
+    pub id_keypair: Option<KeyPair>
 }
 
 impl IDSIdentity {
-    pub async fn new(valid_ctx: &str, user: &IDSUser, push: &APNSState) -> Result<IDSIdentity, IDSError> {
+    pub fn new(push: &APNSState) -> Result<IDSIdentity, IDSError> {
         let encryption_key = PKey::from_rsa(Rsa::generate_with_e(1280, BigNum::from_u32(65537)?.as_ref())?)?;
         let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let signing_key = PKey::from_ec_key(EcKey::generate(&ec_group)?)?;
 
-        let body = Value::Dictionary(Dictionary::from_iter([
-            ("hardware-version", Value::String("MacBookPro18,3".to_string())),
-            ("language", Value::String("en-US".to_string())),
-            ("os-version", Value::String("macOS,13.2.1,22D68".to_string())),
-            ("software-version", Value::String("22D68".to_string())),
-            ("services", Value::Array(vec![
-                Value::Dictionary(Dictionary::from_iter([
-                    ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
-                        ("flags", Value::Integer(17.into())),
-                        ("name", "Messenger".into()),
-                        ("version", Value::Integer(1.into()))
-                    ].into_iter()))])),
-                    ("service", Value::String("com.apple.madrid".to_string())),
-                    ("users", Value::Array(vec![
-                        Value::Dictionary(Dictionary::from_iter([
-                            ("client-data", Value::Dictionary(Dictionary::from_iter([
-                                ("is-c2k-equipment", Value::Boolean(true)),
-                                ("optionally-receive-typing-indicators", Value::Boolean(true)),
-                                ("public-message-identity-key", Value::Data(encode(&encryption_key, &signing_key))),
-                                ("public-message-identity-version", Value::Integer(2.into())),
-                                ("show-peer-errors", Value::Boolean(true)),
-                                ("supports-ack-v1", Value::Boolean(true)),
-                                ("supports-activity-sharing-v1", Value::Boolean(true)),
-                                ("supports-audio-messaging-v2", Value::Boolean(true)),
-                                ("supports-autoloopvideo-v1", Value::Boolean(true)),
-                                ("supports-be-v1", Value::Boolean(true)),
-                                ("supports-ca-v1", Value::Boolean(true)),
-                                ("supports-fsm-v1", Value::Boolean(true)),
-                                ("supports-fsm-v2", Value::Boolean(true)),
-                                ("supports-fsm-v3", Value::Boolean(true)),
-                                ("supports-ii-v1", Value::Boolean(true)),
-                                ("supports-impact-v1", Value::Boolean(true)),
-                                ("supports-inline-attachments", Value::Boolean(true)),
-                                ("supports-keep-receipts", Value::Boolean(true)),
-                                ("supports-location-sharing", Value::Boolean(true)),
-                                ("supports-media-v2", Value::Boolean(true)),
-                                ("supports-photos-extension-v1", Value::Boolean(true)),
-                                ("supports-st-v1", Value::Boolean(true)),
-                                ("supports-update-attachments-v1", Value::Boolean(true)),
-                            ].into_iter()))),
-                            ("uris", Value::Array(
-                                user.state.handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
-                                    ("uri", Value::String(handle.clone()))
-                                ].into_iter()))).collect()
-                            )),
-                            ("user-id", Value::String(user.state.user_id.to_string()))
-                        ].into_iter())),
-                    ]))
-                ].into_iter()))
-            ])),
-            ("validation-data", Value::Data(base64_decode(valid_ctx)))
-        ].into_iter()));
-
-        let body = plist_to_string(&body)?;
-        let client = make_reqwest();
-        let resp = auth_sign_req(
-            client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
-            .header("x-protocol-version", "1640")
-            .header("x-auth-user-id-0", user.state.user_id.to_string()),
-            body.as_bytes(),
-            "id-register",
-            &user.state.auth_keypair,
-            push,
-            Some(0))?
-            .body(body)
-            .send()
-            .await?;
-        
-        let data = resp.bytes().await?;
-        let parsed = plist::Value::from_reader(Cursor::new(&data))?;
-
-        let status = parsed.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
-        if status != 0 {
-            return Err(IDSError::RegisterFailed(status))
-        }
-
-        // umm parsed.services[0].users[0].cert
-        let data = parsed.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap().get(0).unwrap()
-                .as_dictionary().unwrap().get("users").unwrap().as_array().unwrap().get(0).unwrap().as_dictionary().unwrap()
-                .get("cert").unwrap().as_data().unwrap();
-
         Ok(IDSIdentity {
             signing_key: signing_key.private_key_to_der()?,
             encryption_key: encryption_key.private_key_to_der()?,
-            id_keypair: KeyPair { cert: data.to_vec(), private: user.state.auth_keypair.private.clone() }
+            id_keypair: None
         })
     }
 
     pub fn priv_enc_key(&self) -> PKey<Private> {
         PKey::private_key_from_der(&self.encryption_key).unwrap()
+    }
+
+    pub fn priv_sign_key(&self) -> PKey<Private> {
+        PKey::private_key_from_der(&self.signing_key).unwrap()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        encode(&self.priv_enc_key(), &self.priv_sign_key())
     }
 
     pub fn public(&self) -> IDSPublicIdentity {
@@ -212,4 +139,119 @@ impl IDSIdentity {
         let mut signer = Signer::new(MessageDigest::sha1(), signing_key.as_ref())?;
         Ok(signer.sign_oneshot_to_vec(&data)?)
     }
+}
+
+pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), IDSError> {
+
+    let mut user_payloads: Vec<Value> = vec![];
+    for user in users.iter_mut() {
+        user.handles = user.possible_handles(conn.clone()).await?;
+        let identity = user.identity.get_or_insert_with(|| {
+            IDSIdentity::new(&conn.state).unwrap()
+        });
+        let mut dict = Dictionary::from_iter([
+            ("client-data", Value::Dictionary(Dictionary::from_iter([
+                ("is-c2k-equipment", Value::Boolean(true)),
+                ("optionally-receive-typing-indicators", Value::Boolean(true)),
+                ("public-message-identity-key", Value::Data(identity.encode())),
+                ("public-message-identity-version", Value::Integer(2.into())),
+                ("show-peer-errors", Value::Boolean(true)),
+                ("supports-ack-v1", Value::Boolean(true)),
+                ("supports-activity-sharing-v1", Value::Boolean(true)),
+                ("supports-audio-messaging-v2", Value::Boolean(true)),
+                ("supports-autoloopvideo-v1", Value::Boolean(true)),
+                ("supports-be-v1", Value::Boolean(true)),
+                ("supports-ca-v1", Value::Boolean(true)),
+                ("supports-fsm-v1", Value::Boolean(true)),
+                ("supports-fsm-v2", Value::Boolean(true)),
+                ("supports-fsm-v3", Value::Boolean(true)),
+                ("supports-ii-v1", Value::Boolean(true)),
+                ("supports-impact-v1", Value::Boolean(true)),
+                ("supports-inline-attachments", Value::Boolean(true)),
+                ("supports-keep-receipts", Value::Boolean(true)),
+                ("supports-location-sharing", Value::Boolean(true)),
+                ("supports-media-v2", Value::Boolean(true)),
+                ("supports-photos-extension-v1", Value::Boolean(true)),
+                ("supports-st-v1", Value::Boolean(true)),
+                ("supports-update-attachments-v1", Value::Boolean(true)),
+            ].into_iter()))),
+            ("uris", Value::Array(
+                user.handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
+                    ("uri", Value::String(handle.clone()))
+                ].into_iter()))).collect()
+            )),
+            ("user-id", Value::String(user.user_id.to_string()))
+        ].into_iter());
+        if user.user_type == IDSUserType::Phone {
+            dict.insert("tag".to_string(), Value::String("SIM".to_string()));
+        }
+        user_payloads.push(Value::Dictionary(dict));
+    }
+
+    let body = Value::Dictionary(Dictionary::from_iter([
+        ("hardware-version", Value::String("MacBookPro18,3".to_string())),
+        ("language", Value::String("en-US".to_string())),
+        ("os-version", Value::String("macOS,13.2.1,22D68".to_string())),
+        ("software-version", Value::String("22D68".to_string())),
+        ("services", Value::Array(vec![
+            Value::Dictionary(Dictionary::from_iter([
+                ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
+                    ("flags", Value::Integer(17.into())),
+                    ("name", "Messenger".into()),
+                    ("version", Value::Integer(1.into()))
+                ].into_iter()))])),
+                ("service", Value::String("com.apple.madrid".to_string())),
+                ("users", Value::Array(user_payloads))
+            ].into_iter()))
+        ])),
+        ("validation-data", Value::Data(base64_decode(valid_ctx)))
+    ].into_iter()));
+
+    let body = plist_to_string(&body)?;
+    let client = make_reqwest();
+
+    let mut builder = client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
+        .header("x-protocol-version", "1640");
+    for (idx, user) in users.iter().enumerate() {
+        builder = auth_sign_req(
+            builder
+                .header(format!("x-auth-user-id-{}", idx), user.user_id.clone()),
+            body.as_bytes(), 
+            "id-register", 
+            &user.auth_keypair, 
+            &conn.state, 
+            Some(idx as u8)
+        )?;
+    }
+    let resp = builder
+        .body(body)
+        .send()
+        .await?;
+    
+    let data = resp.bytes().await?;
+    let parsed = plist::Value::from_reader(Cursor::new(&data))?;
+
+    let status = parsed.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
+    if status != 0 {
+        return Err(IDSError::RegisterFailed(status))
+    }
+
+    // umm parsed.services[0].users[x].cert
+    let users_array = parsed.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap().get(0).unwrap()
+            .as_dictionary().unwrap().get("users").unwrap().as_array().unwrap();
+    for user in users_array {
+        let dict = user.as_dictionary().unwrap();
+        let cert = dict.get("cert").unwrap().as_data().unwrap();
+        for uri in dict.get("uris").unwrap().as_array().unwrap() {
+            if uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
+                panic!("Failed to register URI {}: {:?}", uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap(), parsed);
+            }
+        }
+        let user_id = dict.get("user-id").unwrap().as_string().unwrap();
+        let user_obj = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
+        user_obj.identity.as_mut().unwrap().id_keypair = 
+            Some(KeyPair { cert: cert.to_vec(), private: user_obj.auth_keypair.private.clone() })
+    }
+    
+    Ok(())
 }
