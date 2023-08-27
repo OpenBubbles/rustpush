@@ -1,4 +1,4 @@
-use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr};
+use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::Data;
@@ -25,6 +25,10 @@ pub struct IMessage {
     pub sender_guid: Option<String>,
     pub body: Option<BalloonBody>,
     pub effect: Option<String>,
+    pub sent_timestamp: u64,
+    pub cv_name: Option<String>,
+    pub cv_new_name: Option<String>,
+    pub cv_old_name: Option<String>
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,6 +50,12 @@ struct RawIMessage {
     b: Option<Data>,
     #[serde(rename = "iid")]
     effect: Option<String>,
+    #[serde(rename = "n")]
+    cv_name: Option<String>,
+    #[serde(rename = "nn")]
+    cv_new_name: Option<String>,
+    #[serde(rename = "old")]
+    cv_old_name: Option<String>
 }
 
 impl IMessage {
@@ -73,7 +83,10 @@ impl IMessage {
             v: "1".to_string(),
             bid: None,
             b: None,
-            effect: self.effect.clone()
+            effect: self.effect.clone(),
+            cv_name: self.cv_name.clone(),
+            cv_new_name: self.cv_new_name.clone(),
+            cv_old_name: self.cv_old_name.clone()
         };
 
         let binary = plist_to_bin(&raw).unwrap();
@@ -90,8 +103,8 @@ impl IMessage {
 
     fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
-        let loaded: RawIMessage = plist::from_bytes(&decompressed).ok()?;
         println!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        let loaded: RawIMessage = plist::from_bytes(&decompressed).ok()?;
         let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
         Some(IMessage {
             text: loaded.text.clone(),
@@ -106,7 +119,11 @@ impl IMessage {
                     Some(BalloonBody { bid: bid.clone(), data: body.clone().into() })
                 } else { None }
             } else { None },
-            effect: loaded.effect.clone()
+            effect: loaded.effect.clone(),
+            sent_timestamp: wrapper.sent_timestamp,
+            cv_name: loaded.cv_name.clone(),
+            cv_new_name: loaded.cv_new_name.clone(),
+            cv_old_name: loaded.cv_old_name.clone()
         })
     }
 }
@@ -159,6 +176,8 @@ struct RecvMsg {
     target: String,
     #[serde(rename = "U")]
     msg_guid: Data,
+    #[serde(rename = "e")]
+    sent_timestamp: u64
 }
 
 
@@ -196,6 +215,7 @@ impl IMClient {
                 };
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let has_p = load.as_dictionary().unwrap().contains_key("P");
+                println!("mydatsa: {:?}", load);
                 has_p
             }).await),
             conn,
@@ -285,7 +305,6 @@ impl IMClient {
     async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
         let body = payload.get_field(3).unwrap();
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
-        println!("xml2: {:?}", plist::Value::from_reader(Cursor::new(&body)));
 
         let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.target)) else {
             panic!("No identity for sender {}", loaded.sender);
@@ -330,18 +349,22 @@ impl IMClient {
         Ok(targets.iter().filter(|target| key_cache.contains_key(*target)).map(|i| i.clone()).collect())
     }
 
-    pub async fn new_msg(&self, text: &str, targets: &[String], guid: &str) -> IMessage {
+    pub async fn new_msg(&self, text: &str, targets: &[String]) -> IMessage {
         let current_handle = self.current_handle.lock().await;
         IMessage {
             text: text.to_string(),
             xml: None,
             participants: targets.to_vec(),
             sender: current_handle.clone(),
-            id: Some(guid.to_string()),
+            id: None,
             sender_guid: None,
             body: None,
             effect: None,
-            after_guid: None
+            after_guid: None,
+            sent_timestamp: 0,
+            cv_name: None,
+            cv_old_name: None,
+            cv_new_name: None
         }
     }
 
@@ -437,6 +460,12 @@ impl IMClient {
 
         let binary = plist_to_bin(&complete)?;
         self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        message.sent_timestamp = since_the_epoch.as_nanos() as u64;
 
         Ok(())
     }

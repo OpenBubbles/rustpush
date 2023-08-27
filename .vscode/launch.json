@@ -8,7 +8,7 @@
             "name": "(Linux) Launch",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceRoot}/target/debug/rustpush",
+            "program": "${workspaceRoot}/target/debug/rustpush-test",
             "args": [],
             "cwd": "${workspaceRoot}",
         }
