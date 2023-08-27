@@ -108,7 +108,7 @@ async fn main() {
         if let Some(msg) = msg {
             match msg {
                 RecievedMessage::Message { msg } => {
-                    println!("[{}]: {}", msg.sender, msg.text);
+                    println!("{}", msg);
                 }
             }
         }
