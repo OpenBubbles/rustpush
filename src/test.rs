@@ -109,7 +109,8 @@ async fn main() {
             match msg {
                 RecievedMessage::Message { msg } => {
                     println!("{}", msg);
-                }
+                },
+                RecievedMessage::Delivered { for_uuid } => {}
             }
         }
         sleep(Duration::from_millis(100)).await;
