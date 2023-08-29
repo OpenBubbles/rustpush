@@ -94,7 +94,7 @@ async fn main() {
     let users = Arc::new(users);
     let mut client = IMClient::new(connection.clone(), users.clone()).await;
 
-    //client.validate_targets(&["tel:+17204878766".to_string(),"mailto:tae.hagen@gmail.com".to_string()]).await.unwrap();
+    //client.validate_targets(&["mailto:textgpt@icloud.com".to_string()]).await.unwrap();
 
 
     //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
@@ -108,9 +108,10 @@ async fn main() {
         if let Some(msg) = msg {
             match msg {
                 RecievedMessage::Message { msg } => {
-                    println!("{}", msg);
-                },
-                RecievedMessage::Delivered { for_uuid } => {}
+                    if msg.has_payload() {
+                        println!("{}", msg);
+                    }
+                }
             }
         }
         sleep(Duration::from_millis(100)).await;
