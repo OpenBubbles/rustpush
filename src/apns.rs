@@ -156,14 +156,14 @@ pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>);
 
 impl APNSReader {
     #[async_recursion]
-    async fn reload_connection(self, write: APNSSubmitter, state: APNSState) {
+    async fn reload_connection(self, write: APNSSubmitter, state: APNSState, retry: u64) {
         println!("attempting to reconnect to APNs!");
+        tokio::time::sleep(Duration::from_secs(std::cmp::min(10 * retry, 30))).await;
         let stream = match APNSConnection::connect().await {
             Ok(stream) => stream,
             Err(err) => {
                 println!("failed to reconnect to APNs! {:?}", err);
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                self.reload_connection(write, state).await;
+                self.reload_connection(write, state, retry + 1).await;
                 return;
             }
         };
@@ -188,8 +188,7 @@ impl APNSReader {
             let Ok(payload) = result else {
                 println!("conn broken? {:?}", result);
                 drop(read);
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                self.reload_connection(write, state).await;
+                self.reload_connection(write, state, 0).await;
                 break // maybe conn broken?
             };
             let Some(payload) = payload else {

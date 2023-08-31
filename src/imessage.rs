@@ -10,7 +10,7 @@ use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, plist_to_string}};
 
 #[repr(C)]
 pub struct BalloonBody {
@@ -117,24 +117,53 @@ impl ReactMessage {
 }
 
 #[repr(C)]
+pub struct UnsendMessage {
+    pub tuuid: String,
+    pub edit_part: u64,
+}
+
+#[repr(C)]
+pub struct EditMessage {
+    pub tuuid: String,
+    pub edit_part: u64,
+    pub new_data: String
+}
+
+#[repr(C)]
 pub enum Message {
     Message(NormalMessage),
     RenameMessage(RenameMessage),
     ChangeParticipants(ChangeParticipantMessage),
     React(ReactMessage),
     Delivered,
-    Read
+    Read,
+    Typing,
+    Unsend(UnsendMessage),
+    Edit(EditMessage),
 }
 
 impl Message {
-    fn getC(&self) -> u8 {
+    fn get_c(&self) -> u8 {
         match self {
             Self::Message(_) => 100,
             Self::React(_) => 100,
             Self::RenameMessage(_) => 190,
             Self::ChangeParticipants(_) => 190,
-            Self::Delivered => 255,
-            Self::Read => 102
+            Self::Delivered => 101,
+            Self::Read => 102,
+            Self::Typing => 100,
+            Self::Edit(_) => 118,
+            Self::Unsend(_) => 118,
+        }
+    }
+
+    fn get_nr(&self) -> Option<bool> {
+        match self {
+            Self::Typing => Some(true),
+            Self::Delivered => Some(true),
+            Self::Edit(_) => Some(true),
+            Self::Unsend(_) => Some(true),
+            _ => None
         }
     }
 }
@@ -213,6 +242,30 @@ struct RawReactMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawEditMessage {
+    #[serde(rename = "epb")]
+    new_html_body: String,
+    et: u64,
+    #[serde(rename = "t")]
+    new_text: String,
+    #[serde(rename = "epi")]
+    part_index: u64,
+    #[serde(rename = "emg")]
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawUnsendMessage {
+    #[serde(rename = "emg")]
+    message: String,
+    rs: bool,
+    et: u64,
+    #[serde(rename = "epi")]
+    part_index: u64,
+    v: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: String,
@@ -266,7 +319,15 @@ impl IMessage {
         match &self.message {
             Message::Read => false,
             Message::Delivered => false,
+            Message::Typing => false,
             _ => true
+        }
+    }
+
+    pub fn get_ex(&self) -> Option<u32> {
+        match &self.message {
+            Message::Typing => Some(0),
+            _ => None
         }
     }
 
@@ -348,7 +409,30 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             },
             Message::Delivered => panic!("no enc body!"),
-            Message::Read => panic!("no enc body!")
+            Message::Read => panic!("no enc body!"),
+            Message::Typing => panic!("no enc body!"),
+            Message::Unsend(msg) => {
+                let raw = RawUnsendMessage {
+                    rs: true,
+                    message: msg.tuuid.clone(),
+                    et: 2,
+                    part_index: msg.edit_part,
+                    v: "1".to_string(),
+                };
+                plist_to_bin(&raw).unwrap()
+            },
+            Message::Edit(msg) => {
+                let inner = format!("<html><body><span message-part=\"{}\">{}</span></body></html>", msg.edit_part, html_escape::encode_text(&msg.new_data));
+                let raw = RawEditMessage {
+                    new_html_body: inner,
+                    et: 1,
+                    part_index: msg.edit_part,
+                    message: msg.tuuid.clone(),
+                    new_text: msg.new_data.clone()
+                };
+
+                plist_to_bin(&raw).unwrap()
+            }
         };
         println!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
         
@@ -365,6 +449,35 @@ impl IMessage {
     fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         println!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            return Some(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: None,
+                message: Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }),
+            })
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            let start = format!("<html><body><span message-part=\"{}\">", loaded.part_index);
+            let end = "</span></body></html>";
+            let clean = html_escape::decode_html_entities(&loaded.new_html_body[start.len()..loaded.new_html_body.len() - end.len()]).to_string();
+            return Some(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: None,
+                message: Message::Edit(EditMessage {
+                    tuuid: loaded.message,
+                    edit_part: loaded.part_index,
+                    new_data: clean
+                }),
+            })
+        }
         if let Ok(loaded) = plist::from_bytes::<RawChangeMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
@@ -482,6 +595,15 @@ impl fmt::Display for Message {
             },
             Message::Delivered => {
                 write!(f, "delivered")
+            },
+            Message::Typing => {
+                write!(f, "typing")
+            },
+            Message::Edit(e) => {
+                write!(f, "Edited {}", e.new_data)
+            },
+            Message::Unsend(_e) => {
+                write!(f, "unsent a message")
             }
         }
     }
@@ -512,7 +634,7 @@ struct SendMsg {
     fcn: u8,
     c: u8,
     #[serde(rename = "E")]
-    e: String,
+    e: Option<String>,
     ua: String,
     v: u8,
     i: u32,
@@ -520,7 +642,10 @@ struct SendMsg {
     u: Data,
     dtl: Vec<BundledPayload>,
     #[serde(rename = "sP")]
-    sp: String
+    sp: String,
+    #[serde(rename = "eX")]
+    ex: Option<u32>,
+    nr: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -574,10 +699,9 @@ impl IMClient {
                     return false
                 };
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-                let has_p = load.as_dictionary().unwrap().contains_key("P");
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
                 println!("mydatsa: {:?}", load);
-                has_p || get_c == 255 || get_c == 102
+                get_c == 100 || get_c == 101 || get_c == 102
             }).await),
             conn,
             current_handle: Mutex::new(users[0].handles[0].clone()),
@@ -679,7 +803,9 @@ impl IMClient {
 
         let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
         let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-        if get_c == 255 || get_c == 102 {
+        let ex = load.as_dictionary().unwrap().get("eX").map(|v| v.as_unsigned_integer().unwrap());
+        let htu = load.as_dictionary().unwrap().get("htu").map(|v| v.as_boolean().unwrap());
+        if get_c == 101 || get_c == 102 || (ex == Some(0) && htu == Some(true)) {
             let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
             let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
             return Some(RecievedMessage::Message {
@@ -687,8 +813,21 @@ impl IMClient {
                     id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
                     sender: None,
                     after_guid: None,
-                    conversation: None,
-                    message: if get_c == 255 {
+                    conversation: if ex == Some(0) && htu == Some(true) {
+                        // typing
+                        let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
+                        let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+                        Some(ConversationData {
+                            participants: vec![source.to_string(), target.to_string()],
+                            cv_name: None,
+                            sender_guid: None
+                        })
+                    } else {
+                        None
+                    },
+                    message: if ex == Some(0) && htu == Some(true) {
+                        Message::Typing
+                    } else if get_c == 101 {
                         Message::Delivered
                     } else {
                         Message::Read
@@ -696,6 +835,11 @@ impl IMClient {
                     sent_timestamp: time_recv / 1000000
                 }
             })
+        }
+
+        let has_p = load.as_dictionary().unwrap().contains_key("P");
+        if !has_p {
+            return None
         }
 
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
@@ -840,15 +984,19 @@ impl IMClient {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = SendMsg {
             fcn: 1,
-            c: message.message.getC(),
-            e: "pair".to_string(),
+            c: message.message.get_c(),
+            e: if message.has_payload() { Some("pair".to_string()) } else { None },
             ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
             v: 8,
             i: u32::from_be_bytes(msg_id),
             u: Uuid::from_str(&message.id).unwrap().as_bytes().to_vec().into(),
             dtl: payloads,
-            sp: message.sender.clone().unwrap()
+            sp: message.sender.clone().unwrap(),
+            ex: message.get_ex(),
+            nr: message.message.get_nr(),
         };
+
+        println!("logmsg {}", plist_to_string(&complete).unwrap());
 
         let binary = plist_to_bin(&complete)?;
         self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;

@@ -2,11 +2,12 @@
 use std::{rc::Rc, sync::Arc};
 
 use apns::APNSState;
-use imessage::IMClient;
+use imessage::{IMClient, ConversationData};
 use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use util::{base64_encode, base64_decode};
+use uuid::Uuid;
 use crate::ids::IDSError;
 use crate::imessage::RecievedMessage;
 use crate::ids::user::IDSAppleUser;
@@ -94,12 +95,19 @@ async fn main() {
     let users = Arc::new(users);
     let mut client = IMClient::new(connection.clone(), users.clone()).await;
 
-    //client.validate_targets(&["mailto:textgpt@icloud.com".to_string()]).await.unwrap();
+    //client.validate_targets(&["mailto:testu3@icloud.com".to_string()]).await.unwrap();
 
 
     //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
     //let mut msg = client.new_msg("woah test", &["mailto:jjtech@jjtech.dev".to_string()]);
-    //client.send(&mut msg).await.unwrap();
+    /*let mut msg = client.new_msg(ConversationData {
+        participants: vec!["tel:+17203818329".to_string()],
+        cv_name: None,
+        sender_guid: Some(Uuid::new_v4().to_string())
+    }, imessage::Message::Present).await;
+    println!("sendingrun");
+    client.send(&mut msg).await.unwrap();
+    println!("sendingdone");*/
 
     //sleep(Duration::from_millis(10000)).await;
     

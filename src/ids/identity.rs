@@ -174,6 +174,28 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
                 ("supports-photos-extension-v1", Value::Boolean(true)),
                 ("supports-st-v1", Value::Boolean(true)),
                 ("supports-update-attachments-v1", Value::Boolean(true)),
+                ("supports-people-request-messages", Value::Boolean(true)),
+                ("supports-people-request-messages-v2", Value::Boolean(true)),
+                ("supports-people-request-messages-v3", Value::Boolean(true)),
+                ("supports-rem", Value::Boolean(true)),
+                ("kt-version", Value::Real(5.0)),
+                ("nicknames-version", Value::Real(1.0)),
+                ("ec-version", Value::Real(1.0)),
+                ("supports-cross-platform-sharing", Value::Boolean(true)),
+                ("supports-original-timestamp-v1", Value::Boolean(true)),
+                ("supports-sa-v1", Value::Boolean(true)),
+                ("supports-photos-extension-v2", Value::Boolean(true)),
+                ("prefers-sdr", Value::Boolean(false)),
+                ("supports-shared-exp", Value::Boolean(true)),
+                ("supports-protobuf-payload-data-v2", Value::Boolean(true)),
+                ("supports-hdr", Value::Boolean(true)),
+                ("supports-heif", Value::Boolean(true)),
+                ("supports-certified-delivery-v1", Value::Boolean(true)),
+                ("supports-dq-nr", Value::Boolean(true)),
+                ("supports-family-invite-message-bubble", Value::Boolean(true)),
+                ("supports-live-delivery", Value::Boolean(true)),
+                ("supports-uwb", Value::Boolean(true)),
+
             ].into_iter()))),
             ("uris", Value::Array(
                 user.handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
@@ -196,9 +218,9 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
         ("services", Value::Array(vec![
             Value::Dictionary(Dictionary::from_iter([
                 ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
-                    ("flags", Value::Integer(17.into())),
+                    ("flags", Value::Integer(1.into())),
                     ("name", "Messenger".into()),
-                    ("version", Value::Integer(1.into()))
+                    ("version", Value::Integer(1.into())),
                 ].into_iter()))])),
                 ("service", Value::String("com.apple.madrid".to_string())),
                 ("users", Value::Array(user_payloads))

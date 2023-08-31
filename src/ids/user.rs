@@ -241,7 +241,7 @@ impl IDSUser {
             ("v", 2.into()),
             ("b", Value::Data(encoded))
         ].into_iter()));
-        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await;
+        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await?;
 
         let response = conn.reader.wait_find_pred(move |x| {
             if x.id != 0x0A {
