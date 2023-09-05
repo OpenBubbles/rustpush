@@ -1,6 +1,7 @@
 
 use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
+use log::{debug, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::{Data, Value};
 use regex::Regex;
@@ -434,7 +435,7 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             }
         };
-        println!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
+        debug!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
         
         // do not gzip xml
         let final_msg = if !should_gzip {
@@ -448,7 +449,7 @@ impl IMessage {
 
     fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
-        println!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
@@ -700,7 +701,7 @@ impl IMClient {
                 };
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-                println!("mydatsa: {:?}", load);
+                debug!("mydatsa: {:?}", load);
                 get_c == 100 || get_c == 101 || get_c == 102
             }).await),
             conn,
@@ -734,21 +735,21 @@ impl IMClient {
 
         let cache = self.key_cache.lock().await;
         let Some(keys) = cache.get(sender) else {
-            println!("Cannot verify; no public key");
+            warn!("Cannot verify; no public key");
             if retry < 3 {
                 return self.verify_payload(payload, sender, sender_token, retry+1).await;
             } else {
-                println!("giving up");
+                warn!("giving up");
             }
             return false
         };
 
         let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
-            println!("Cannot verify; no public key");
+            warn!("Cannot verify; no public key");
             if retry < 3 {
                 return self.verify_payload(payload, sender, sender_token, retry+1).await;
             } else {
-                println!("giving up");
+                warn!("giving up");
             }
             return false
         };
@@ -996,7 +997,7 @@ impl IMClient {
             nr: message.message.get_nr(),
         };
 
-        println!("logmsg {}", plist_to_string(&complete).unwrap());
+        debug!("logmsg {}", plist_to_string(&complete).unwrap());
 
         let binary = plist_to_bin(&complete)?;
         self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;

@@ -25,6 +25,8 @@ libflate = "2.0.0"
 thiserror = "1.0.47"
 async-recursion = "1.0.4"
 html-escape = "0.2.13"
+log = "0.4.20"
+pretty_env_logger = "0.5.0"
 
 [[bin]]
 name = "rustpush-test"

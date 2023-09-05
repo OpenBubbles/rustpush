@@ -3,6 +3,7 @@ use std::{rc::Rc, sync::Arc};
 
 use apns::APNSState;
 use imessage::{IMClient, ConversationData};
+use log::info;
 use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
@@ -75,7 +76,7 @@ async fn main() {
     };
 
     if users[0].identity.is_none() {
-        println!("Registering new identity...");
+        info!("Registering new identity...");
         print!("Enter validation data: ");
         io::stdout().flush().await.unwrap();
         let stdin = io::stdin();

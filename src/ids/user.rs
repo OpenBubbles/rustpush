@@ -1,5 +1,6 @@
 use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap, sync::Arc, fmt::format};
 
+use log::info;
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
 use plist::{Value, Data, Dictionary};
 use rand::Rng;
@@ -47,7 +48,7 @@ async fn get_auth_token(username: &str, password: &str) -> Result<(String, Strin
     let token = result_dict.get("auth-token").unwrap().as_string().unwrap();
     let user_id = result_dict.get("profile-id").unwrap().as_string().unwrap();
     
-    println!("Got auth token for IDS {}", token);
+    info!("Got auth token for IDS {}", token);
     Ok((token.to_string(), user_id.to_string()))
 }
 
@@ -151,7 +152,7 @@ pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APN
     let parsed: HandleResult = plist::from_bytes(&data)?;
     let handles: Vec<String> = parsed.handles.iter().map(|h| h.uri.clone()).collect();
 
-    println!("User {} has handles {:?}", user_id, handles);
+    info!("User {} has handles {:?}", user_id, handles);
     Ok(handles)
 }
 
