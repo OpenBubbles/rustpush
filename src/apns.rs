@@ -2,6 +2,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
+use plist::Value;
 use rustls::Certificate;
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -246,6 +247,22 @@ impl APNSReader {
         rx
     }
 
+    pub async fn wait_find_msg<F>(&self, p: F) -> APNSPayload
+    where
+        F: Fn(&Value) -> bool + Send + Sync + 'static,
+    {
+        self.wait_find_pred(move |x| {
+            if x.id != 0x0A {
+                return false
+            }
+            let Some(body) = x.get_field(3) else {
+                return false
+            };
+            let loaded: Value = plist::from_bytes(body).unwrap();
+            p(&loaded)
+        }).await
+    }
+
     pub async fn wait_find_pred<F>(&self, p: F) -> APNSPayload
     where
         F: Fn(&APNSPayload) -> bool + Send + Sync + 'static,
@@ -255,16 +272,6 @@ impl APNSReader {
         locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
         drop(locked);
         rx.await.unwrap()
-        /*let mut interval = time::interval(Duration::from_millis(100));
-        loop {
-            let mut locked = self.0.lock().await;
-            let item = locked.iter().position(|item| p(item));
-            if let Some(item) = item {
-                return locked.remove(item);
-            }
-            drop(locked);
-            interval.tick().await;
-        }*/
     }
 
     pub async fn wait_find(&self, id: u8) -> APNSPayload {

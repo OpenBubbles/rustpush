@@ -200,14 +200,7 @@ impl MMCSAttachment {
         let binary = plist_to_bin(&complete)?;
         apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
         // wait for response
-        let response = apns.reader.wait_find_pred(move |x| {
-            if x.id != 0x0A {
-                return false
-            }
-            let Some(body) = x.get_field(3) else {
-                return false
-            };
-            let loaded: Value = plist::from_bytes(body).unwrap();
+        let response = apns.reader.wait_find_msg(move |loaded| {
             let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
                 return false
             };
@@ -241,14 +234,7 @@ impl MMCSAttachment {
         let binary = plist_to_bin(&complete)?;
         apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
         // wait for response
-        let response = apns.reader.wait_find_pred(move |x| {
-            if x.id != 0x0A {
-                return false
-            }
-            let Some(body) = x.get_field(3) else {
-                return false
-            };
-            let loaded: Value = plist::from_bytes(body).unwrap();
+        let response = apns.reader.wait_find_msg(move |loaded| {
             let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
                 return false
             };
