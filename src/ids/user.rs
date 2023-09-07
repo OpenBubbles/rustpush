@@ -255,7 +255,7 @@ impl IDSUser {
                 return false
             };
             let resp_id = resp_id.as_data().unwrap();
-            return resp_id == msg_id
+            resp_id == msg_id
         }).await;
 
         let data = response.get_field(3).unwrap();

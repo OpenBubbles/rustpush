@@ -1,5 +1,5 @@
 
-use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}, fs};
 
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::{Data, Value};
@@ -9,8 +9,9 @@ use tokio::sync::{mpsc::Receiver, Mutex};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
+use xml::{EventReader, EventWriter, reader, writer::XmlEvent, EmitterConfig};
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, plist_to_string}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, plist_to_string, decode_hex, encode_hex}, mmcs::{get_mmcs, calculate_mmcs_signature, put_mmcs}};
 
 #[repr(C)]
 pub struct BalloonBody {
@@ -28,7 +29,7 @@ pub struct ConversationData {
 #[repr(C)]
 pub struct NormalMessage {
     pub text: String,
-    pub xml: Option<String>,
+    pub attachments: Vec<Attachment>,
     pub body: Option<BalloonBody>,
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
@@ -127,6 +128,277 @@ pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
     pub new_data: String
+}
+
+#[repr(C)]
+pub struct MMCSAttachment {
+    signature: Vec<u8>,
+    object: String,
+    url: String,
+    key: Vec<u8>
+}
+
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSDownload {
+    #[serde(rename = "mO")]
+    object: String,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSDownloadResponse {
+    #[serde(rename = "mA")]
+    token: String,
+    #[serde(rename = "mU")]
+    dsid: String,
+    s: u64
+}
+
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSUpload {
+    #[serde(rename = "mL")]
+    length: usize,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSUploadResponse {
+    #[serde(rename = "mA")]
+    token: String,
+    #[serde(rename = "mR")]
+    domain: String,
+    #[serde(rename = "mU")]
+    object: String
+}
+
+impl MMCSAttachment {
+    async fn new(apns: &APNSConnection, body: &[u8]) -> Result<MMCSAttachment, IDSError> {
+        let key = rand::thread_rng().gen::<[u8; 32]>();
+        let encrypted = encrypt(Cipher::aes_256_ctr(), &key, Some(&ZERO_NONCE), &body)?;
+        let sig = calculate_mmcs_signature(&encrypted);
+        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+        let complete = RequestMMCSUpload {
+            c: 150,
+            ua: "[Mac OS X,10.11.6,15G31,iMac13,1]".to_string(),
+            v: 3,
+            i: u32::from_be_bytes(msg_id),
+            length: encrypted.len(),
+            signature: sig.clone().into()
+        };
+        let binary = plist_to_bin(&complete)?;
+        apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+        let response = apns.reader.wait_find_pred(move |x| {
+            if x.id != 0x0A {
+                return false
+            }
+            let Some(body) = x.get_field(3) else {
+                return false
+            };
+            let loaded: Value = plist::from_bytes(body).unwrap();
+            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                return false
+            };
+            c.as_unsigned_integer().unwrap() == 150
+        }).await;
+        let response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
+
+        let url = format!("{}/{}", response.domain, response.object);
+        put_mmcs(&sig, &encrypted, &url, &response.token, &response.object).await?;
+
+        Ok(MMCSAttachment {
+            signature: sig.to_vec(),
+            object: response.object,
+            url,
+            key: key.to_vec()
+        })
+    }
+
+    async fn get_attachment(&self, apns: &APNSConnection) -> Result<Vec<u8>, IDSError> {
+        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+        let complete = RequestMMCSDownload {
+            c: 151,
+            ua: "[Mac OS X,10.11.6,15G31,iMac13,1]".to_string(),
+            v: 3,
+            i: u32::from_be_bytes(msg_id),
+            object: self.object.clone(),
+            signature: self.signature.clone().into()
+        };
+
+        let binary = plist_to_bin(&complete)?;
+        apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+        println!("sent message");
+        let response = apns.reader.wait_find_pred(move |x| {
+            if x.id != 0x0A {
+                return false
+            }
+            let Some(body) = x.get_field(3) else {
+                return false
+            };
+            let loaded: Value = plist::from_bytes(body).unwrap();
+            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                return false
+            };
+            c.as_unsigned_integer().unwrap() == 151
+        }).await;
+
+        let response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
+        
+        let encrypted = get_mmcs(&self.signature, &response.token, &response.dsid, &self.url).await?;
+
+        Ok(decrypt(Cipher::aes_256_ctr(), &self.key, Some(&ZERO_NONCE), &encrypted)?)
+    }
+}
+
+#[repr(C)]
+pub enum AttachmentType {
+    Inline(Vec<u8>),
+    MMCS(MMCSAttachment)
+}
+
+#[repr(C)]
+pub struct Attachment {
+    a_type: AttachmentType,
+    part: u64,
+    uti_type: String,
+    size: usize,
+    mime: String,
+    name: String
+}
+
+impl Attachment {
+
+    pub async fn new_mmcs(apns: &APNSConnection, data: &[u8], mime: &str, uti: &str, name: &str, part: u64) -> Result<Attachment, IDSError> {
+        let mmcs = MMCSAttachment::new(apns, data).await?;
+        Ok(Attachment {
+            a_type: AttachmentType::MMCS(mmcs),
+            part,
+            uti_type: uti.to_string(),
+            size: data.len(),
+            mime: mime.to_string(),
+            name: name.to_string()
+        })
+    }
+
+    pub async fn get_attachment(&self, apns: &APNSConnection) -> Result<Vec<u8>, IDSError> {
+        match &self.a_type {
+            AttachmentType::Inline(data) => {
+                Ok(data.clone())
+            },
+            AttachmentType::MMCS(mmcs) => {
+                mmcs.get_attachment(apns).await
+            }
+        }
+    }
+
+    fn stringify_attachments(raw: &mut RawIMessage, attachments: &[Attachment]) -> String {
+        let mut output = vec![];
+        let writer_config = EmitterConfig::new()
+            .write_document_declaration(false);
+        let mut writer = writer_config.create_writer(Cursor::new(&mut output));
+        writer.write(XmlEvent::start_element("html")).unwrap();
+        writer.write(XmlEvent::start_element("body")).unwrap();
+        for (idx, attachment) in attachments.iter().enumerate() {
+            let filesize = attachment.size.to_string();
+            let part = attachment.part.to_string();
+            let element = XmlEvent::start_element("FILE")
+                .attr("name", &attachment.name)
+                .attr("width", "0")
+                .attr("height", "0")
+                .attr("datasize", &filesize)
+                .attr("mime-type", &attachment.mime)
+                .attr("uti-type", &attachment.uti_type)
+                .attr("file-size", &filesize)
+                .attr("message-part", &part);
+            match &attachment.a_type {
+                AttachmentType::Inline(data) => {
+                    let num = if idx == 0 {
+                        raw.inline0 = Some(data.clone().into());
+                        "ia-0"
+                    } else if idx == 1 {
+                        raw.inline1 = Some(data.clone().into());
+                        "ia-1"
+                    } else {
+                        continue;
+                    };
+                    writer.write(
+                        element
+                            .attr("inline-attachment", num)
+                    ).unwrap();
+                }
+                AttachmentType::MMCS(mmcs) => {
+                    writer.write(
+                        element
+                            .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
+                            .attr("mmcs-url", &mmcs.url)
+                            .attr("mmcs-owner", &mmcs.object)
+                            .attr("decryption-key", &encode_hex(&[
+                                vec![0x00],
+                                mmcs.key.clone()
+                            ].concat()))
+                    ).unwrap();
+                }
+            }
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+        writer.write(XmlEvent::end_element()).unwrap();
+        writer.write(XmlEvent::end_element()).unwrap();
+        let msg = std::str::from_utf8(&output).unwrap().to_string();
+        println!("{}", msg);
+        msg
+    }
+    fn parse_attachments(xml: &str, raw: &RawIMessage) -> Vec<Attachment> {
+        let mut data: Vec<Attachment> = vec![];
+        let reader = EventReader::new(Cursor::new(xml));
+        for e in reader {
+            match e {
+                Ok(reader::XmlEvent::StartElement { name, attributes, namespace }) => {
+                    let get_attr = |name: &str, def: Option<&str>| {
+                        attributes.iter().find(|attr| attr.name.to_string() == name)
+                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                    };
+                    if name.local_name == "FILE" {
+                        data.push(Attachment {
+                            a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                AttachmentType::Inline(if inline.value == "ia-0" {
+                                    raw.inline0.clone().unwrap().into()
+                                } else if inline.value == "ia-1" {
+                                    raw.inline1.clone().unwrap().into()
+                                } else {
+                                    continue
+                                })
+                            } else {
+                                let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
+                                let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                AttachmentType::MMCS(MMCSAttachment {
+                                    signature: sig.clone(), // chop off first byte because it's not actually the signature
+                                    object: get_attr("mmcs-owner", None),
+                                    url: get_attr("mmcs-url", None),
+                                    key: key[1..].to_vec()
+                                })
+                            },
+                            part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                            uti_type: get_attr("uti-type", None),
+                            size: get_attr("file-size", None).parse().unwrap(),
+                            mime: get_attr("mime-type", Some("application/octet-stream")),
+                            name: get_attr("name", None)
+                        })
+                    }
+                },
+                _ => {}
+            }
+        }
+        data
+    }
 }
 
 #[repr(C)]
@@ -287,7 +559,11 @@ struct RawIMessage {
     #[serde(rename = "n")]
     cv_name: Option<String>,
     #[serde(rename = "tg")]
-    reply: Option<String>
+    reply: Option<String>,
+    #[serde(rename = "ia-0")]
+    inline0: Option<Data>,
+    #[serde(rename = "ia-1")]
+    inline1: Option<Data>,
 }
 
 
@@ -388,9 +664,9 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             },
             Message::Message (normal) => {
-                let raw = RawIMessage {
+                let mut raw = RawIMessage {
                     text: normal.text.clone(),
-                    xml: normal.xml.clone(),
+                    xml: None,
                     participants: conversation.participants.clone(),
                     after_guid: self.after_guid.clone(),
                     sender_guid: conversation.sender_guid.clone(),
@@ -401,10 +677,16 @@ impl IMessage {
                     b: None,
                     effect: normal.effect.clone(),
                     cv_name: conversation.cv_name.clone(),
-                    reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid))
+                    reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
+                    inline0: None,
+                    inline1: None
                 };
+
+                if normal.attachments.len() > 0 {
+                    raw.xml = Some(Attachment::stringify_attachments(&mut raw, &normal.attachments));
+                }
                 
-                should_gzip = !normal.xml.is_some();
+                should_gzip = !raw.xml.is_some();
         
                 plist_to_bin(&raw).unwrap()
             },
@@ -539,7 +821,7 @@ impl IMessage {
         }
         if let Ok(loaded) = plist::from_bytes::<RawIMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            let replies = loaded.reply.map(|to| {
+            let replies = loaded.reply.as_ref().map(|to| {
                 let mut parts: Vec<&str> = to.split(":").collect();
                 parts.remove(0); // remove r:
                 let guididx = parts.iter().position(|p| p.contains("-")).unwrap();
@@ -559,7 +841,7 @@ impl IMessage {
                 }),
                 message: Message::Message(NormalMessage {
                     text: loaded.text.clone(),
-                    xml: loaded.xml.clone(),
+                    attachments: loaded.xml.as_ref().map_or(vec![], |data| Attachment::parse_attachments(data, &loaded)),
                     body: if let Some(body) = &loaded.b {
                             if let Some(bid) = &loaded.bid {
                                 Some(BalloonBody { bid: bid.clone(), data: body.clone().into() })
@@ -683,6 +965,12 @@ pub enum RecievedMessage {
 const NORMAL_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
 ];
+
+const ZERO_NONCE: [u8; 16] = [
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+];
+
+const MAX_SIZE: usize = 10000;
 
 impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
@@ -957,7 +1245,7 @@ impl IMClient {
         self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), false).await?;
         let raw = if message.has_payload() { message.to_raw() } else { vec![] };
 
-        let mut payloads: Vec<BundledPayload> = vec![];
+        let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
         let key_cache = self.key_cache.lock().await;
         for participant in &message.conversation.as_ref().unwrap().participants {
@@ -966,40 +1254,59 @@ impl IMClient {
                     // don't send to ourself
                     continue;
                 }
-                payloads.push(BundledPayload {
+                let encrypted = if message.has_payload() {
+                    let payload = self.encrypt_payload(&raw, &token.identity).await?;
+                    Some(payload)
+                } else {
+                    None
+                };
+
+                payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
                     participant: participant.clone(),
                     not_me: participant != message.sender.as_ref().unwrap(),
                     session_token: token.session_token.clone().into(),
-                    payload: if message.has_payload() {
-                        let payload = self.encrypt_payload(&raw, &token.identity).await?;
-                        Some(payload.into())
-                    } else {
-                        None
-                    },
+                    payload: encrypted.map(|e| e.into()),
                     token: token.push_token.clone().into()
-                });
+                }));
             }
         }
         drop(key_cache);
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
-        let complete = SendMsg {
-            fcn: 1,
-            c: message.message.get_c(),
-            e: if message.has_payload() { Some("pair".to_string()) } else { None },
-            ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
-            v: 8,
-            i: u32::from_be_bytes(msg_id),
-            u: Uuid::from_str(&message.id).unwrap().as_bytes().to_vec().into(),
-            dtl: payloads,
-            sp: message.sender.clone().unwrap(),
-            ex: message.get_ex(),
-            nr: message.message.get_nr(),
+        println!("sending {:?}", message.message.to_string());
+
+        let mut staged_payloads: Vec<BundledPayload> = vec![];
+        let mut staged_size: usize = 0;
+        let send_staged = |send: Vec<BundledPayload>| {
+            async {
+                let complete = SendMsg {
+                    fcn: 1,
+                    c: message.message.get_c(),
+                    e: if message.has_payload() { Some("pair".to_string()) } else { None },
+                    ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
+                    v: 8,
+                    i: u32::from_be_bytes(msg_id),
+                    u: Uuid::from_str(&message.id).unwrap().as_bytes().to_vec().into(),
+                    dtl: send,
+                    sp: message.sender.clone().unwrap(),
+                    ex: message.get_ex(),
+                    nr: message.message.get_nr(),
+                };
+        
+                let binary = plist_to_bin(&complete)?;
+                Ok::<(), IDSError>(self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?)
+            }
         };
 
-        println!("logmsg {}", plist_to_string(&complete).unwrap());
-
-        let binary = plist_to_bin(&complete)?;
-        self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+        for payload in payloads {
+            staged_payloads.push(payload.1);
+            staged_size += payload.0;
+            if staged_size > MAX_SIZE {
+                staged_size = 0;
+                send_staged(staged_payloads).await?;
+                staged_payloads = vec![];
+            }
+        }
+        send_staged(staged_payloads).await?;
 
         let start = SystemTime::now();
         let since_the_epoch = start

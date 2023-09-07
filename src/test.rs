@@ -9,9 +9,11 @@ use tokio::io::AsyncWriteExt;
 use util::{base64_encode, base64_decode};
 use uuid::Uuid;
 use crate::ids::IDSError;
-use crate::imessage::RecievedMessage;
+use crate::imessage::{RecievedMessage, Message};
 use crate::ids::user::IDSAppleUser;
 use crate::ids::identity::register;
+use crate::imessage::NormalMessage;
+use crate::imessage::Attachment;
 
 use tokio::time::{sleep, Duration};
 
@@ -24,6 +26,11 @@ mod apns;
 mod ids;
 mod util;
 mod imessage;
+mod mmcs;
+
+pub mod mmcsp {
+    include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -100,14 +107,41 @@ async fn main() {
 
     //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
     //let mut msg = client.new_msg("woah test", &["mailto:jjtech@jjtech.dev".to_string()]);
-    /*let mut msg = client.new_msg(ConversationData {
-        participants: vec!["tel:+17203818329".to_string()],
+    /*let data = fs::read("upload.png").await.expect("Unable to read file");
+    let attachment = Attachment::new_mmcs(&connection, &data, "image/jpeg", "public.jpeg", "3f80ecc9-2ca9-4a77-a208-cfe3104ca27f.jpeg", 1).await.unwrap();
+    let mut msg = client.new_msg(ConversationData {
+        participants: vec!["mailto:tanay@neotia.in".to_string()],
         cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, imessage::Message::Present).await;
+    }, imessage::Message::Message(NormalMessage {
+        text: "".to_string(),
+        attachments: vec![attachment],
+        body: None,
+        effect: None,
+        reply_guid: None,
+        reply_part: None
+    })).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
+
+    let data = fs::read("upload.png").await.expect("Unable to read file");
+    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png", 0).await.unwrap();
+    let mut msg = client.new_msg(ConversationData {
+        participants: vec!["tel:+17203818329".to_string()],
+        cv_name: None,
+        sender_guid: Some(Uuid::new_v4().to_string())
+    }, imessage::Message::Message(NormalMessage {
+        text: "".to_string(),
+        attachments: vec![attachment],
+        body: None,
+        effect: None,
+        reply_guid: None,
+        reply_part: None
+    })).await;
+    println!("sendingrun");
+    client.send(&mut msg).await.unwrap();
+    println!("sendingdone");
 
     //sleep(Duration::from_millis(10000)).await;
     
@@ -118,6 +152,12 @@ async fn main() {
                 RecievedMessage::Message { msg } => {
                     if msg.has_payload() {
                         println!("{}", msg);
+                        if let Message::Message(msg) = msg.message {
+                            for attachment in msg.attachments {
+                                let data = attachment.get_attachment(&connection).await.unwrap();
+                                fs::write("download.png", data).await.unwrap();
+                            }
+                        }
                     }
                 }
             }

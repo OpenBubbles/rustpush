@@ -69,11 +69,11 @@ struct InnerSubmitter {
 }
 
 #[derive(Clone)]
-pub struct APNSSubmitter(Arc<Mutex<InnerSubmitter>>);
+pub struct APNSSubmitter(Arc<Mutex<InnerSubmitter>>, Option<APNSReader>);
 
 impl APNSSubmitter {
     fn make(stream: WriteHalf<TlsStream<TcpStream>>) -> APNSSubmitter {
-        APNSSubmitter(Arc::new(Mutex::new(InnerSubmitter { stream, token: vec![] })))
+        APNSSubmitter(Arc::new(Mutex::new(InnerSubmitter { stream, token: vec![] })), None)
     }
 
     async fn token(&self) -> Vec<u8> {

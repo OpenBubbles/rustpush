@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::num::ParseIntError;
 
 use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
@@ -7,6 +8,7 @@ use base64::Engine;
 use reqwest::{Client, Certificate};
 use serde::{Serialize, Deserialize};
 use std::io::{Write, Read};
+use std::fmt::Write as FmtWrite;
 
 pub fn make_reqwest() -> Client {
     let certificates = vec![
@@ -14,6 +16,7 @@ pub fn make_reqwest() -> Client {
         Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
     ];
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
@@ -22,7 +25,7 @@ pub fn make_reqwest() -> Client {
     for certificate in certificates.into_iter() {
         builder = builder.add_root_certificate(certificate);
     }
-
+    
     builder.build().unwrap()
 }
 
@@ -79,4 +82,19 @@ pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoded_data = Vec::new();
     decoder.read_to_end(&mut decoded_data)?;
     Ok(decoded_data)
+}
+
+pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
+}
+
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+    s
 }
