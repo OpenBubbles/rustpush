@@ -12,7 +12,7 @@ use crate::imessage::{RecievedMessage, Message};
 use crate::ids::user::IDSAppleUser;
 use crate::ids::identity::register;
 use crate::imessage::NormalMessage;
-use crate::imessage::Attachment;
+use crate::imessage::{Attachment, MessagePart, MessageParts};
 
 use tokio::time::{sleep, Duration};
 
@@ -141,15 +141,17 @@ async fn main() {
 
     let data = fs::read("upload.png").await.expect("Unable to read file");
     println!("upload attachment");
-    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png", 0).await.unwrap();
+    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png").await.unwrap();
     println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {
         participants: vec!["tel:+17203818329".to_string()],
         cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
     }, imessage::Message::Message(NormalMessage {
-        text: "".to_string(),
-        attachments: vec![attachment],
+        parts: MessageParts(vec![
+            MessagePart::Attachment(attachment),
+            MessagePart::Text("Sent from pure rust!".to_string())
+        ]),
         body: None,
         effect: None,
         reply_guid: None,
@@ -169,9 +171,11 @@ async fn main() {
                     if msg.has_payload() {
                         println!("{}", msg);
                         if let Message::Message(msg) = msg.message {
-                            for attachment in msg.attachments {
-                                let data = attachment.get_attachment(&connection).await.unwrap();
-                                fs::write("download.png", data).await.unwrap();
+                            for part in msg.parts.0 {
+                                if let MessagePart::Attachment(attachment) = part {
+                                    let data = attachment.get_attachment(&connection).await.unwrap();
+                                    fs::write("download.png", data).await.unwrap();
+                                }
                             }
                         }
                     }

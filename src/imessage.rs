@@ -3,7 +3,7 @@ use std::{fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, t
 
 use log::{debug, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
-use plist::{Data, Value};
+use plist::Data;
 use regex::Regex;
 use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc::Receiver, Mutex};
@@ -28,9 +28,164 @@ pub struct ConversationData {
 }
 
 #[repr(C)]
+pub enum MessagePart {
+    Text(String),
+    Attachment(Attachment)
+}
+
+#[repr(C)]
+pub struct MessageParts(pub Vec<MessagePart>);
+
+impl MessageParts {
+    fn has_attachments(&self) -> bool {
+        self.0.iter().any(|p| matches!(p, MessagePart::Attachment(_)))
+    }
+
+    fn from_raw(raw: &str) -> MessageParts {
+        MessageParts(vec![MessagePart::Text(raw.to_string())])
+    }
+
+    // Convert parts into xml for a RawIMessage
+    fn to_xml(&self, mut raw: Option<&mut RawIMessage>) -> String {
+        let mut output = vec![];
+        let mut writer_config = EmitterConfig::new()
+            .write_document_declaration(false);
+        writer_config.perform_escaping = false;
+        let mut writer = writer_config.create_writer(Cursor::new(&mut output));
+        writer.write(XmlEvent::start_element("html")).unwrap();
+        writer.write(XmlEvent::start_element("body")).unwrap();
+        let mut inline_attachment_num = 0;
+        for (idx, part) in self.0.iter().enumerate() {
+            match part {
+                MessagePart::Attachment(attachment) => {
+                    let filesize = attachment.size.to_string();
+                    let part = idx.to_string();
+                    let element = XmlEvent::start_element("FILE")
+                        .attr("name", &attachment.name)
+                        .attr("width", "0")
+                        .attr("height", "0")
+                        .attr("datasize", &filesize)
+                        .attr("mime-type", &attachment.mime)
+                        .attr("uti-type", &attachment.uti_type)
+                        .attr("file-size", &filesize)
+                        .attr("message-part", &part);
+                    match &attachment.a_type {
+                        AttachmentType::Inline(data) => {
+                            let num = if inline_attachment_num == 0 {
+                                if let Some(raw) = &mut raw {
+                                    raw.inline0 = Some(data.clone().into());
+                                }
+                                "ia-0"
+                            } else if inline_attachment_num == 1 {
+                                if let Some(raw) = &mut raw {
+                                    raw.inline1 = Some(data.clone().into());
+                                }
+                                "ia-1"
+                            } else {
+                                continue;
+                            };
+                            writer.write(
+                                element
+                                    .attr("inline-attachment", num)
+                            ).unwrap();
+
+                            inline_attachment_num += 1;
+                        }
+                        AttachmentType::MMCS(mmcs) => {
+                            writer.write(
+                                element
+                                    .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
+                                    .attr("mmcs-url", &mmcs.url)
+                                    .attr("mmcs-owner", &mmcs.object)
+                                    .attr("decryption-key", &encode_hex(&[
+                                        vec![0x00],
+                                        mmcs.key.clone()
+                                    ].concat()))
+                            ).unwrap();
+                        }
+                    }
+                },
+                MessagePart::Text(text) => {
+                    writer.write(XmlEvent::start_element("span")).unwrap();
+                    writer.write(XmlEvent::Characters(html_escape::encode_text(text).as_ref())).unwrap();
+                }
+            }
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+        writer.write(XmlEvent::end_element()).unwrap();
+        writer.write(XmlEvent::end_element()).unwrap();
+        let msg = std::str::from_utf8(&output).unwrap().to_string();
+        debug!("xml body {}", msg);
+        msg
+    }
+
+    // parse XML parts
+    fn parse_parts(xml: &str, raw: Option<&RawIMessage>) -> MessageParts {
+        let mut data: Vec<MessagePart> = vec![];
+        let reader: EventReader<Cursor<&str>> = EventReader::new(Cursor::new(xml));
+        let mut string_buf = String::new();
+        for e in reader {
+            match e {
+                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
+                    let get_attr = |name: &str, def: Option<&str>| {
+                        attributes.iter().find(|attr| attr.name.to_string() == name)
+                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
+                    };
+                    if name.local_name == "FILE" {
+                        if string_buf.trim().len() > 0 {
+                            data.push(MessagePart::Text(string_buf));
+                            string_buf = String::new();
+                        }
+                        data.push(MessagePart::Attachment(Attachment {
+                            a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                AttachmentType::Inline(if inline.value == "ia-0" {
+                                    raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
+                                } else if inline.value == "ia-1" {
+                                    raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                } else {
+                                    continue
+                                })
+                            } else {
+                                let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
+                                let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                AttachmentType::MMCS(MMCSAttachment {
+                                    signature: sig.clone(), // chop off first byte because it's not actually the signature
+                                    object: get_attr("mmcs-owner", None),
+                                    url: get_attr("mmcs-url", None),
+                                    key: key[1..].to_vec()
+                                })
+                            },
+                            part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                            uti_type: get_attr("uti-type", None),
+                            size: get_attr("file-size", None).parse().unwrap(),
+                            mime: get_attr("mime-type", Some("application/octet-stream")),
+                            name: get_attr("name", None)
+                        }))
+                    }
+                },
+                Ok(reader::XmlEvent::Characters(data)) => {
+                    string_buf += &data;
+                }
+                _ => {}
+            }
+        }
+        if string_buf.trim().len() > 0 {
+            data.push(MessagePart::Text(string_buf));
+        }
+        MessageParts(data)
+    }
+
+    pub fn raw_text(&self) -> String {
+        self.0.iter().filter_map(|m| match m {
+            MessagePart::Text(text) => Some(text.clone()),
+            MessagePart::Attachment(_) => None
+        }).collect::<Vec<String>>().join("\n")
+    }
+}
+
+#[repr(C)]
 pub struct NormalMessage {
-    pub text: String,
-    pub attachments: Vec<Attachment>,
+    pub parts: MessageParts,
     pub body: Option<BalloonBody>,
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
@@ -128,7 +283,7 @@ pub struct UnsendMessage {
 pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
-    pub new_data: String
+    pub new_parts: MessageParts
 }
 
 #[repr(C)]
@@ -267,11 +422,11 @@ pub struct Attachment {
 
 impl Attachment {
 
-    pub async fn new_mmcs(apns: &APNSConnection, data: &[u8], mime: &str, uti: &str, name: &str, part: u64) -> Result<Attachment, IDSError> {
+    pub async fn new_mmcs(apns: &APNSConnection, data: &[u8], mime: &str, uti: &str, name: &str) -> Result<Attachment, IDSError> {
         let mmcs = MMCSAttachment::new(apns, data).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
-            part,
+            part: 0,
             uti_type: uti.to_string(),
             size: data.len(),
             mime: mime.to_string(),
@@ -288,108 +443,6 @@ impl Attachment {
                 mmcs.get_attachment(apns).await
             }
         }
-    }
-    // Convert attachments objects into xml for a RawIMessage
-    fn stringify_attachments(raw: &mut RawIMessage, attachments: &[Attachment]) -> String {
-        let mut output = vec![];
-        let writer_config = EmitterConfig::new()
-            .write_document_declaration(false);
-        let mut writer = writer_config.create_writer(Cursor::new(&mut output));
-        writer.write(XmlEvent::start_element("html")).unwrap();
-        writer.write(XmlEvent::start_element("body")).unwrap();
-        for (idx, attachment) in attachments.iter().enumerate() {
-            let filesize = attachment.size.to_string();
-            let part = attachment.part.to_string();
-            let element = XmlEvent::start_element("FILE")
-                .attr("name", &attachment.name)
-                .attr("width", "0")
-                .attr("height", "0")
-                .attr("datasize", &filesize)
-                .attr("mime-type", &attachment.mime)
-                .attr("uti-type", &attachment.uti_type)
-                .attr("file-size", &filesize)
-                .attr("message-part", &part);
-            match &attachment.a_type {
-                AttachmentType::Inline(data) => {
-                    let num = if idx == 0 {
-                        raw.inline0 = Some(data.clone().into());
-                        "ia-0"
-                    } else if idx == 1 {
-                        raw.inline1 = Some(data.clone().into());
-                        "ia-1"
-                    } else {
-                        continue;
-                    };
-                    writer.write(
-                        element
-                            .attr("inline-attachment", num)
-                    ).unwrap();
-                }
-                AttachmentType::MMCS(mmcs) => {
-                    writer.write(
-                        element
-                            .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
-                            .attr("mmcs-url", &mmcs.url)
-                            .attr("mmcs-owner", &mmcs.object)
-                            .attr("decryption-key", &encode_hex(&[
-                                vec![0x00],
-                                mmcs.key.clone()
-                            ].concat()))
-                    ).unwrap();
-                }
-            }
-            writer.write(XmlEvent::end_element()).unwrap();
-        }
-        writer.write(XmlEvent::end_element()).unwrap();
-        writer.write(XmlEvent::end_element()).unwrap();
-        let msg = std::str::from_utf8(&output).unwrap().to_string();
-        debug!("attachments {}", msg);
-        msg
-    }
-
-    // parse XML attachments
-    fn parse_attachments(xml: &str, raw: &RawIMessage) -> Vec<Attachment> {
-        let mut data: Vec<Attachment> = vec![];
-        let reader = EventReader::new(Cursor::new(xml));
-        for e in reader {
-            match e {
-                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
-                    let get_attr = |name: &str, def: Option<&str>| {
-                        attributes.iter().find(|attr| attr.name.to_string() == name)
-                            .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
-                    };
-                    if name.local_name == "FILE" {
-                        data.push(Attachment {
-                            a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                AttachmentType::Inline(if inline.value == "ia-0" {
-                                    raw.inline0.clone().unwrap().into()
-                                } else if inline.value == "ia-1" {
-                                    raw.inline1.clone().unwrap().into()
-                                } else {
-                                    continue
-                                })
-                            } else {
-                                let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                AttachmentType::MMCS(MMCSAttachment {
-                                    signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                    object: get_attr("mmcs-owner", None),
-                                    url: get_attr("mmcs-url", None),
-                                    key: key[1..].to_vec()
-                                })
-                            },
-                            part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
-                            uti_type: get_attr("uti-type", None),
-                            size: get_attr("file-size", None).parse().unwrap(),
-                            mime: get_attr("mime-type", Some("application/octet-stream")),
-                            name: get_attr("name", None)
-                        })
-                    }
-                },
-                _ => {}
-            }
-        }
-        data
     }
 }
 
@@ -657,7 +710,7 @@ impl IMessage {
             },
             Message::Message (normal) => {
                 let mut raw = RawIMessage {
-                    text: normal.text.clone(),
+                    text: normal.parts.raw_text(),
                     xml: None,
                     participants: conversation.participants.clone(),
                     after_guid: self.after_guid.clone(),
@@ -674,8 +727,8 @@ impl IMessage {
                     inline1: None
                 };
 
-                if normal.attachments.len() > 0 {
-                    raw.xml = Some(Attachment::stringify_attachments(&mut raw, &normal.attachments));
+                if normal.parts.has_attachments() {
+                    raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
                 }
                 
                 should_gzip = !raw.xml.is_some();
@@ -696,13 +749,12 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             },
             Message::Edit(msg) => {
-                let inner = format!("<html><body><span message-part=\"{}\">{}</span></body></html>", msg.edit_part, html_escape::encode_text(&msg.new_data));
                 let raw = RawEditMessage {
-                    new_html_body: inner,
+                    new_html_body: msg.new_parts.to_xml(None),
                     et: 1,
                     part_index: msg.edit_part,
                     message: msg.tuuid.clone(),
-                    new_text: msg.new_data.clone()
+                    new_text: msg.new_parts.raw_text()
                 };
 
                 plist_to_bin(&raw).unwrap()
@@ -736,9 +788,6 @@ impl IMessage {
         }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            let start = format!("<html><body><span message-part=\"{}\">", loaded.part_index);
-            let end = "</span></body></html>";
-            let clean = html_escape::decode_html_entities(&loaded.new_html_body[start.len()..loaded.new_html_body.len() - end.len()]).to_string();
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
@@ -748,7 +797,7 @@ impl IMessage {
                 message: Message::Edit(EditMessage {
                     tuuid: loaded.message,
                     edit_part: loaded.part_index,
-                    new_data: clean
+                    new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
                 }),
             })
         }
@@ -821,6 +870,11 @@ impl IMessage {
                 parts.remove(guididx);
                 (guid, parts.join(":"))
             });
+            let parts = loaded.xml.as_ref().map_or_else(|| {
+                MessageParts::from_raw(&loaded.text)
+            }, |xml| {
+                MessageParts::parse_parts(xml, Some(&loaded))
+            });
             return Some(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
@@ -832,8 +886,7 @@ impl IMessage {
                     sender_guid: loaded.sender_guid.clone(),
                 }),
                 message: Message::Message(NormalMessage {
-                    text: loaded.text.clone(),
-                    attachments: loaded.xml.as_ref().map_or(vec![], |data| Attachment::parse_attachments(data, &loaded)),
+                    parts,
                     body: if let Some(body) = &loaded.b {
                             if let Some(bid) = &loaded.bid {
                                 Some(BalloonBody { bid: bid.clone(), data: body.clone().into() })
@@ -853,7 +906,7 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Message::Message(msg) => {
-                write!(f, "{}", msg.text)
+                write!(f, "{}", msg.parts.raw_text())
             },
             Message::RenameMessage(msg) => {
                 write!(f, "renamed the chat to {}", msg.new_name)
@@ -874,7 +927,7 @@ impl fmt::Display for Message {
                 write!(f, "typing")
             },
             Message::Edit(e) => {
-                write!(f, "Edited {}", e.new_data)
+                write!(f, "Edited {}", e.new_parts.raw_text())
             },
             Message::Unsend(_e) => {
                 write!(f, "unsent a message")
