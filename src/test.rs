@@ -40,7 +40,22 @@ struct SavedState {
 
 #[tokio::main]
 async fn main() {
-    let data = fs::read_to_string("config.json").await.expect("Unable to read file");
+    let data: String = match fs::read_to_string("config.json").await {
+		Ok(v) => v,
+		Err(e) => {
+			match e.kind() {
+				io::ErrorKind::NotFound => {
+					let _ = fs::File::create("config.json").await.expect("Unable to create file").write_all(b"{}");
+					"{}".to_string()
+				}
+				_ => {
+					eprintln!("Unable to read file");
+					std::process::exit(1);
+				}
+			}
+		}
+	};
+	
     let saved_state: Option<SavedState> = serde_json::from_str(&data).ok();
 
     let connection = Arc::new(APNSConnection::new(saved_state.as_ref().map(|state| state.push.clone())).await.unwrap());
