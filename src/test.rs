@@ -3,6 +3,7 @@ use std::{rc::Rc, sync::Arc};
 
 use apns::APNSState;
 use imessage::{IMClient, ConversationData};
+use log::{info, error};
 use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
@@ -49,7 +50,7 @@ async fn main() {
 					"{}".to_string()
 				}
 				_ => {
-					eprintln!("Unable to read file");
+				    error!("Unable to read file");
 					std::process::exit(1);
 				}
 			}
@@ -97,7 +98,7 @@ async fn main() {
     };
 
     if users[0].identity.is_none() {
-        println!("Registering new identity...");
+        info!("Registering new identity...");
         print!("Enter validation data: ");
         io::stdout().flush().await.unwrap();
         let stdin = io::stdin();
@@ -141,7 +142,9 @@ async fn main() {
     println!("sendingdone");*/
 
     let data = fs::read("upload.png").await.expect("Unable to read file");
+    println!("upload attachment");
     let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png", 0).await.unwrap();
+    println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {
         participants: vec!["tel:+17203818329".to_string()],
         cv_name: None,

@@ -1,5 +1,6 @@
 use std::{io, sync::Arc, time::Duration};
 
+use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use rustls::{Certificate, client::{ServerCertVerifier, ServerCertVerified}};
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
@@ -98,7 +99,7 @@ impl APNSSubmitter {
     }
 
     pub async fn set_state(&self, state: u8) -> Result<(), APNSError> {
-        println!("Sending state packet {}", state);
+        debug!("Sending state packet {}", state);
         let magic_num: u32 = 0x7FFFFFFF;
         self.send_payload(0x14, vec![(1, state.to_be_bytes().to_vec()), (2, magic_num.to_be_bytes().to_vec())]).await?;
         Ok(())
@@ -118,18 +119,18 @@ impl APNSSubmitter {
 
     async fn keep_alive(&self) -> Result<(), APNSError> {
         self.send_payload(0x0C, vec![]).await?;
-        println!("Sending keep alive");
+        debug!("Sending keep alive");
         Ok(())
     }
 
     async fn send_ack(&self, id: &[u8]) -> Result<(), APNSError> {
-        println!("Sending ack for {:?}", id);
+        debug!("Sending ack for {:?}", id);
         self.send_payload(0x0B, vec![(1, self.token().await), (4, id.to_vec()), (8, vec![0x0])]).await?;
         Ok(())
     }
     
     pub async fn filter(&self, topics: &[&str]) -> Result<(), APNSError> {
-        println!("Sending filter for {:?}", topics);
+        debug!("Sending filter for {:?}", topics);
         let mut fields = vec![(1, self.token().await)];
         for topic in topics {
             let mut hasher = Sha1::new();
@@ -157,12 +158,12 @@ pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>);
 impl APNSReader {
     #[async_recursion]
     async fn reload_connection(self, write: APNSSubmitter, state: APNSState, retry: u64) {
-        println!("attempting to reconnect to APNs!");
+        info!("attempting to reconnect to APNs!");
         tokio::time::sleep(Duration::from_secs(std::cmp::min(10 * retry, 30))).await;
         let stream = match APNSConnection::connect().await {
             Ok(stream) => stream,
             Err(err) => {
-                println!("failed to reconnect to APNs! {:?}", err);
+                warn!("failed to reconnect to APNs! {:?}", err);
                 self.reload_connection(write, state, retry + 1).await;
                 return;
             }
@@ -176,7 +177,7 @@ impl APNSReader {
         let write2 = write.clone();
         tokio::spawn(async move {
             if let Err(err) = APNSConnection::init_conn(&write2, &self2, &mut state2).await {
-                println!("failed to conenct to APNs: {:?}", err);
+                warn!("failed to conenct to APNs: {:?}", err);
             }
         });
         self.read_connection(read, write, state).await;
@@ -186,7 +187,7 @@ impl APNSReader {
         loop {
             let result = APNSPayload::read(&mut read).await;
             let Ok(payload) = result else {
-                println!("conn broken? {:?}", result);
+                warn!("conn broken? {:?}", result);
                 drop(read);
                 self.reload_connection(write, state, 0).await;
                 break // maybe conn broken?
@@ -195,13 +196,13 @@ impl APNSReader {
                 continue
             };
             if payload.id == 0x0A {
-                println!("Sending automatic ACK");
+                debug!("Sending automatic ACK");
                 if let Err(_) = write.send_ack(payload.get_field(4).unwrap()).await {
                     break // conn broken?
                 }
             }
             
-            println!("Recieved payload");
+            info!("Recieved payload");
             let mut locked = self.0.lock().await;
             let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
                 if (item.waiting_for)(&payload) {
@@ -343,7 +344,7 @@ impl APNSConnection {
         
         let connection = connector.connect(domain, stream).await?;
 
-        println!("Connected to APNs ({})", host);
+        info!("Connected to APNs ({})", host);
 
         Ok(connection)
     }
@@ -380,10 +381,10 @@ impl APNSConnection {
         ];
 
         if let Some(token) = &state.token {
-            println!("Sending connect message with token {:?}", token);
+            debug!("Sending connect message with token {:?}", token);
             fields.push((1, token.clone()));
         } else {
-            println!("Sending connect message without token");
+            debug!("Sending connect message without token");
         }
         
         submitter.send_payload(7, fields).await?;
@@ -404,7 +405,7 @@ impl APNSConnection {
         };
         submitter.set_token(&token).await;
 
-        println!("Recieved connect response with token {:?}", token);
+        debug!("Recieved connect response with token {:?}", token);
 
         let write = submitter.clone();
         tokio::spawn(async move {
