@@ -35,7 +35,7 @@ message ConfirmResponse {
         string url = 1;
         uint32 status = 2;
         repeated Metric edgeInfo = 4;
-        optional bytes f7 = 7;
+        optional bytes uploadMd5 = 7;
         repeated Metric metrics = 8;
         repeated Metric metrics2 = 9;
         string token = 10;
@@ -80,7 +80,6 @@ message Container {
 
 message AuthorizeGetResponse {
     message F1 {
-        // no clue what any of this stuff is
         message ChunkReferences {
             message ChunkReference {
                 uint32 container_index = 1;

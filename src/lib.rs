@@ -12,7 +12,8 @@ pub mod mmcsp {
 
 pub use apns::{APNSState, APNSConnection};
 pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register, IDSError};
-pub use imessage::{IMClient, IMessage, RecievedMessage, BalloonBody, ConversationData, Message};
+pub use imessage::messages::{IMessage, RecievedMessage, BalloonBody, ConversationData, Message, Attachment, NormalMessage, MessageParts, MessagePart};
+pub use imessage::client::IMClient;
 extern crate pretty_env_logger;
 extern crate log;
 

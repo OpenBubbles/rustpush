@@ -1,18 +1,239 @@
 
-use std::{fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
-use log::{debug, warn};
-use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
+use std::{fmt, vec, io::Cursor};
+
+use log::debug;
+use openssl::symm::{Cipher, encrypt, decrypt};
 use plist::Data;
 use regex::Regex;
 use serde::{Serialize, Deserialize};
-use tokio::sync::{mpsc::Receiver, Mutex};
 use uuid::Uuid;
 use rand::Rng;
-use async_recursion::async_recursion;
 use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, calculate_mmcs_signature, put_mmcs}};
+use crate::{apns::APNSConnection, ids::IDSError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, calculate_mmcs_signature, put_mmcs}};
+
+// raw messages used for communicating with APNs
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSDownload {
+    #[serde(rename = "mO")]
+    object: String,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSDownloadResponse {
+    #[serde(rename = "mA")]
+    token: String,
+    #[serde(rename = "mU")]
+    dsid: String,
+    s: u64
+}
+
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSUpload {
+    #[serde(rename = "mL")]
+    length: usize,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSUploadResponse {
+    #[serde(rename = "mA")]
+    token: String,
+    #[serde(rename = "mR")]
+    domain: String,
+    #[serde(rename = "mU")]
+    object: String
+}
+
+#[derive(Serialize, Deserialize)]
+struct MsiData {
+    pub ams: String,
+    pub amc: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawRenameMessage {
+    #[serde(rename = "nn")]
+    new_name: String,
+    #[serde(rename = "sp")]
+    participants: Vec<String>,
+    gv: String,
+    #[serde(rename = "old")]
+    old_name: Option<String>,
+    #[serde(rename = "n")]
+    name: String,
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawChangeMessage {
+    pv: u64,
+    #[serde(rename = "tp")]
+    target_participants: Vec<String>,
+    #[serde(rename = "nn")]
+    new_name: String,
+    #[serde(rename = "sp")]
+    source_participants: Vec<String>,
+    gv: String,
+    #[serde(rename = "n")]
+    name: String,
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawReactMessage {
+    pv: u64,
+    amrln: u64,
+    amrlc: u64,
+    amt: u64,
+    #[serde(rename = "t")]
+    text: String,
+    #[serde(rename = "p")]
+    participants: Vec<String>,
+    #[serde(rename = "r")]
+    after_guid: Option<String>, // uuid
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+    gv: String,
+    v: String,
+    #[serde(rename = "n")]
+    cv_name: Option<String>,
+    msi: Data,
+    amk: String
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawEditMessage {
+    #[serde(rename = "epb")]
+    new_html_body: String,
+    et: u64,
+    #[serde(rename = "t")]
+    new_text: String,
+    #[serde(rename = "epi")]
+    part_index: u64,
+    #[serde(rename = "emg")]
+    message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawUnsendMessage {
+    #[serde(rename = "emg")]
+    message: String,
+    rs: bool,
+    et: u64,
+    #[serde(rename = "epi")]
+    part_index: u64,
+    v: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawIMessage {
+    #[serde(rename = "t")]
+    text: String,
+    #[serde(rename = "x")]
+    xml: Option<String>,
+    #[serde(rename = "p")]
+    participants: Vec<String>,
+    #[serde(rename = "r")]
+    after_guid: Option<String>, // uuid
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+    pv: u64,
+    gv: String,
+    v: String,
+    bid: Option<String>,
+    b: Option<Data>,
+    #[serde(rename = "iid")]
+    effect: Option<String>,
+    #[serde(rename = "n")]
+    cv_name: Option<String>,
+    #[serde(rename = "tg")]
+    reply: Option<String>,
+    #[serde(rename = "ia-0")]
+    inline0: Option<Data>,
+    #[serde(rename = "ia-1")]
+    inline1: Option<Data>,
+}
+
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct BundledPayload {
+    #[serde(rename = "tP")]
+    pub(super) participant: String,
+    #[serde(rename = "D")]
+    pub(super) not_me: bool,
+    #[serde(rename = "sT")]
+    pub(super) session_token: Data,
+    #[serde(rename = "P")]
+    pub(super) payload: Option<Data>,
+    #[serde(rename = "t")]
+    pub(super) token: Data,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct SendMsg {
+    pub(super) fcn: u8,
+    pub(super) c: u8,
+    #[serde(rename = "E")]
+    pub(super) e: Option<String>,
+    pub(super) ua: String,
+    pub(super) v: u8,
+    pub(super) i: u32,
+    #[serde(rename = "U")]
+    pub(super) u: Data,
+    pub(super) dtl: Vec<BundledPayload>,
+    #[serde(rename = "sP")]
+    pub(super) sp: String,
+    #[serde(rename = "eX")]
+    pub(super) ex: Option<u32>,
+    pub(super) nr: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct RecvMsg {
+    #[serde(rename = "P")]
+    pub(super) payload: Data,
+    #[serde(rename = "sP")]
+    pub(super) sender: String,
+    #[serde(rename = "t")]
+    pub(super) token: Data,
+    #[serde(rename = "tP")]
+    pub(super) target: String,
+    #[serde(rename = "U")]
+    pub(super) msg_guid: Data,
+    #[serde(rename = "e")]
+    pub(super) sent_timestamp: u64
+}
+
+const ZERO_NONCE: [u8; 16] = [
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+];
+
+// a recieved message, for now just an iMessage
+#[repr(C)]
+pub enum RecievedMessage {
+    Message {
+        msg: IMessage
+    }
+}
 
 #[repr(C)]
 pub struct BalloonBody {
@@ -20,6 +241,7 @@ pub struct BalloonBody {
     pub data: Vec<u8>
 }
 
+// conversation data, used to uniquely identify a conversation from a message
 #[repr(C)]
 pub struct ConversationData {
     pub participants: Vec<String>,
@@ -183,6 +405,7 @@ impl MessageParts {
     }
 }
 
+// a "normal" imessage, containing multiple parts and text
 #[repr(C)]
 pub struct NormalMessage {
     pub parts: MessageParts,
@@ -292,49 +515,6 @@ pub struct MMCSAttachment {
     object: String,
     url: String,
     key: Vec<u8>
-}
-
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSDownload {
-    #[serde(rename = "mO")]
-    object: String,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32
-}
-
-#[derive(Serialize, Deserialize)]
-struct MMCSDownloadResponse {
-    #[serde(rename = "mA")]
-    token: String,
-    #[serde(rename = "mU")]
-    dsid: String,
-    s: u64
-}
-
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSUpload {
-    #[serde(rename = "mL")]
-    length: usize,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32
-}
-
-#[derive(Serialize, Deserialize)]
-struct MMCSUploadResponse {
-    #[serde(rename = "mA")]
-    token: String,
-    #[serde(rename = "mR")]
-    domain: String,
-    #[serde(rename = "mU")]
-    object: String
 }
 
 impl MMCSAttachment {
@@ -460,7 +640,7 @@ pub enum Message {
 }
 
 impl Message {
-    fn get_c(&self) -> u8 {
+    pub(super) fn get_c(&self) -> u8 {
         match self {
             Self::Message(_) => 100,
             Self::React(_) => 100,
@@ -474,7 +654,7 @@ impl Message {
         }
     }
 
-    fn get_nr(&self) -> Option<bool> {
+    pub(super) fn get_nr(&self) -> Option<bool> {
         match self {
             Self::Typing => Some(true),
             Self::Delivered => Some(true),
@@ -485,130 +665,38 @@ impl Message {
     }
 }
 
-#[repr(C)]
-pub struct IMessage {
-    pub id: String,
-    pub sender: Option<String>,
-    pub after_guid: Option<String>,
-    pub conversation: Option<ConversationData>,
-    pub message: Message,
-    pub sent_timestamp: u64
-}
-
-#[derive(Serialize, Deserialize)]
-struct MsiData {
-    pub ams: String,
-    pub amc: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawRenameMessage {
-    #[serde(rename = "nn")]
-    new_name: String,
-    #[serde(rename = "sp")]
-    participants: Vec<String>,
-    gv: String,
-    #[serde(rename = "old")]
-    old_name: Option<String>,
-    #[serde(rename = "n")]
-    name: String,
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(rename = "gid")]
-    sender_guid: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawChangeMessage {
-    pv: u64,
-    #[serde(rename = "tp")]
-    target_participants: Vec<String>,
-    #[serde(rename = "nn")]
-    new_name: String,
-    #[serde(rename = "sp")]
-    source_participants: Vec<String>,
-    gv: String,
-    #[serde(rename = "n")]
-    name: String,
-    #[serde(rename = "type")]
-    msg_type: String,
-    #[serde(rename = "gid")]
-    sender_guid: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawReactMessage {
-    pv: u64,
-    amrln: u64,
-    amrlc: u64,
-    amt: u64,
-    #[serde(rename = "t")]
-    text: String,
-    #[serde(rename = "p")]
-    participants: Vec<String>,
-    #[serde(rename = "r")]
-    after_guid: Option<String>, // uuid
-    #[serde(rename = "gid")]
-    sender_guid: Option<String>,
-    gv: String,
-    v: String,
-    #[serde(rename = "n")]
-    cv_name: Option<String>,
-    msi: Data,
-    amk: String
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawEditMessage {
-    #[serde(rename = "epb")]
-    new_html_body: String,
-    et: u64,
-    #[serde(rename = "t")]
-    new_text: String,
-    #[serde(rename = "epi")]
-    part_index: u64,
-    #[serde(rename = "emg")]
-    message: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawUnsendMessage {
-    #[serde(rename = "emg")]
-    message: String,
-    rs: bool,
-    et: u64,
-    #[serde(rename = "epi")]
-    part_index: u64,
-    v: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RawIMessage {
-    #[serde(rename = "t")]
-    text: String,
-    #[serde(rename = "x")]
-    xml: Option<String>,
-    #[serde(rename = "p")]
-    participants: Vec<String>,
-    #[serde(rename = "r")]
-    after_guid: Option<String>, // uuid
-    #[serde(rename = "gid")]
-    sender_guid: Option<String>,
-    pv: u64,
-    gv: String,
-    v: String,
-    bid: Option<String>,
-    b: Option<Data>,
-    #[serde(rename = "iid")]
-    effect: Option<String>,
-    #[serde(rename = "n")]
-    cv_name: Option<String>,
-    #[serde(rename = "tg")]
-    reply: Option<String>,
-    #[serde(rename = "ia-0")]
-    inline0: Option<Data>,
-    #[serde(rename = "ia-1")]
-    inline1: Option<Data>,
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Message::Message(msg) => {
+                write!(f, "{}", msg.parts.raw_text())
+            },
+            Message::RenameMessage(msg) => {
+                write!(f, "renamed the chat to {}", msg.new_name)
+            },
+            Message::ChangeParticipants(msg) => {
+                write!(f, "changed participants {:?}", msg.new_participants)
+            },
+            Message::React(msg) => {
+                write!(f, "{}", msg.get_text())
+            },
+            Message::Read => {
+                write!(f, "read")
+            },
+            Message::Delivered => {
+                write!(f, "delivered")
+            },
+            Message::Typing => {
+                write!(f, "typing")
+            },
+            Message::Edit(e) => {
+                write!(f, "Edited {}", e.new_parts.raw_text())
+            },
+            Message::Unsend(_e) => {
+                write!(f, "unsent a message")
+            }
+        }
+    }
 }
 
 
@@ -625,8 +713,19 @@ fn add_prefix(participants: &[String]) -> Vec<String> {
     }).collect()
 }
 
+// a message that can be sent to other iMessage users
+#[repr(C)]
+pub struct IMessage {
+    pub id: String,
+    pub sender: Option<String>,
+    pub after_guid: Option<String>,
+    pub conversation: Option<ConversationData>,
+    pub message: Message,
+    pub sent_timestamp: u64
+}
+
 impl IMessage {
-    fn sanity_check_send(&mut self) {
+    pub(super) fn sanity_check_send(&mut self) {
         let conversation = self.conversation.as_mut().expect("no convo for send!??!?");
         if conversation.sender_guid.is_none() {
             conversation.sender_guid = Some(Uuid::new_v4().to_string());
@@ -652,7 +751,7 @@ impl IMessage {
         }
     }
 
-    fn to_raw(&mut self) -> Vec<u8> {
+    pub(super) fn to_raw(&mut self) -> Vec<u8> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -772,7 +871,7 @@ impl IMessage {
         final_msg
     }
 
-    fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
+    pub(super) fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
@@ -902,465 +1001,8 @@ impl IMessage {
     }
 }
 
-impl fmt::Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Message::Message(msg) => {
-                write!(f, "{}", msg.parts.raw_text())
-            },
-            Message::RenameMessage(msg) => {
-                write!(f, "renamed the chat to {}", msg.new_name)
-            },
-            Message::ChangeParticipants(msg) => {
-                write!(f, "changed participants {:?}", msg.new_participants)
-            },
-            Message::React(msg) => {
-                write!(f, "{}", msg.get_text())
-            },
-            Message::Read => {
-                write!(f, "read")
-            },
-            Message::Delivered => {
-                write!(f, "delivered")
-            },
-            Message::Typing => {
-                write!(f, "typing")
-            },
-            Message::Edit(e) => {
-                write!(f, "Edited {}", e.new_parts.raw_text())
-            },
-            Message::Unsend(_e) => {
-                write!(f, "unsent a message")
-            }
-        }
-    }
-}
-
 impl fmt::Display for IMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct BundledPayload {
-    #[serde(rename = "tP")]
-    participant: String,
-    #[serde(rename = "D")]
-    not_me: bool,
-    #[serde(rename = "sT")]
-    session_token: Data,
-    #[serde(rename = "P")]
-    payload: Option<Data>,
-    #[serde(rename = "t")]
-    token: Data,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SendMsg {
-    fcn: u8,
-    c: u8,
-    #[serde(rename = "E")]
-    e: Option<String>,
-    ua: String,
-    v: u8,
-    i: u32,
-    #[serde(rename = "U")]
-    u: Data,
-    dtl: Vec<BundledPayload>,
-    #[serde(rename = "sP")]
-    sp: String,
-    #[serde(rename = "eX")]
-    ex: Option<u32>,
-    nr: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RecvMsg {
-    #[serde(rename = "P")]
-    payload: Data,
-    #[serde(rename = "sP")]
-    sender: String,
-    #[serde(rename = "t")]
-    token: Data,
-    #[serde(rename = "tP")]
-    target: String,
-    #[serde(rename = "U")]
-    msg_guid: Data,
-    #[serde(rename = "e")]
-    sent_timestamp: u64
-}
-
-
-pub struct IMClient {
-    pub conn: Arc<APNSConnection>,
-    pub users: Arc<Vec<IDSUser>>,
-    key_cache: Mutex<HashMap<String, Vec<IDSIdentityResult>>>,
-    raw_inbound: Mutex<Receiver<APNSPayload>>,
-    pub current_handle: Mutex<String>
-}
-
-#[repr(C)]
-pub enum RecievedMessage {
-    Message {
-        msg: IMessage
-    }
-}
-
-const NORMAL_NONCE: [u8; 16] = [
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
-];
-
-const ZERO_NONCE: [u8; 16] = [
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-];
-
-const PAYLOADS_MAX_SIZE: usize = 10000;
-
-impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
-        IMClient {
-            key_cache: Mutex::new(HashMap::new()),
-            raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
-                if pay.id != 0x0A {
-                    return false
-                }
-                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) {
-                    return false
-                }
-                let Some(body) = pay.get_field(3) else {
-                    return false
-                };
-                let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-                let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-                debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102
-            }).await),
-            conn,
-            current_handle: Mutex::new(users[0].handles[0].clone()),
-            users,
-        }
-    }
-
-    fn parse_payload(payload: &[u8]) -> (&[u8], &[u8]) {
-        let body_len = u16::from_be_bytes(payload[1..3].try_into().unwrap()) as usize;
-        let body = &payload[3..(3 + body_len)];
-        let sig_len = u8::from_be_bytes(payload[(3 + body_len)..(4 + body_len)].try_into().unwrap()) as usize;
-        let sig = &payload[(4 + body_len)..(4 + body_len + sig_len)];
-        (body, sig)
-    }
-
-    pub async fn use_handle(&self, handle: &str) {
-        let mut cache = self.key_cache.lock().await;
-        cache.clear();
-        let mut current_identity = self.current_handle.lock().await;
-        *current_identity = handle.to_string();
-    }
-
-    pub fn get_handles(&self) -> Vec<String> {
-        self.users.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
-    }
-
-    #[async_recursion]
-    async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], retry: u8) -> bool {
-        self.cache_keys(&[sender.to_string()], retry > 0).await.unwrap();
-
-        let cache = self.key_cache.lock().await;
-        let Some(keys) = cache.get(sender) else {
-            warn!("Cannot verify; no public key");
-            if retry < 3 {
-                return self.verify_payload(payload, sender, sender_token, retry+1).await;
-            } else {
-                warn!("giving up");
-            }
-            return false
-        };
-
-        let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
-            warn!("Cannot verify; no public key");
-            if retry < 3 {
-                return self.verify_payload(payload, sender, sender_token, retry+1).await;
-            } else {
-                warn!("giving up");
-            }
-            return false
-        };
-
-        let (body, sig) = Self::parse_payload(payload);
-        let valid = identity.identity.verify(body, sig).unwrap();
-
-        valid
-    }
-
-    pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, IDSError> {
-        let (body, _sig) = Self::parse_payload(payload);
-        
-        let key = user.identity.as_ref().unwrap().priv_enc_key();
-        let mut decrypter = Decrypter::new(&key)?;
-        decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
-        decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
-        decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
-        let buffer_len = decrypter.decrypt_len(&payload).unwrap();
-        let mut decrypted_asym = vec![0; buffer_len];
-        decrypter.decrypt(&body[..160], &mut decrypted_asym[..])?;
-
-        let decrypted_sym = decrypt(Cipher::aes_128_ctr(), &decrypted_asym[..16], Some(&NORMAL_NONCE), &[
-            decrypted_asym[16..116].to_vec(),
-            body[160..].to_vec()
-        ].concat()).unwrap();
-
-        Ok(decrypted_sym)
-    }
-
-    pub async fn recieve(&mut self) -> Option<RecievedMessage> {
-        let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
-            return None
-        };
-        self.recieve_payload(payload).await
-    }
-
-    pub async fn recieve_wait(&self) -> Option<RecievedMessage> {
-        let Some(payload) = self.raw_inbound.lock().await.recv().await else {
-            return None
-        };
-        self.recieve_payload(payload).await
-    }
-
-    async fn current_user(&self) -> &IDSUser {
-        let current_handle = self.current_handle.lock().await;
-        self.users.iter().find(|user| user.handles.contains(&current_handle)).unwrap()
-    }
-
-    async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
-        let body = payload.get_field(3).unwrap();
-
-        let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-        let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-        let ex = load.as_dictionary().unwrap().get("eX").map(|v| v.as_unsigned_integer().unwrap());
-        let htu = load.as_dictionary().unwrap().get("htu").map(|v| v.as_boolean().unwrap());
-        if get_c == 101 || get_c == 102 || (ex == Some(0) && htu == Some(true)) {
-            let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
-            let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
-            return Some(RecievedMessage::Message {
-                msg: IMessage {
-                    id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
-                    sender: None,
-                    after_guid: None,
-                    conversation: if ex == Some(0) && htu == Some(true) {
-                        // typing
-                        let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
-                        let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
-                        Some(ConversationData {
-                            participants: vec![source.to_string(), target.to_string()],
-                            cv_name: None,
-                            sender_guid: None
-                        })
-                    } else {
-                        None
-                    },
-                    message: if ex == Some(0) && htu == Some(true) {
-                        Message::Typing
-                    } else if get_c == 101 {
-                        Message::Delivered
-                    } else {
-                        Message::Read
-                    },
-                    sent_timestamp: time_recv / 1000000
-                }
-            })
-        }
-
-        let has_p = load.as_dictionary().unwrap().contains_key("P");
-        if !has_p {
-            return None
-        }
-
-        let loaded: RecvMsg = plist::from_bytes(body).unwrap();
-
-        let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.target)) else {
-            panic!("No identity for sender {}", loaded.sender);
-        };
-
-        let payload: Vec<u8> = loaded.payload.clone().into();
-        let token: Vec<u8> = loaded.token.clone().into();
-        if !self.verify_payload(&payload, &loaded.sender, &token, 0).await {
-            panic!("Payload verification failed!");
-        }
-
-        let decrypted = self.decrypt(identity, &payload).await.unwrap();
-        
-        IMessage::from_raw(&decrypted, &loaded).map(|msg| RecievedMessage::Message {
-            msg
-        })
-    }
-
-    pub async fn cache_keys(&self, participants: &[String], refresh: bool) -> Result<(), IDSError> {
-        // find participants whose keys need to be fetched
-        let key_cache = self.key_cache.lock().await;
-        let fetch: Vec<String> = if refresh {
-            participants.to_vec()
-        } else {
-            participants.iter().filter(|p| !key_cache.contains_key(*p))
-                .map(|p| p.to_string()).collect()
-        };
-        if fetch.len() == 0 {
-            return Ok(())
-        }
-        drop(key_cache);
-        let results = self.current_user().await.lookup(self.conn.clone(), fetch).await?;
-        let mut key_cache = self.key_cache.lock().await;
-        for (id, results) in results {
-            key_cache.insert(id, results);
-        }
-        Ok(())
-    }
-
-    pub async fn validate_targets(&self, targets: &[String]) -> Result<Vec<String>, IDSError> {
-        self.cache_keys(targets, false).await?;
-        let key_cache = self.key_cache.lock().await;
-        Ok(targets.iter().filter(|target| key_cache.get(*target).unwrap().len() > 0).map(|i| i.clone()).collect())
-    }
-
-    pub async fn new_msg(&self, conversation: ConversationData, message: Message) -> IMessage {
-        let current_handle = self.current_handle.lock().await;
-        IMessage {
-            sender: Some(current_handle.clone()),
-            id: Uuid::new_v4().to_string().to_uppercase(),
-            after_guid: None,
-            sent_timestamp: 0,
-            conversation: Some(conversation),
-            message
-        }
-    }
-
-    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity) -> Result<Vec<u8>, IDSError> {
-        let rand = rand::thread_rng().gen::<[u8; 11]>();
-        let user = self.current_user().await;
-
-        let hmac = PKey::hmac(&rand)?;
-        let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;
-        let result = signer.sign_oneshot_to_vec(&[
-            raw.to_vec(),
-            vec![0x02],
-            user.identity.as_ref().unwrap().public().hash().to_vec(),
-            key.hash().to_vec()
-        ].concat())?;
-
-        let aes_key = [
-            rand.to_vec(),
-            result[..5].to_vec()
-        ].concat();
-
-        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&NORMAL_NONCE), raw).unwrap();
-
-        let encryption_key = PKey::from_rsa(key.encryption_key.clone())?;
-
-        let payload = [
-            aes_key,
-            encrypted_sym[..100].to_vec()
-        ].concat();
-        let mut encrypter = Encrypter::new(&encryption_key)?;
-        encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
-        encrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
-        encrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
-        let buffer_len = encrypter.encrypt_len(&payload).unwrap();
-        let mut encrypted = vec![0; buffer_len];
-        let encrypted_len = encrypter.encrypt(&payload, &mut encrypted).unwrap();
-        encrypted.truncate(encrypted_len);
-
-        let payload = [
-            encrypted,
-            encrypted_sym[100..].to_vec()
-        ].concat();
-
-        let sig = user.identity.as_ref().unwrap().sign(&payload)?;
-        let payload = [
-            vec![0x02],
-            (payload.len() as u16).to_be_bytes().to_vec(),
-            payload,
-            (sig.len() as u8).to_be_bytes().to_vec(),
-            sig
-        ].concat();
-
-        Ok(payload)
-    }
-
-    pub async fn send(&self, message: &mut IMessage) -> Result<(), IDSError> {
-        message.sanity_check_send();
-        self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), false).await?;
-        let raw = if message.has_payload() { message.to_raw() } else { vec![] };
-
-        let mut payloads: Vec<(usize, BundledPayload)> = vec![];
-
-        let key_cache = self.key_cache.lock().await;
-        for participant in &message.conversation.as_ref().unwrap().participants {
-            for token in key_cache.get(participant).unwrap() {
-                if &token.push_token == self.conn.state.token.as_ref().unwrap() {
-                    // don't send to ourself
-                    continue;
-                }
-                let encrypted = if message.has_payload() {
-                    let payload = self.encrypt_payload(&raw, &token.identity).await?;
-                    Some(payload)
-                } else {
-                    None
-                };
-
-                payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
-                    participant: participant.clone(),
-                    not_me: participant != message.sender.as_ref().unwrap(),
-                    session_token: token.session_token.clone().into(),
-                    payload: encrypted.map(|e| e.into()),
-                    token: token.push_token.clone().into()
-                }));
-            }
-        }
-        drop(key_cache);
-        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
-        debug!("sending {:?}", message.message.to_string());
-
-        // chunk payloads together, but if they get too big split them up into mulitple messages.
-        // When sending attachments, APNs gets mad at us if we send too much at the same time.
-        let mut staged_payloads: Vec<BundledPayload> = vec![];
-        let mut staged_size: usize = 0;
-        let send_staged = |send: Vec<BundledPayload>| {
-            async {
-                let complete = SendMsg {
-                    fcn: 1,
-                    c: message.message.get_c(),
-                    e: if message.has_payload() { Some("pair".to_string()) } else { None },
-                    ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
-                    v: 8,
-                    i: u32::from_be_bytes(msg_id),
-                    u: Uuid::from_str(&message.id).unwrap().as_bytes().to_vec().into(),
-                    dtl: send,
-                    sp: message.sender.clone().unwrap(),
-                    ex: message.get_ex(),
-                    nr: message.message.get_nr(),
-                };
-        
-                let binary = plist_to_bin(&complete)?;
-                Ok::<(), IDSError>(self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?)
-            }
-        };
-
-        for payload in payloads {
-            staged_payloads.push(payload.1);
-            staged_size += payload.0;
-            if staged_size > PAYLOADS_MAX_SIZE {
-                staged_size = 0;
-                send_staged(staged_payloads).await?;
-                staged_payloads = vec![];
-            }
-        }
-        send_staged(staged_payloads).await?;
-
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        message.sent_timestamp = since_the_epoch.as_millis() as u64;
-
-        Ok(())
     }
 }

@@ -1,35 +1,14 @@
 
 use std::sync::Arc;
 
-use apns::APNSState;
-use imessage::{IMClient, ConversationData};
 use log::{info, error};
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-use crate::ids::IDSError;
-use crate::imessage::{RecievedMessage, Message};
-use crate::ids::user::IDSAppleUser;
-use crate::ids::identity::register;
-use crate::imessage::NormalMessage;
-use crate::imessage::{Attachment, MessagePart, MessageParts};
-
 use tokio::time::{sleep, Duration};
-
-use crate::apns::APNSConnection;
-use crate::ids::user::IDSUser;
 use serde::{Serialize, Deserialize};
-mod bags;
-mod albert;
-mod apns;
-mod ids;
-mod util;
-mod imessage;
-mod mmcs;
-
-pub mod mmcsp {
-    include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
-}
+use std::io::Write;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -64,12 +43,12 @@ async fn main() {
     } else {
         let stdin = io::stdin();
         print!("Username: ");
-        io::stdout().flush().await.unwrap();
+        std::io::stdout().flush().unwrap();
         let mut reader = BufReader::new(stdin);
         let mut username = String::new();
         reader.read_line(&mut username).await.unwrap();
         print!("Password: ");
-        io::stdout().flush().await.unwrap();
+        std::io::stdout().flush().unwrap();
         let mut password = String::new();
         reader.read_line(&mut password).await.unwrap();
 
@@ -81,7 +60,8 @@ async fn main() {
                     break vec![user]
                 }
                 Err(IDSError::TwoFaError) => {
-                    println!("2fa code: ");
+                    print!("2fa code: ");
+                    std::io::stdout().flush().unwrap();
                     let stdin = io::stdin();
                     let mut reader = BufReader::new(stdin);
                     let mut code = String::new();
@@ -98,7 +78,7 @@ async fn main() {
     if users[0].identity.is_none() {
         info!("Registering new identity...");
         print!("Enter validation data: ");
-        io::stdout().flush().await.unwrap();
+        std::io::stdout().flush().unwrap();
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin);
         let mut validation = String::new();
@@ -147,7 +127,7 @@ async fn main() {
         participants: vec!["tel:+17203818329".to_string()],
         cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, imessage::Message::Message(NormalMessage {
+    }, Message::Message(NormalMessage {
         parts: MessageParts(vec![
             MessagePart::Attachment(attachment),
             MessagePart::Text("Sent from pure rust!".to_string())

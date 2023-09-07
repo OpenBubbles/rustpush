@@ -55,7 +55,7 @@ fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, uplo
                 v: edge_info
             }]
         ].concat(),
-        f7: upload_md5.map(|md5| md5.to_vec()),
+        upload_md5: upload_md5.map(|md5| md5.to_vec()),
         metrics: [
             vec![
                 mmcsp::confirm_response::request::Metric {
