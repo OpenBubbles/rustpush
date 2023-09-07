@@ -1,6 +1,7 @@
 
 use std::io::Cursor;
 
+use log::info;
 use openssl::{rsa::{Rsa, Padding}, x509::{X509ReqBuilder, X509NameBuilder}, error::ErrorStack, nid::Nid, bn::BigNum, hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, sign::Signer};
 use plist::Data;
 use uuid::Uuid;
@@ -98,7 +99,7 @@ pub async fn generate_push_cert() -> Result<KeyPair, CertGenError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let activation_info = build_activation_info(private_key.as_ref())?;
 
-    println!("Generated activation info (with UUID: {})", &activation_info.unique_device_id);
+    info!("Generated activation info (with UUID: {})", &activation_info.unique_device_id);
     
     let activation_info_plist = plist_to_buf(&activation_info)?;
 
