@@ -14,7 +14,7 @@ pub use apns::{APNSState, APNSConnection};
 pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register, IDSError};
 pub use imessage::{IMClient, IMessage, RecievedMessage, BalloonBody, ConversationData, Message};
 extern crate pretty_env_logger;
-#[macro_use] extern crate log;
+extern crate log;
 
 //not sure if this can be called outside of this library and still have it work
 pub fn init_logger() {

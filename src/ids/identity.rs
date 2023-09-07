@@ -3,9 +3,9 @@ use std::{io::Cursor, sync::Arc};
 use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::{APNSState, APNSConnection}};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSConnection};
 
-use super::{IDSError, user::{IDSUser, IDSPhoneUser, IDSUserType}, signing::auth_sign_req};
+use super::{IDSError, user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::Serialize;
 use serde::Deserialize;
 
@@ -97,7 +97,7 @@ pub struct IDSIdentity {
 }
 
 impl IDSIdentity {
-    pub fn new(push: &APNSState) -> Result<IDSIdentity, IDSError> {
+    pub fn new() -> Result<IDSIdentity, IDSError> {
         let encryption_key = PKey::from_rsa(Rsa::generate_with_e(1280, BigNum::from_u32(65537)?.as_ref())?)?;
         let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let signing_key = PKey::from_ec_key(EcKey::generate(&ec_group)?)?;
@@ -147,7 +147,7 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
     for user in users.iter_mut() {
         user.handles = user.possible_handles(conn.clone()).await?;
         let identity = user.identity.get_or_insert_with(|| {
-            IDSIdentity::new(&conn.state).unwrap()
+            IDSIdentity::new().unwrap()
         });
         let mut dict = Dictionary::from_iter([
             ("client-data", Value::Dictionary(Dictionary::from_iter([

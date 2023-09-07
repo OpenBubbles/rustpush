@@ -1,7 +1,7 @@
 
-use std::{rc::Rc, fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}, fs};
+use std::{fmt, collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
-use log::{debug, warn, info};
+use log::{debug, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use plist::{Data, Value};
 use regex::Regex;
@@ -10,9 +10,9 @@ use tokio::sync::{mpsc::Receiver, Mutex};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
-use xml::{EventReader, EventWriter, reader, writer::XmlEvent, EmitterConfig};
+use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, plist_to_string, decode_hex, encode_hex}, mmcs::{get_mmcs, calculate_mmcs_signature, put_mmcs}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, calculate_mmcs_signature, put_mmcs}};
 
 #[repr(C)]
 pub struct BalloonBody {
@@ -183,6 +183,7 @@ struct MMCSUploadResponse {
 }
 
 impl MMCSAttachment {
+    // create and upload a new attachment to MMCS
     async fn new(apns: &APNSConnection, body: &[u8]) -> Result<MMCSAttachment, IDSError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let encrypted = encrypt(Cipher::aes_256_ctr(), &key, Some(&ZERO_NONCE), &body)?;
@@ -198,6 +199,7 @@ impl MMCSAttachment {
         };
         let binary = plist_to_bin(&complete)?;
         apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+        // wait for response
         let response = apns.reader.wait_find_pred(move |x| {
             if x.id != 0x0A {
                 return false
@@ -224,6 +226,7 @@ impl MMCSAttachment {
         })
     }
 
+    // request to get and download attachment from MMCS
     async fn get_attachment(&self, apns: &APNSConnection) -> Result<Vec<u8>, IDSError> {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = RequestMMCSDownload {
@@ -237,7 +240,7 @@ impl MMCSAttachment {
 
         let binary = plist_to_bin(&complete)?;
         apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
-        info!("sent message");
+        // wait for response
         let response = apns.reader.wait_find_pred(move |x| {
             if x.id != 0x0A {
                 return false
@@ -300,7 +303,7 @@ impl Attachment {
             }
         }
     }
-
+    // Convert attachments objects into xml for a RawIMessage
     fn stringify_attachments(raw: &mut RawIMessage, attachments: &[Attachment]) -> String {
         let mut output = vec![];
         let writer_config = EmitterConfig::new()
@@ -357,12 +360,14 @@ impl Attachment {
         debug!("attachments {}", msg);
         msg
     }
+
+    // parse XML attachments
     fn parse_attachments(xml: &str, raw: &RawIMessage) -> Vec<Attachment> {
         let mut data: Vec<Attachment> = vec![];
         let reader = EventReader::new(Cursor::new(xml));
         for e in reader {
             match e {
-                Ok(reader::XmlEvent::StartElement { name, attributes, namespace }) => {
+                Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
                     let get_attr = |name: &str, def: Option<&str>| {
                         attributes.iter().find(|attr| attr.name.to_string() == name)
                             .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
@@ -971,7 +976,7 @@ const ZERO_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 ];
 
-const MAX_SIZE: usize = 10000;
+const PAYLOADS_MAX_SIZE: usize = 10000;
 
 impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
@@ -1275,6 +1280,8 @@ impl IMClient {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         debug!("sending {:?}", message.message.to_string());
 
+        // chunk payloads together, but if they get too big split them up into mulitple messages.
+        // When sending attachments, APNs gets mad at us if we send too much at the same time.
         let mut staged_payloads: Vec<BundledPayload> = vec![];
         let mut staged_size: usize = 0;
         let send_staged = |send: Vec<BundledPayload>| {
@@ -1301,7 +1308,7 @@ impl IMClient {
         for payload in payloads {
             staged_payloads.push(payload.1);
             staged_size += payload.0;
-            if staged_size > MAX_SIZE {
+            if staged_size > PAYLOADS_MAX_SIZE {
                 staged_size = 0;
                 send_staged(staged_payloads).await?;
                 staged_payloads = vec![];

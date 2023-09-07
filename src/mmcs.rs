@@ -1,11 +1,10 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{ids::IDSError, mmcsp::{self, HttpRequest, Container, container::ChunkMeta}, util::{decode_hex, make_reqwest, encode_hex}};
-use openssl::{sha::{Sha1, Sha256, sha256}, symm::{decrypt, Cipher}, hash::{self, hash, MessageDigest}};
+use crate::{ids::IDSError, mmcsp::{self, HttpRequest, container::ChunkMeta}, util::{make_reqwest, encode_hex}};
+use openssl::{sha::{Sha1, sha256}, hash::{hash, MessageDigest}};
 use prost::Message;
 use reqwest::{Client, Response};
 use uuid::Uuid;
-use rand::Rng;
 
 async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, IDSError> {
     Ok(client.post(format!("{}/{}", url, method))
@@ -36,7 +35,8 @@ pub fn calculate_mmcs_signature(data: &[u8]) -> Vec<u8> {
     ].concat()
 }
 
-fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, up_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
+// build confirm request, mostly a bunch of analytics I don't care to track accurately
+fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, upload_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
     let edge_info = resp.headers().get("x-apple-edge-info").clone().unwrap().to_str().unwrap().to_string();
     let etag = resp.headers().get("ETag").clone().unwrap().to_str().unwrap().to_string();
     let status = resp.status();
@@ -44,7 +44,7 @@ fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, up_m
         url: url.to_string(),
         status: status.as_u16() as u32,
         edge_info: [
-            if up_md5.is_some() {
+            if upload_md5.is_some() {
                 vec![mmcsp::confirm_response::request::Metric {
                     n: "Etag".to_string(),
                     v: etag
@@ -55,7 +55,7 @@ fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, up_m
                 v: edge_info
             }]
         ].concat(),
-        f7: up_md5.map(|md5| md5.to_vec()),
+        f7: upload_md5.map(|md5| md5.to_vec()),
         metrics: [
             vec![
                 mmcsp::confirm_response::request::Metric {
@@ -87,14 +87,14 @@ fn confirm_for_resp(resp: &Response, url: &str, len: u64, conf_token: &str, up_m
                     v: "0".to_string()
                 }
             ],
-            if up_md5.is_some() {
+            if upload_md5.is_some() {
                 vec![mmcsp::confirm_response::request::Metric {
                     n: "vendor.request.qos".to_string(),
                     v: "fg".to_string()
                 }]
             } else { vec![] },
         ].concat(),
-        metrics2: if up_md5.is_some() {
+        metrics2: if upload_md5.is_some() {
             vec![
                 mmcsp::confirm_response::request::Metric {
                     n: "authorizeGetForFiles.millis".to_string(),
@@ -132,8 +132,9 @@ fn gen_chunk_sig(chunk: &[u8]) -> [u8; 20] {
     sha256(&out)[..20].try_into().unwrap()
 }
 
+// upload data to mmcs
 pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, object: &str) -> Result<(), IDSError> {
-    // chunk data into chunks of 5MB
+    // chunk data into chunks of 5MB, generating a signature for each chunk
     let chunks: Vec<(&[u8], [u8; 20])> = data.chunks(5242880).map(|chunk|
         (chunk, gen_chunk_sig(chunk))).collect();
     let get = mmcsp::AuthorizePut {
@@ -161,6 +162,7 @@ pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, objec
     let resp_data = resp.bytes().await?;
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(resp_data)).unwrap();
     for target in response.targets {
+        // find the chunks Apple wants in this request, and build a body
         let mut body: Vec<u8> = vec![];
         for chunk_uuid in target.chunks {
             let wanted_chunk = chunks.iter().find(|test| &test.1 == &chunk_uuid[1..] /* without 0x1 */).unwrap();
@@ -170,9 +172,11 @@ pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, objec
         let body_md5 = hash(MessageDigest::md5(), &body)?;
         let request = target.request.unwrap();
         let response = transfer_mmcs_container(&client, &request, Some(&body)).await?;
+        // compute confirm message for this upload, then finish the upload
         let only_confirm = confirm_for_resp(&response, &get_container_url(&request), response.content_length().unwrap(), &target.cl_auth_p2, Some(&body_md5));
         response.bytes().await?;
 
+        // send the confirm message
         let confirmation = mmcsp::ConfirmResponse {
             inner: vec![only_confirm]
         };
@@ -233,8 +237,10 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<
     let mut container_cache: HashMap<u32, (Vec<u8>, Vec<ChunkMeta>)> = HashMap::new();
     let mut confirm_responses: Vec<mmcsp::confirm_response::Request> = vec![];
     let mut body: Vec<u8> = vec![];
-    let data = &response.f1.as_ref().   unwrap().containers;
+    // reassemble the body, going chunk by chunk
+    let data = &response.f1.as_ref().unwrap().containers;
     for chunk in response.f1.as_ref().unwrap().references.as_ref().unwrap().chunk_references.iter() {
+        // download bucket for chunk if bucket not downloaded yet
         if !container_cache.contains_key(&chunk.container_index) {
             let container = data.get(chunk.container_index as usize).unwrap();
             let req = container.request.as_ref().unwrap();
@@ -242,6 +248,7 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<
             confirm_responses.push(confirm_for_resp(&response, &get_container_url(req), response.content_length().unwrap(), &container.cl_auth_p2, None));
             container_cache.insert(chunk.container_index, (response.bytes().await?.to_vec(), container.chunks.clone()));
         }
+        
         let container = container_cache.get(&chunk.container_index).unwrap();
         let start = container.1.iter().take(chunk.chunk_index as usize).fold(0, |a, chunk| a + chunk.size) as usize;
         let len = container.1.get(chunk.chunk_index as usize).unwrap().size as usize;
@@ -249,6 +256,7 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<
         body.extend_from_slice(&container.0[start..start + len]);
     }
 
+    // confirm get
     let confirmation = mmcsp::ConfirmResponse {
         inner: confirm_responses
     };

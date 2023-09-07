@@ -1,13 +1,11 @@
 
-use std::{rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use apns::APNSState;
 use imessage::{IMClient, ConversationData};
 use log::{info, error};
-use plist::Dictionary;
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
-use util::{base64_encode, base64_decode};
 use uuid::Uuid;
 use crate::ids::IDSError;
 use crate::imessage::{RecievedMessage, Message};

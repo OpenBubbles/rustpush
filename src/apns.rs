@@ -2,7 +2,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
-use rustls::{Certificate, client::{ServerCertVerifier, ServerCertVerified}};
+use rustls::Certificate;
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
@@ -12,7 +12,7 @@ use serde::{Serialize, Deserialize};
 use async_recursion::async_recursion;
 use tokio::time::interval;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::{KeyPair, base64_encode}, ids::signing::generate_nonce};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair, ids::signing::generate_nonce};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {

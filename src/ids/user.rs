@@ -1,4 +1,4 @@
-use std::{rc::Rc, io::Cursor, future::Future, collections::HashMap, sync::Arc, fmt::format};
+use std::{io::Cursor, collections::HashMap, sync::Arc};
 
 use log::info;
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
@@ -289,7 +289,7 @@ impl IDSUser {
 }
 
 impl IDSAppleUser {
-    pub async fn authenticate(conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, IDSError> {
+    pub async fn authenticate(_conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, IDSError> {
         let (token, user_id) = get_auth_token(username, password).await?;
         let auth_keypair = get_auth_cert(&user_id, &token).await?;
 
