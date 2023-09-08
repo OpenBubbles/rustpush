@@ -70,7 +70,7 @@ message Container {
     message ChunkMeta {
         bytes checksum = 1;
         uint64 size = 3;
-        uint32 f4 = 4;
+        uint64 offset = 4;
     }
     HTTPRequest request = 1;
     repeated ChunkMeta chunks = 2;

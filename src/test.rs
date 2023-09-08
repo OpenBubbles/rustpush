@@ -121,7 +121,9 @@ async fn main() {
 
     let data = fs::read("upload.png").await.expect("Unable to read file");
     println!("upload attachment");
-    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png").await.unwrap();
+    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
+        println!("uploaded attachment bytes {} of {}", curr, total);
+    }).await.unwrap();
     println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {
         participants: vec!["tel:+17203818329".to_string()],
@@ -153,7 +155,9 @@ async fn main() {
                         if let Message::Message(msg) = msg.message {
                             for part in msg.parts.0 {
                                 if let MessagePart::Attachment(attachment) = part {
-                                    let data = attachment.get_attachment(&connection).await.unwrap();
+                                    let data = attachment.get_attachment(&connection, &mut |curr, total| {
+                                        println!("downloaded attachment bytes {} of {}", curr, total);
+                                    }).await.unwrap();
                                     fs::write("download.png", data).await.unwrap();
                                 }
                             }

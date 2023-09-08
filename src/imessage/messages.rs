@@ -312,7 +312,7 @@ pub struct MMCSAttachment {
 
 impl MMCSAttachment {
     // create and upload a new attachment to MMCS
-    async fn new(apns: &APNSConnection, body: &[u8]) -> Result<MMCSAttachment, IDSError> {
+    async fn new(apns: &APNSConnection, body: &[u8], progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSAttachment, IDSError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let encrypted = encrypt(Cipher::aes_256_ctr(), &key, Some(&ZERO_NONCE), &body)?;
         let sig = calculate_mmcs_signature(&encrypted);
@@ -337,7 +337,7 @@ impl MMCSAttachment {
         let response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
         let url = format!("{}/{}", response.domain, response.object);
-        put_mmcs(&sig, &encrypted, &url, &response.token, &response.object).await?;
+        put_mmcs(&sig, &encrypted, &url, &response.token, &response.object, progress).await?;
 
         Ok(MMCSAttachment {
             signature: sig.to_vec(),
@@ -348,7 +348,7 @@ impl MMCSAttachment {
     }
 
     // request to get and download attachment from MMCS
-    async fn get_attachment(&self, apns: &APNSConnection) -> Result<Vec<u8>, IDSError> {
+    async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = RequestMMCSDownload {
             c: 151,
@@ -371,7 +371,7 @@ impl MMCSAttachment {
 
         let response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
         
-        let encrypted = get_mmcs(&self.signature, &response.token, &response.dsid, &self.url).await?;
+        let encrypted = get_mmcs(&self.signature, &response.token, &response.dsid, &self.url, progress).await?;
 
         Ok(decrypt(Cipher::aes_256_ctr(), &self.key, Some(&ZERO_NONCE), &encrypted)?)
     }
@@ -395,8 +395,8 @@ pub struct Attachment {
 
 impl Attachment {
 
-    pub async fn new_mmcs(apns: &APNSConnection, data: &[u8], mime: &str, uti: &str, name: &str) -> Result<Attachment, IDSError> {
-        let mmcs = MMCSAttachment::new(apns, data).await?;
+    pub async fn new_mmcs(apns: &APNSConnection, data: &[u8], mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, IDSError> {
+        let mmcs = MMCSAttachment::new(apns, data, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
             part: 0,
@@ -407,13 +407,13 @@ impl Attachment {
         })
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection) -> Result<Vec<u8>, IDSError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 Ok(data.clone())
             },
             AttachmentType::MMCS(mmcs) => {
-                mmcs.get_attachment(apns).await
+                mmcs.get_attachment(apns, progress).await
             }
         }
     }

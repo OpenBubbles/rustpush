@@ -70,7 +70,7 @@ fn gen_chunk_sig(chunk: &[u8]) -> [u8; 20] {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, object: &str) -> Result<(), IDSError> {
+pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, object: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
     // chunk data into chunks of 5MB, generating a signature for each chunk
     let chunks: Vec<(&[u8], [u8; 20])> = data.chunks(5242880).map(|chunk|
         (chunk, gen_chunk_sig(chunk))).collect();
@@ -96,6 +96,8 @@ pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, objec
     let resp = send_mmcs_req(&client, &url, "authorizePut", 
             &format!("{} {} {}", encode_hex(&req_sig), data.len(), token), object, &buf).await?;
     
+    let mut uploaded_bytes = 0;
+
     let resp_data = resp.bytes().await?;
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(resp_data)).unwrap();
     for target in response.targets {
@@ -112,6 +114,9 @@ pub async fn put_mmcs(req_sig: &[u8], data: &[u8], url: &str, token: &str, objec
         // compute confirm message for this upload, then finish the upload
         let only_confirm = confirm_for_resp(&response, &get_container_url(&request), &target.cl_auth_p2, Some(&body_md5));
         response.bytes().await?;
+
+        uploaded_bytes += body.len();
+        progress(uploaded_bytes, data.len());
 
         // send the confirm message
         let confirmation = mmcsp::ConfirmResponse {
@@ -153,7 +158,16 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
     Ok(upload_resp.send().await?)
 }
 
-pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<Vec<u8>, IDSError> {
+pub async fn track_download(mut response: Response, got_bytes: &mut dyn FnMut(usize)) -> Result<Vec<u8>, IDSError> {
+    let mut body_buf = Vec::with_capacity(response.content_length().unwrap() as usize);
+    while let Some(buf) = response.chunk().await? {
+        got_bytes(buf.len());
+        body_buf.extend_from_slice(&buf);
+    }
+    Ok(body_buf)
+}
+
+pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
     let get = mmcsp::AuthorizeGet {
         data: Some(mmcsp::authorize_get::GetData {
             sig: sig.to_vec(),
@@ -171,9 +185,14 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<
     let resp_data = resp.bytes().await?;
     let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(resp_data)).unwrap();
 
+    let total_bytes = response.f1.as_ref().unwrap().containers.iter()
+        .fold(0, |acc, container| acc + 
+                container.chunks.iter().fold(0, |acc, chunk| acc + chunk.size)) as usize;
+    let mut downloaded_bytes = 0;
     let mut container_cache: HashMap<u32, (Vec<u8>, Vec<ChunkMeta>)> = HashMap::new();
     let mut confirm_responses: Vec<mmcsp::confirm_response::Request> = vec![];
     let mut body: Vec<u8> = vec![];
+
     // reassemble the body, going chunk by chunk
     let data = &response.f1.as_ref().unwrap().containers;
     for chunk in response.f1.as_ref().unwrap().references.as_ref().unwrap().chunk_references.iter() {
@@ -183,11 +202,16 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str) -> Result<
             let req = container.request.as_ref().unwrap();
             let response = transfer_mmcs_container(&client, req, None).await?;
             confirm_responses.push(confirm_for_resp(&response, &get_container_url(req), &container.cl_auth_p2, None));
-            container_cache.insert(chunk.container_index, (response.bytes().await?.to_vec(), container.chunks.clone()));
+            
+            let body_buf = track_download(response, &mut |bytes| {
+                downloaded_bytes += bytes;
+                progress(downloaded_bytes, total_bytes);
+            }).await?;
+            container_cache.insert(chunk.container_index, (body_buf, container.chunks.clone()));
         }
         
         let container = container_cache.get(&chunk.container_index).unwrap();
-        let start = container.1.iter().take(chunk.chunk_index as usize).fold(0, |a, chunk| a + chunk.size) as usize;
+        let start = container.1.get(chunk.chunk_index as usize).unwrap().offset as usize;
         let len = container.1.get(chunk.chunk_index as usize).unwrap().size as usize;
         
         body.extend_from_slice(&container.0[start..start + len]);
