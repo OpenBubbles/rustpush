@@ -3,7 +3,7 @@
 use std::{fmt, vec, io::Cursor};
 
 use log::debug;
-use openssl::symm::{Cipher, encrypt, decrypt};
+use openssl::symm::{Cipher, encrypt, Crypter};
 use plist::Data;
 use regex::Regex;
 use uuid::Uuid;
@@ -348,7 +348,7 @@ impl MMCSAttachment {
     }
 
     // request to get and download attachment from MMCS
-    async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
+    async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(Vec<u8>, usize)) -> Result<(), IDSError> {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = RequestMMCSDownload {
             c: 151,
@@ -371,9 +371,24 @@ impl MMCSAttachment {
 
         let response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
         
-        let encrypted = get_mmcs(&self.signature, &response.token, &response.dsid, &self.url, progress).await?;
+        let mut encrypter = Crypter::new(Cipher::aes_256_ctr(), openssl::symm::Mode::Encrypt, &self.key, Some(&ZERO_NONCE))?;
+        let mut my_total = 0;
+        get_mmcs(&self.signature, &response.token, &response.dsid, &self.url, &mut |data, total| {
+            let block_size = Cipher::aes_256_ctr().block_size();
+            let mut plaintext = vec![0; data.len() + block_size];
+            let len = encrypter.update(&data, &mut plaintext).unwrap();
+            plaintext.resize(len, 0);
+            my_total = total;
+            progress(plaintext, total);
+        }).await?;
 
-        Ok(decrypt(Cipher::aes_256_ctr(), &self.key, Some(&ZERO_NONCE), &encrypted)?)
+        let block_size = Cipher::aes_256_ctr().block_size();
+        let mut plaintext = vec![0; block_size];
+        let len = encrypter.finalize(&mut plaintext).unwrap();
+        plaintext.resize(len, 0);
+        progress(plaintext, my_total);
+
+        Ok(())
     }
 }
 
@@ -407,10 +422,11 @@ impl Attachment {
         })
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, progress: &mut dyn FnMut(Vec<u8>, usize)) -> Result<(), IDSError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
-                Ok(data.clone())
+                progress(data.clone(), data.len());
+                Ok(())
             },
             AttachmentType::MMCS(mmcs) => {
                 mmcs.get_attachment(apns, progress).await

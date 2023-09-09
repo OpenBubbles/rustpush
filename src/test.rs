@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use log::{info, error};
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage};
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -18,6 +18,7 @@ struct SavedState {
 
 #[tokio::main]
 async fn main() {
+    init_logger();
     let data: String = match fs::read_to_string("config.json").await {
 		Ok(v) => v,
 		Err(e) => {
@@ -155,10 +156,14 @@ async fn main() {
                         if let Message::Message(msg) = msg.message {
                             for part in msg.parts.0 {
                                 if let MessagePart::Attachment(attachment) = part {
-                                    let data = attachment.get_attachment(&connection, &mut |curr, total| {
-                                        println!("downloaded attachment bytes {} of {}", curr, total);
+                                    let mut file = std::fs::File::create("download.png").unwrap();
+                                    let mut total_len = 0;
+                                    attachment.get_attachment(&connection, &mut |data, total| {
+                                        file.write(&data).unwrap();
+                                        total_len += data.len();
+                                        println!("downloaded attachment bytes {} of {}", total_len, total);
                                     }).await.unwrap();
-                                    fs::write("download.png", data).await.unwrap();
+                                    file.flush().unwrap();
                                 }
                             }
                         }

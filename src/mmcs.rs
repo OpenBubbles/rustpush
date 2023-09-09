@@ -1,6 +1,7 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{ids::IDSError, mmcsp::{self, HttpRequest, container::ChunkMeta}, util::{make_reqwest, encode_hex}};
+use crate::{ids::IDSError, mmcsp::{self, HttpRequest}, util::{make_reqwest, encode_hex}};
+use log::info;
 use openssl::{sha::{Sha1, sha256}, hash::{hash, MessageDigest}};
 use prost::Message;
 use reqwest::{Client, Response};
@@ -158,16 +159,42 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
     Ok(upload_resp.send().await?)
 }
 
-pub async fn track_download(mut response: Response, got_bytes: &mut dyn FnMut(usize)) -> Result<Vec<u8>, IDSError> {
-    let mut body_buf = Vec::with_capacity(response.content_length().unwrap() as usize);
-    while let Some(buf) = response.chunk().await? {
-        got_bytes(buf.len());
-        body_buf.extend_from_slice(&buf);
-    }
-    Ok(body_buf)
+struct ChunkedResponse {
+    response: Response,
+    overflow_chunk: Vec<u8>,
 }
 
-pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>, IDSError> {
+impl ChunkedResponse {
+    fn new(response: Response) -> ChunkedResponse {
+        ChunkedResponse {
+            response,
+            overflow_chunk: vec![]
+        }
+    }
+
+    async fn read_chunk(&mut self, len: usize, new_data: &mut dyn FnMut(Vec<u8>)) -> Result<(), IDSError> {
+        let mut recieved_chunk_bytes = self.overflow_chunk.len();
+        let mut overflow_chunk = vec![];
+        std::mem::swap(&mut overflow_chunk, &mut self.overflow_chunk);
+        new_data(overflow_chunk);
+
+        while let Some(buf) = self.response.chunk().await? {
+            recieved_chunk_bytes += buf.len();
+            if recieved_chunk_bytes > len {
+                let extra_bytes = recieved_chunk_bytes - len;
+                let chunk_end = buf.len() - extra_bytes;
+                self.overflow_chunk = buf[chunk_end..].to_vec();
+                new_data(buf[..chunk_end].to_vec());
+                break;
+            } else {
+                new_data(buf.into())
+            };
+        };
+        Ok(())
+    }
+}
+
+pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, new_data: &mut dyn FnMut(Vec<u8>, usize)) -> Result<(), IDSError> {
     let get = mmcsp::AuthorizeGet {
         data: Some(mmcsp::authorize_get::GetData {
             sig: sig.to_vec(),
@@ -188,33 +215,47 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, progress: 
     let total_bytes = response.f1.as_ref().unwrap().containers.iter()
         .fold(0, |acc, container| acc + 
                 container.chunks.iter().fold(0, |acc, chunk| acc + chunk.size)) as usize;
-    let mut downloaded_bytes = 0;
-    let mut container_cache: HashMap<u32, (Vec<u8>, Vec<ChunkMeta>)> = HashMap::new();
-    let mut confirm_responses: Vec<mmcsp::confirm_response::Request> = vec![];
-    let mut body: Vec<u8> = vec![];
+    
+    // chunk cache keys are (bucket, chunk num)
+    let mut chunk_cache: HashMap<(u32, u32), Vec<u8>> = HashMap::new();
 
-    // reassemble the body, going chunk by chunk
     let data = &response.f1.as_ref().unwrap().containers;
-    for chunk in response.f1.as_ref().unwrap().references.as_ref().unwrap().chunk_references.iter() {
-        // download bucket for chunk if bucket not downloaded yet
-        if !container_cache.contains_key(&chunk.container_index) {
-            let container = data.get(chunk.container_index as usize).unwrap();
-            let req = container.request.as_ref().unwrap();
-            let response = transfer_mmcs_container(&client, req, None).await?;
-            confirm_responses.push(confirm_for_resp(&response, &get_container_url(req), &container.cl_auth_p2, None));
-            
-            let body_buf = track_download(response, &mut |bytes| {
-                downloaded_bytes += bytes;
-                progress(downloaded_bytes, total_bytes);
-            }).await?;
-            container_cache.insert(chunk.container_index, (body_buf, container.chunks.clone()));
+    let mut wanted_chunks = response.f1.as_ref().unwrap().references.as_ref().unwrap().chunk_references.iter();
+    let mut confirm_responses: Vec<mmcsp::confirm_response::Request> = vec![];
+
+    let mut wanted_chunk = wanted_chunks.next();
+    while wanted_chunk.is_some() {
+        let wanted_chunk_ref = (wanted_chunk.unwrap().container_index, wanted_chunk.unwrap().chunk_index);
+        // if the chunk is already cached (sent out of order), send it now
+        if let Some(cached) = chunk_cache.remove(&wanted_chunk_ref) {
+            new_data(cached, total_bytes);
+            wanted_chunk = wanted_chunks.next(); // next chunk
+            continue;
         }
-        
-        let container = container_cache.get(&chunk.container_index).unwrap();
-        let start = container.1.get(chunk.chunk_index as usize).unwrap().offset as usize;
-        let len = container.1.get(chunk.chunk_index as usize).unwrap().size as usize;
-        
-        body.extend_from_slice(&container.0[start..start + len]);
+        // start downloading
+        let container = data.get(wanted_chunk.unwrap().container_index as usize).unwrap();
+        let req = container.request.as_ref().unwrap();
+        let response = transfer_mmcs_container(&client, req, None).await?;
+        confirm_responses.push(confirm_for_resp(&response, &get_container_url(req), &container.cl_auth_p2, None));
+        let mut response = ChunkedResponse::new(response);
+        for (idx, container_chunk) in container.chunks.iter().enumerate() {
+
+            // this is the chunk we want right now, stream it.
+            if idx == wanted_chunk.unwrap().chunk_index as usize {
+                response.read_chunk(container_chunk.size as usize, &mut |data| {
+                    new_data(data, total_bytes);
+                }).await?;
+                wanted_chunk = wanted_chunks.next(); // next chunk
+                continue
+            }
+            // the chunks are out of order, cache the needed chunk
+            info!("Warning, chunks out of order!");
+            let mut chunk_data = vec![];
+            response.read_chunk(container_chunk.size as usize, &mut |mut data| {
+                chunk_data.append(&mut data);
+            }).await?;
+            chunk_cache.insert((wanted_chunk.unwrap().container_index, idx as u32), chunk_data);
+        }
     }
 
     // confirm get
@@ -229,5 +270,5 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, progress: 
         panic!("confirm failed {}", resp.status())
     }
 
-    Ok(body)
+    Ok(())
 }
