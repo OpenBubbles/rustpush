@@ -348,11 +348,11 @@ impl<'a> Container for IMessageContainer<'a> {
         }
         Ok(None)
     }
-    async fn read(&mut self, len: usize) -> Vec<u8> {
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError> {
         let mut recieved = self.cacher.read_exact(len);
         while recieved.is_none() {
             let mut data = vec![0; len];
-            let read = self.reader.as_mut().unwrap().read(&mut data).unwrap();
+            let read = self.reader.as_mut().unwrap().read(&mut data)?;
             if read == 0 {
                 let ciphertext = self.finish();
                 self.cacher.data_avail(&ciphertext);
@@ -369,14 +369,15 @@ impl<'a> Container for IMessageContainer<'a> {
             recieved = self.cacher.read_exact(len);
         }
         
-        recieved.unwrap_or(vec![])
+        Ok(recieved.unwrap_or(vec![]))
     }
-    async fn write(&mut self, data: &[u8]) {
+    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError> {
         let block_size = Cipher::aes_256_ctr().block_size();
         let mut plaintext = vec![0; data.len() + block_size];
         let len = self.crypter.update(&data, &mut plaintext).unwrap();
         plaintext.resize(len, 0);
-        self.writer.as_mut().unwrap().write(&plaintext).unwrap();
+        self.writer.as_mut().unwrap().write(&plaintext)?;
+        Ok(())
     }
 
     fn get_progress_count(&self) -> usize {
@@ -398,14 +399,14 @@ pub struct MMCSAttachment {
 }
 
 impl MMCSAttachment {
-    pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> AttachmentPreparedPut {
+    pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> Result<AttachmentPreparedPut, IDSError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let mut send_container = IMessageContainer::new(&key, None, Some(reader));
-        let prepared = prepare_put(&mut send_container).await;
-        AttachmentPreparedPut {
+        let prepared = prepare_put(&mut send_container).await?;
+        Ok(AttachmentPreparedPut {
             mmcs: prepared,
             key
-        }
+        })
     }
 
     // create and upload a new attachment to MMCS

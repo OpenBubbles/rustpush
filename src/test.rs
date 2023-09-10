@@ -121,12 +121,12 @@ async fn main() {
     println!("sendingdone");*/
 
     println!("prepare attachment");
-    let mut data = std::fs::File::open("upload.png").unwrap();
-    let prepared = MMCSAttachment::prepare_put(&mut data).await;
+    let mut data = std::fs::File::open("upload.bin").unwrap();
+    let prepared = MMCSAttachment::prepare_put(&mut data).await.unwrap();
     println!("upload attachment");
     data.rewind().unwrap();
-    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
-        //println!("uploaded attachment bytes {} of {}", curr, total);
+    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.bin", &mut |curr, total| {
+        println!("uploaded attachment bytes {} of {}", curr, total);
     }).await.unwrap();
     println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {

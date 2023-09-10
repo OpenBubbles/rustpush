@@ -71,28 +71,28 @@ pub struct PreparedPut {
     pub total_len: usize
 }
 
-pub async fn prepare_put(reader: &mut dyn Container) -> PreparedPut {
+pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, IDSError> {
     let mut total_len = 0;
     let mut total_hasher = Sha1::new();
     total_hasher.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
     let mut chunk_sigs: Vec<([u8; 21], usize)> = vec![];
 
-    let mut chunk = reader.read(5242880).await;
+    let mut chunk = reader.read(5242880).await?;
     // chunk data into chunks of 5MB, generating a signature for each chunk
     while chunk.len() > 0 {
         total_hasher.update(&chunk);
         chunk_sigs.push((gen_chunk_sig(&chunk), chunk.len()));
         total_len += chunk.len();
-        chunk = reader.read(5242880).await;
+        chunk = reader.read(5242880).await?;
     }
-    PreparedPut {
+    Ok(PreparedPut {
         total_sig: [
             vec![0x01],
             total_hasher.finish().to_vec()
         ].concat(),
         chunk_sigs,
         total_len
-    }
+    })
 }
 
 // a `Container` that transfers to an MMCS bucket
@@ -159,15 +159,18 @@ impl MMCSPutContainer {
 
 #[async_trait]
 impl Container for MMCSPutContainer {
-    async fn read(&mut self, _len: usize) -> Vec<u8> {
+    async fn read(&mut self, _len: usize) -> Result<Vec<u8>, IDSError> {
         panic!("cannot write to put container!")
     }
-    async fn write(&mut self, data: &[u8]) {
+    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError> {
         self.ensure_stream().await;
-        self.sender.as_ref().unwrap().send_async(Ok(data.to_vec())).await.unwrap();
+        if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data.to_vec())).await {
+            err.into_inner()?;
+        }
         let mut hasher = self.hasher.lock().await;
         hasher.update(data).unwrap();
         self.transfer_progress += data.len();
+        Ok(())
     }
 
     fn get_progress_count(&self) -> usize {
@@ -237,7 +240,7 @@ pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, url: &
         reciepts: vec![],
         total: prepared.total_len
     };
-    matcher.transfer_chunks(progress).await;
+    matcher.transfer_chunks(progress).await?;
 
     Ok(())
 }
@@ -269,8 +272,8 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
 #[async_trait]
 pub trait Container {
     // read ONE chunk
-    async fn read(&mut self, len: usize) -> Vec<u8>;
-    async fn write(&mut self, data: &[u8]);
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError>;
+    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError>;
     async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError>;
     // this should represent the byte count that represents transfer *progress*
     // if this is a file container, return 0 as writing to disk does not indicate progress
@@ -298,10 +301,10 @@ impl ChunkedContainer<'_> {
     }
 
     // (chunk id, data)
-    async fn read_next(&mut self) -> ([u8; 21], Vec<u8>) {
+    async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), IDSError> {
         let reading_chunk = &self.chunks[self.current_chunk];
         self.current_chunk += 1;
-        (reading_chunk.0, self.container.read(reading_chunk.1).await)
+        Ok((reading_chunk.0, self.container.read(reading_chunk.1).await?))
     }
 
     fn complete(&self) -> bool {
@@ -312,16 +315,16 @@ impl ChunkedContainer<'_> {
         self.chunks.get(self.current_chunk).map(|c| c.0)
     }
 
-    async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) {
+    async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) -> Result<(), IDSError> {
         // are we current chunk?
         if chunk.0 == self.wanted_chunk().unwrap() {
             // write right now (stream)
-            self.container.write(&chunk.1).await;
+            self.container.write(&chunk.1).await?;
             self.current_chunk += 1;
             if !self.complete() {
                 // try to catch up on any cached chunks
                 while let Some(cached) = self.cached_chunks.remove(&self.wanted_chunk().unwrap()) {
-                    self.container.write(&cached).await;
+                    self.container.write(&cached).await?;
                     self.current_chunk += 1;
                 }
             }
@@ -329,6 +332,7 @@ impl ChunkedContainer<'_> {
             warn!("Chunks out of order!");
             self.cached_chunks.insert(chunk.0, chunk.1.clone());
         }
+        Ok(())
     }
 }
 
@@ -352,14 +356,14 @@ impl MMCSMatcher<'_, '_> {
         sources.get_mut(wanted_idx)
     }
 
-    async fn transfer_chunks(&mut self, progress: &mut dyn FnMut(usize, usize)) {
+    async fn transfer_chunks(&mut self, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
         let mut total_source_progress = 0;
         while let Some(source) = Self::best_source(&self.targets, &mut self.sources) {
             while !source.complete() {
-                let chunk = source.read_next().await;
+                let chunk = source.read_next().await?;
                 // finialize if the source was just completed
                 if source.complete() {
-                    if let Some(data) = source.container.finalize().await.unwrap() {
+                    if let Some(data) = source.container.finalize().await? {
                         self.reciepts.push(data);
                     }
                 }
@@ -367,10 +371,10 @@ impl MMCSMatcher<'_, '_> {
                     if !target.chunks.iter().any(|c| c.0 == chunk.0) {
                         continue
                     }
-                    target.write_chunk(&chunk).await;
+                    target.write_chunk(&chunk).await?;
                     // finialize if the target was just completed
                     if target.complete() {
-                        if let Some(data) = target.container.finalize().await.unwrap() {
+                        if let Some(data) = target.container.finalize().await? {
                             self.reciepts.push(data);
                         }
                     }
@@ -382,6 +386,7 @@ impl MMCSMatcher<'_, '_> {
             }
             total_source_progress += source.container.get_progress_count();
         }
+        Ok(())
     }
 
     fn get_confirm_reciepts(&self) -> &[mmcsp::confirm_response::Request] {
@@ -455,13 +460,13 @@ impl MMCSGetContainer {
 
 #[async_trait]
 impl Container for MMCSGetContainer {
-    async fn read(&mut self, len: usize) -> Vec<u8> {
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError> {
         self.ensure_stream().await;
 
         let mut recieved = self.cacher.read_exact(len);
         while recieved.is_none() {
-            let Some(bytes) = self.response.as_mut().unwrap().chunk().await.unwrap() else {
-                return self.cacher.read_all()
+            let Some(bytes) = self.response.as_mut().unwrap().chunk().await? else {
+                return Ok(self.cacher.read_all())
             };
             self.cacher.data_avail(&bytes);
             recieved = self.cacher.read_exact(len);
@@ -469,14 +474,14 @@ impl Container for MMCSGetContainer {
         
         let read = recieved.unwrap();
         self.transfer_progress += read.len();
-        read
+        Ok(read)
     }
 
     fn get_progress_count(&self) -> usize {
         self.transfer_progress
     }
 
-    async fn write(&mut self, _data: &[u8]) {
+    async fn write(&mut self, _data: &[u8]) -> Result<(), IDSError> {
         panic!("cannot write to get container!")
     }
 
@@ -526,7 +531,7 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, target: &m
         reciepts: vec![],
         total: total_bytes
     };
-    matcher.transfer_chunks(progress).await;
+    matcher.transfer_chunks(progress).await?;
 
     let confirmation = mmcsp::ConfirmResponse {
         inner: matcher.get_confirm_reciepts().to_vec()
