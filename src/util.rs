@@ -25,6 +25,11 @@ pub fn make_reqwest() -> Client {
     for certificate in certificates.into_iter() {
         builder = builder.add_root_certificate(certificate);
     }
+
+    /*let builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .proxy(Proxy::https("https://localhost:8080").unwrap())
+        .danger_accept_invalid_certs(true);*/
     
     builder.build().unwrap()
 }

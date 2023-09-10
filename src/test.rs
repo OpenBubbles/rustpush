@@ -1,8 +1,8 @@
 
-use std::sync::Arc;
+use std::{sync::Arc, io::Seek};
 
 use log::{info, error};
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger};
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSAttachment};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -120,10 +120,13 @@ async fn main() {
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
 
-    let data = fs::read("upload.png").await.expect("Unable to read file");
+    println!("prepare attachment");
+    let mut data = std::fs::File::open("upload.png").unwrap();
+    let prepared = MMCSAttachment::prepare_put(&mut data).await;
     println!("upload attachment");
-    let attachment = Attachment::new_mmcs(&connection, &data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
-        println!("uploaded attachment bytes {} of {}", curr, total);
+    data.rewind().unwrap();
+    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
+        //println!("uploaded attachment bytes {} of {}", curr, total);
     }).await.unwrap();
     println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {
@@ -157,11 +160,8 @@ async fn main() {
                             for part in msg.parts.0 {
                                 if let MessagePart::Attachment(attachment) = part {
                                     let mut file = std::fs::File::create("download.png").unwrap();
-                                    let mut total_len = 0;
-                                    attachment.get_attachment(&connection, &mut |data, total| {
-                                        file.write(&data).unwrap();
-                                        total_len += data.len();
-                                        println!("downloaded attachment bytes {} of {}", total_len, total);
+                                    attachment.get_attachment(&connection, &mut file, &mut |curr, total| {
+                                        //println!("downloaded attachment bytes {} of {}", curr, total);
                                     }).await.unwrap();
                                     file.flush().unwrap();
                                 }
