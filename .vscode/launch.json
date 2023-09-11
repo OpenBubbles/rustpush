@@ -11,6 +11,9 @@
             "program": "${workspaceRoot}/target/debug/rustpush-test",
             "args": [],
             "cwd": "${workspaceRoot}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
         }
     ]
 }

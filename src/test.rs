@@ -120,12 +120,12 @@ async fn main() {
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
 
-    println!("prepare attachment");
-    let mut data = std::fs::File::open("upload.bin").unwrap();
+    /*println!("prepare attachment");
+    let mut data = std::fs::File::open("upload.png").unwrap();
     let prepared = MMCSAttachment::prepare_put(&mut data).await.unwrap();
     println!("upload attachment");
     data.rewind().unwrap();
-    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.bin", &mut |curr, total| {
+    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
         println!("uploaded attachment bytes {} of {}", curr, total);
     }).await.unwrap();
     println!("uploaded attachment");
@@ -145,7 +145,7 @@ async fn main() {
     })).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
-    println!("sendingdone");
+    println!("sendingdone");*/
 
     //sleep(Duration::from_millis(10000)).await;
     
@@ -156,7 +156,7 @@ async fn main() {
                 RecievedMessage::Message { msg } => {
                     if msg.has_payload() {
                         println!("{}", msg);
-                        if let Message::Message(msg) = msg.message {
+                        /*if let Message::Message(msg) = msg.message {
                             for part in msg.parts.0 {
                                 if let MessagePart::Attachment(attachment) = part {
                                     let mut file = std::fs::File::create("download.png").unwrap();
@@ -166,7 +166,7 @@ async fn main() {
                                     file.flush().unwrap();
                                 }
                             }
-                        }
+                        }*/
                     }
                 }
             }

@@ -42,7 +42,7 @@ impl IMClient {
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
                 debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102
+                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118
             }).await),
             conn,
             current_handle: Mutex::new(users[0].handles[0].clone()),

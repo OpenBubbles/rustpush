@@ -204,7 +204,7 @@ impl APNSReader {
                 }
             }
             
-            info!("Recieved payload {:?}", payload);
+            debug!("Recieved payload {:?}", payload);
             let mut locked = self.0.lock().await;
             let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
                 if (item.waiting_for)(&payload) {

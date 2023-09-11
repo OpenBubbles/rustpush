@@ -49,16 +49,18 @@ pub enum MessagePart {
     Attachment(Attachment)
 }
 
+pub struct IndexedMessagePart(MessagePart, Option<usize>);
+
 #[repr(C)]
-pub struct MessageParts(pub Vec<MessagePart>);
+pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
     fn has_attachments(&self) -> bool {
-        self.0.iter().any(|p| matches!(p, MessagePart::Attachment(_)))
+        self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)))
     }
 
     fn from_raw(raw: &str) -> MessageParts {
-        MessageParts(vec![MessagePart::Text(raw.to_string())])
+        MessageParts(vec![IndexedMessagePart(MessagePart::Text(raw.to_string()), None)])
     }
 
     // Convert parts into xml for a RawIMessage
@@ -72,10 +74,10 @@ impl MessageParts {
         writer.write(XmlEvent::start_element("body")).unwrap();
         let mut inline_attachment_num = 0;
         for (idx, part) in self.0.iter().enumerate() {
-            match part {
+            let part_idx = part.1.unwrap_or(idx).to_string();
+            match &part.0 {
                 MessagePart::Attachment(attachment) => {
                     let filesize = attachment.size.to_string();
-                    let part = idx.to_string();
                     let element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
                         .attr("width", "0")
@@ -84,7 +86,7 @@ impl MessageParts {
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
                         .attr("file-size", &filesize)
-                        .attr("message-part", &part);
+                        .attr("message-part", &part_idx);
                     match &attachment.a_type {
                         AttachmentType::Inline(data) => {
                             let num = if inline_attachment_num == 0 {
@@ -122,8 +124,8 @@ impl MessageParts {
                     }
                 },
                 MessagePart::Text(text) => {
-                    writer.write(XmlEvent::start_element("span")).unwrap();
-                    writer.write(XmlEvent::Characters(html_escape::encode_text(text).as_ref())).unwrap();
+                    writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
+                    writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
                 }
             }
             writer.write(XmlEvent::end_element()).unwrap();
@@ -137,9 +139,10 @@ impl MessageParts {
 
     // parse XML parts
     fn parse_parts(xml: &str, raw: Option<&RawIMessage>) -> MessageParts {
-        let mut data: Vec<MessagePart> = vec![];
+        let mut data: Vec<IndexedMessagePart> = vec![];
         let reader: EventReader<Cursor<&str>> = EventReader::new(Cursor::new(xml));
         let mut string_buf = String::new();
+        let mut text_part_idx: Option<usize> = None;
         for e in reader {
             match e {
                 Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
@@ -147,12 +150,14 @@ impl MessageParts {
                         attributes.iter().find(|attr| attr.name.to_string() == name)
                             .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
                     };
+                    let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
                     if name.local_name == "FILE" {
                         if string_buf.trim().len() > 0 {
-                            data.push(MessagePart::Text(string_buf));
+                            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
                             string_buf = String::new();
+                            text_part_idx = None;
                         }
-                        data.push(MessagePart::Attachment(Attachment {
+                        data.push(IndexedMessagePart(MessagePart::Attachment(Attachment {
                             a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
                                 AttachmentType::Inline(if inline.value == "ia-0" {
                                     raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
@@ -176,7 +181,9 @@ impl MessageParts {
                             size: get_attr("file-size", None).parse().unwrap(),
                             mime: get_attr("mime-type", Some("application/octet-stream")),
                             name: get_attr("name", None)
-                        }))
+                        }), part_idx))
+                    } else if name.local_name == "span" {
+                        text_part_idx = part_idx;
                     }
                 },
                 Ok(reader::XmlEvent::Characters(data)) => {
@@ -186,13 +193,13 @@ impl MessageParts {
             }
         }
         if string_buf.trim().len() > 0 {
-            data.push(MessagePart::Text(string_buf));
+            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
         }
         MessageParts(data)
     }
 
     pub fn raw_text(&self) -> String {
-        self.0.iter().filter_map(|m| match m {
+        self.0.iter().filter_map(|m| match &m.0 {
             MessagePart::Text(text) => Some(text.clone()),
             MessagePart::Attachment(_) => None
         }).collect::<Vec<String>>().join("\n")
@@ -482,6 +489,7 @@ pub enum AttachmentType {
 }
 
 #[repr(C)]
+
 pub struct Attachment {
     a_type: AttachmentType,
     part: u64,
@@ -532,6 +540,7 @@ pub enum Message {
 }
 
 impl Message {
+    // also add new C values to client.rs raw_inbound
     pub(super) fn get_c(&self) -> u8 {
         match self {
             Self::Message(_) => 100,
