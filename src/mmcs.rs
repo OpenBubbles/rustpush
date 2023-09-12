@@ -8,6 +8,17 @@ use reqwest::{Client, Response, Body};
 use tokio::{sync::Mutex, task::JoinHandle};
 use uuid::Uuid;
 use async_trait::async_trait;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MMCSTransferData {
+    pub mmcs_owner: String,
+    pub mmcs_url: String,
+    pub mmcs_signature_hex: String,
+    pub file_size: String,
+    pub decryption_key: String
+}
 
 async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, IDSError> {
     Ok(client.post(format!("{}/{}", url, method))

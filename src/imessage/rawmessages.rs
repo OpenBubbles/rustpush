@@ -1,4 +1,5 @@
 use serde::{Serialize, Deserialize};
+use crate::mmcs::MMCSTransferData;
 
 // raw messages used for communicating with APNs
 #[derive(Serialize, Deserialize)]
@@ -83,6 +84,35 @@ struct RawChangeMessage {
     msg_type: String,
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IMTransferData {
+    #[serde(rename = "IMFileTransferCreatedDate")]
+    created_date: f64,
+    #[serde(rename = "IMFileTransferFilenameKey")]
+    filename_key: String,
+    #[serde(rename = "IMFileTransferLocalUserInfoKey")]
+    local_user_info: MMCSTransferData,
+    #[serde(rename = "IMFileTransferGUID")]
+    transfer_guid: String,
+    #[serde(rename = "IMFileTransferMessageGUID")]
+    message_guid: String
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawIconChangeMessage {
+    pv: u64,
+    tv: IMTransferData,
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+    #[serde(rename = "type")]
+    msg_type: String,
+    #[serde(rename = "sp")]
+    participants: Vec<String>,
+    #[serde(rename = "n")]
+    cv_name: Option<String>,
+    gv: String
 }
 
 #[derive(Serialize, Deserialize)]

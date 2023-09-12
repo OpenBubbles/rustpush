@@ -1,6 +1,6 @@
 
 
-use std::{fmt, vec, io::{Cursor, Write, Read}};
+use std::{fmt, vec, io::{Cursor, Write, Read}, time::{SystemTime, UNIX_EPOCH}};
 
 use log::debug;
 use openssl::symm::{Cipher, Crypter};
@@ -49,7 +49,8 @@ pub enum MessagePart {
     Attachment(Attachment)
 }
 
-pub struct IndexedMessagePart(MessagePart, Option<usize>);
+#[repr(C)]
+pub struct IndexedMessagePart(pub MessagePart, pub Option<usize>);
 
 #[repr(C)]
 pub struct MessageParts(pub Vec<IndexedMessagePart>);
@@ -169,11 +170,12 @@ impl MessageParts {
                             } else {
                                 let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
                                 let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                AttachmentType::MMCS(MMCSAttachment {
+                                AttachmentType::MMCS(MMCSFile {
                                     signature: sig.clone(), // chop off first byte because it's not actually the signature
                                     object: get_attr("mmcs-owner", None),
                                     url: get_attr("mmcs-url", None),
-                                    key: key[1..].to_vec()
+                                    key: key[1..].to_vec(),
+                                    size: get_attr("file-size", None).parse().unwrap()
                                 })
                             },
                             part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
@@ -398,14 +400,44 @@ pub struct AttachmentPreparedPut {
 }
 
 #[repr(C)]
-pub struct MMCSAttachment {
+#[derive(Clone)]
+pub struct MMCSFile {
     signature: Vec<u8>,
     object: String,
     url: String,
-    key: Vec<u8>
+    key: Vec<u8>,
+    size: usize
 }
 
-impl MMCSAttachment {
+impl From<MMCSTransferData> for MMCSFile {
+    fn from(value: MMCSTransferData) -> Self {
+        MMCSFile {
+            signature: decode_hex(&value.mmcs_signature_hex).unwrap(),
+            object: value.mmcs_owner,
+            url: value.mmcs_url,
+            key: decode_hex(&value.decryption_key).unwrap()[1..].to_vec(),
+            size: value.file_size.parse().unwrap()
+        }
+    }
+}
+
+impl Into<MMCSTransferData> for MMCSFile {
+    fn into(self) -> MMCSTransferData {
+        MMCSTransferData {
+            mmcs_signature_hex: encode_hex(&self.signature),
+            mmcs_owner: self.object,
+            mmcs_url: self.url,
+            decryption_key: encode_hex(&[
+                vec![0x0],
+                self.key
+            ].concat()),
+            file_size: self.size.to_string()
+        }
+    }
+}
+
+
+impl MMCSFile {
     pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> Result<AttachmentPreparedPut, IDSError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let mut send_container = IMessageContainer::new(&key, None, Some(reader));
@@ -417,7 +449,7 @@ impl MMCSAttachment {
     }
 
     // create and upload a new attachment to MMCS
-    async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSAttachment, IDSError> {
+    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, IDSError> {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = RequestMMCSUpload {
             c: 150,
@@ -443,16 +475,17 @@ impl MMCSAttachment {
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
         put_mmcs(&mut send_container, &prepared.mmcs, &url, &response.token, &response.object, progress).await?;
 
-        Ok(MMCSAttachment {
+        Ok(MMCSFile {
             signature: prepared.mmcs.total_sig.to_vec(),
             object: response.object,
             url,
-            key: prepared.key.to_vec()
+            key: prepared.key.to_vec(),
+            size: prepared.mmcs.total_len
         })
     }
 
     // request to get and download attachment from MMCS
-    async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         let complete = RequestMMCSDownload {
             c: 151,
@@ -485,7 +518,7 @@ impl MMCSAttachment {
 #[repr(C)]
 pub enum AttachmentType {
     Inline(Vec<u8>),
-    MMCS(MMCSAttachment)
+    MMCS(MMCSFile)
 }
 
 #[repr(C)]
@@ -502,7 +535,7 @@ pub struct Attachment {
 impl Attachment {
 
     pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, IDSError> {
-        let mmcs = MMCSAttachment::new(apns, prepared, reader, progress).await?;
+        let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
             part: 0,
@@ -527,6 +560,11 @@ impl Attachment {
 }
 
 #[repr(C)]
+pub struct IconChangeMessage {
+    pub file: MMCSFile
+}
+
+#[repr(C)]
 pub enum Message {
     Message(NormalMessage),
     RenameMessage(RenameMessage),
@@ -537,6 +575,7 @@ pub enum Message {
     Typing,
     Unsend(UnsendMessage),
     Edit(EditMessage),
+    IconChange(IconChangeMessage)
 }
 
 impl Message {
@@ -552,6 +591,7 @@ impl Message {
             Self::Typing => 100,
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
+            Self::IconChange(_) => 190,
         }
     }
 
@@ -595,6 +635,9 @@ impl fmt::Display for Message {
             },
             Message::Unsend(_e) => {
                 write!(f, "unsent a message")
+            },
+            Message::IconChange(_e) => {
+                write!(f, "changed the group icon")
             }
         }
     }
@@ -758,6 +801,29 @@ impl IMessage {
                 };
 
                 plist_to_bin(&raw).unwrap()
+            },
+            Message::IconChange(msg) => {
+                let start = SystemTime::now();
+                let since_the_epoch = start
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards");
+                let raw = RawIconChangeMessage {
+                    pv: 30,
+                    tv: IMTransferData {
+                        created_date: (since_the_epoch.as_nanos() as f64) / 1000000000f64,
+                        filename_key: "GroupPhotoImage".to_string(),
+                        local_user_info: msg.file.clone().into(),
+                        transfer_guid: format!("at_0_{}", self.id),
+                        message_guid: self.id.clone()
+                    },
+                    sender_guid: conversation.sender_guid.clone(),
+                    msg_type: "v".to_string(),
+                    participants: remove_prefix(&conversation.participants),
+                    gv: "8".to_string(),
+                    cv_name: conversation.cv_name.clone()
+                };
+
+                plist_to_bin(&raw).unwrap()
             }
         };
         debug!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
@@ -775,6 +841,23 @@ impl IMessage {
     pub(super) fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            return Some(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: Some(ConversationData {
+                    participants: add_prefix(&loaded.participants),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone()
+                }),
+                message: Message::IconChange(IconChangeMessage {
+                    file: loaded.tv.local_user_info.into()
+                }),
+            })
+        }
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {

@@ -2,7 +2,8 @@
 use std::{sync::Arc, io::Seek};
 
 use log::{info, error};
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSAttachment};
+use openssl::ex_data::Index;
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -120,9 +121,9 @@ async fn main() {
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
 
-    /*println!("prepare attachment");
+    println!("prepare attachment");
     let mut data = std::fs::File::open("upload.png").unwrap();
-    let prepared = MMCSAttachment::prepare_put(&mut data).await.unwrap();
+    let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
     println!("upload attachment");
     data.rewind().unwrap();
     let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
@@ -135,8 +136,8 @@ async fn main() {
         sender_guid: Some(Uuid::new_v4().to_string())
     }, Message::Message(NormalMessage {
         parts: MessageParts(vec![
-            MessagePart::Attachment(attachment),
-            MessagePart::Text("Sent from pure rust!".to_string())
+            IndexedMessagePart(MessagePart::Attachment(attachment), None),
+            IndexedMessagePart(MessagePart::Text("Sent from pure rust!".to_string()), None)
         ]),
         body: None,
         effect: None,
@@ -145,7 +146,7 @@ async fn main() {
     })).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
-    println!("sendingdone");*/
+    println!("sendingdone");
 
     //sleep(Duration::from_millis(10000)).await;
     
