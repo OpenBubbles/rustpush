@@ -121,7 +121,7 @@ async fn main() {
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
 
-    println!("prepare attachment");
+    /*println!("prepare attachment");
     let mut data = std::fs::File::open("upload.png").unwrap();
     let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
     println!("upload attachment");
@@ -146,7 +146,7 @@ async fn main() {
     })).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
-    println!("sendingdone");
+    println!("sendingdone");*/
 
     //sleep(Duration::from_millis(10000)).await;
     
@@ -157,9 +157,9 @@ async fn main() {
                 RecievedMessage::Message { msg } => {
                     if msg.has_payload() {
                         println!("{}", msg);
-                        /*if let Message::Message(msg) = msg.message {
+                        if let Message::Message(msg) = msg.message {
                             for part in msg.parts.0 {
-                                if let MessagePart::Attachment(attachment) = part {
+                                if let MessagePart::Attachment(attachment) = part.0 {
                                     let mut file = std::fs::File::create("download.png").unwrap();
                                     attachment.get_attachment(&connection, &mut file, &mut |curr, total| {
                                         //println!("downloaded attachment bytes {} of {}", curr, total);
@@ -167,7 +167,7 @@ async fn main() {
                                     file.flush().unwrap();
                                 }
                             }
-                        }*/
+                        }
                     }
                 }
             }

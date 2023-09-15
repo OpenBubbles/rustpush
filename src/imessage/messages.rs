@@ -450,34 +450,15 @@ impl MMCSFile {
 
     // create and upload a new attachment to MMCS
     pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, IDSError> {
-        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
-        let complete = RequestMMCSUpload {
-            c: 150,
-            ua: "[Mac OS X,10.11.6,15G31,iMac13,1]".to_string(),
-            v: 3,
-            i: u32::from_be_bytes(msg_id),
-            length: prepared.mmcs.total_len,
-            signature: prepared.mmcs.total_sig.clone().into()
-        };
-        let binary = plist_to_bin(&complete)?;
-        apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
-        // wait for response
-        let response = apns.reader.wait_find_msg(move |loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return false
-            };
-            c.as_unsigned_integer().unwrap() == 150
-        }).await;
-        let response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
-
-        let url = format!("{}/{}", response.domain, response.object);
 
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
-        put_mmcs(&mut send_container, &prepared.mmcs, &url, &response.token, &response.object, progress).await?;
+        let result = put_mmcs(&mut send_container, &prepared.mmcs, apns, progress).await?;
+
+        let url = format!("{}/{}", result.0, result.1);
 
         Ok(MMCSFile {
             signature: prepared.mmcs.total_sig.to_vec(),
-            object: response.object,
+            object: result.1,
             url,
             key: prepared.key.to_vec(),
             size: prepared.mmcs.total_len
@@ -486,30 +467,8 @@ impl MMCSFile {
 
     // request to get and download attachment from MMCS
     pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
-        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
-        let complete = RequestMMCSDownload {
-            c: 151,
-            ua: "[Mac OS X,10.11.6,15G31,iMac13,1]".to_string(),
-            v: 3,
-            i: u32::from_be_bytes(msg_id),
-            object: self.object.clone(),
-            signature: self.signature.clone().into()
-        };
-
-        let binary = plist_to_bin(&complete)?;
-        apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
-        // wait for response
-        let response = apns.reader.wait_find_msg(move |loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return false
-            };
-            c.as_unsigned_integer().unwrap() == 151
-        }).await;
-
-        let response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
-        
         let mut recieve_container = IMessageContainer::new(&self.key, Some(writer), None);
-        get_mmcs(&self.signature, &response.token, &response.dsid, &self.url, &mut recieve_container, progress).await?;
+        get_mmcs(&self.signature, &self.url, &self.object, apns, &mut recieve_container, progress).await?;
 
         Ok(())
     }

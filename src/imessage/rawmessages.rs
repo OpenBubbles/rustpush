@@ -2,48 +2,6 @@ use serde::{Serialize, Deserialize};
 use crate::mmcs::MMCSTransferData;
 
 // raw messages used for communicating with APNs
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSDownload {
-    #[serde(rename = "mO")]
-    object: String,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32
-}
-
-#[derive(Serialize, Deserialize)]
-struct MMCSDownloadResponse {
-    #[serde(rename = "mA")]
-    token: String,
-    #[serde(rename = "mU")]
-    dsid: String,
-    s: u64
-}
-
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSUpload {
-    #[serde(rename = "mL")]
-    length: usize,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32
-}
-
-#[derive(Serialize, Deserialize)]
-struct MMCSUploadResponse {
-    #[serde(rename = "mA")]
-    token: String,
-    #[serde(rename = "mR")]
-    domain: String,
-    #[serde(rename = "mU")]
-    object: String
-}
 
 #[derive(Serialize, Deserialize)]
 struct MsiData {

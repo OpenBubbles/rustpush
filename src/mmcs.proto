@@ -3,27 +3,24 @@ syntax = "proto3";
 
 package mmcsp;
 
-message AuthorizeGet {
-    message GetData {
-        bytes sig = 1;
-        string token = 2;
-    }
-    GetData data = 1;
-    uint32 f = 2;
-}
-
 message AuthorizePut {
     message PutData {
         message Chunk {
             bytes sig = 1;
             uint32 size = 3;
         }
+        message Footer {
+            uint32 chunk_count = 1;
+            string profile_type = 101;
+            uint32 f103 = 103;
+        }
         bytes sig = 1;
         string token = 2;
         repeated Chunk chunks = 3;
+        Footer footer = 8;
     }
     PutData data = 1;
-    uint32 f = 3;
+    uint32 f3 = 3;
 }
 
 message ConfirmResponse {
@@ -35,7 +32,6 @@ message ConfirmResponse {
         string url = 1;
         uint32 status = 2;
         repeated Metric edgeInfo = 4;
-        optional bytes uploadMd5 = 7;
         repeated Metric metrics = 8;
         repeated Metric metrics2 = 9;
         string token = 10;
@@ -49,10 +45,6 @@ message HTTPRequest {
         string name = 1;
         string value = 2;
     }
-    message F12 {
-        string name = 1;
-        string value = 2;
-    }
     string domain = 1;
     uint32 port = 2;
     string method = 3;
@@ -63,7 +55,7 @@ message HTTPRequest {
     repeated Header headers = 8;
     string datacenter = 9;
     uint64 f11 = 11;
-    F12 f12 = 12;
+    uint32 f13 = 13;
 }
 
 message Container {
@@ -72,10 +64,13 @@ message Container {
         uint64 size = 3;
         uint64 offset = 4;
     }
+    message ChunkWrapper {
+        ChunkMeta meta = 1;
+    }
     HTTPRequest request = 1;
-    repeated ChunkMeta chunks = 2;
     string clAuthP1 = 3;
     string clAuthP2 = 4;
+    repeated ChunkWrapper chunks = 5;
 }
 
 message AuthorizeGetResponse {
@@ -98,10 +93,13 @@ message AuthorizeGetResponse {
 
 message AuthorizePutResponse {
     message UploadTarget {
+        message ChunkIdentifier {
+            bytes chunk_id = 1;
+        }
         string clAuthP1 = 1;
         HTTPRequest request = 2;
-        repeated bytes chunks = 3;
         string clAuthP2 = 4;
+        repeated ChunkIdentifier chunks = 5;
     }
     message F4 {
         bytes signature = 1;
@@ -110,4 +108,10 @@ message AuthorizePutResponse {
     repeated UploadTarget targets = 1;
     uint32 f3 = 3;
     F4 f4 = 4;
+    optional bytes confirm_data = 6;
+}
+
+message PutFooter {
+    bytes md5_sum = 1;
+    optional bytes confirm_data = 2;
 }

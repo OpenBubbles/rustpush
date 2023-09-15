@@ -1,14 +1,16 @@
-use std::{io::Cursor, collections::HashMap, sync::Arc};
+use std::{io::Cursor, collections::HashMap};
 
-use crate::{ids::IDSError, mmcsp::{self, HttpRequest, Container as ProtoContainer, authorize_put_response::UploadTarget}, util::{make_reqwest, encode_hex}};
+use crate::{ids::IDSError, mmcsp::{self, HttpRequest, Container as ProtoContainer, authorize_put_response::UploadTarget}, util::{make_reqwest, plist_to_bin}, APNSConnection};
 use log::{warn, info};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
+use plist::Data;
 use prost::Message;
 use reqwest::{Client, Response, Body};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
+use rand::Rng;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -27,39 +29,33 @@ async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsi
         .header("Accept", "application/vnd.com.apple.me.ubchunk+protobuf")
         .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
         .header("x-apple-mme-dsid", dsid)
-        .header("x-mme-client-info", "<iMac13,1> <Mac OS X;10.11.6;15G31> <com.apple.icloud.content/357.1 (com.apple.Messenger/1.0)>")
+        .header("x-mme-client-info", "<iMac13,1> <macOS;12.6.9;21G726> <com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)>")
         .header("Accept-Language", "en-us")
         .header("Content-Type", "application/vnd.com.apple.me.ubchunk+protobuf")
-        .header("User-Agent", "IMTransferAgent/1000 CFNetwork/760.6.3 Darwin/15.6.0 (x86_64)")
-        .header("x-apple-mmcs-proto-version", "4.0")
+        .header("User-Agent", "IMTransferAgent/1000 CFNetwork/1335.0.3.4 Darwin/21.6.0")
+        .header("x-apple-mmcs-proto-version", "5.0")
+        .header("x-apple-mmcs-plist-version", "v1.0")
         .header("Accept-Encoding", "gzip, deflate")
         .header("Proxy-Connection", "keep-alive")
         .header("Connection", "keep-alive")
+        .header("x-apple-mmcs-plist-sha256", "fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=")
         .body(body.to_owned())
         .send().await?)
 }
 
 // build confirm request, mostly a bunch of analytics I don't care to track accurately
-fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str, upload_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
+fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str) -> mmcsp::confirm_response::Request {
     let edge_info = resp.headers().get("x-apple-edge-info").clone().unwrap().to_str().unwrap().to_string();
-    let etag = resp.headers().get("ETag").clone().unwrap().to_str().unwrap().to_string();
     let status = resp.status();
     mmcsp::confirm_response::Request {
         url: url.to_string(),
         status: status.as_u16() as u32,
         edge_info: [
-            if upload_md5.is_some() {
-                vec![mmcsp::confirm_response::request::Metric {
-                    n: "Etag".to_string(),
-                    v: etag
-                }]
-            } else { vec![] },
             vec![mmcsp::confirm_response::request::Metric {
                 n: "x-apple-edge-info".to_string(),
                 v: edge_info
             }]
         ].concat(),
-        upload_md5: upload_md5.map(|md5| md5.to_vec()),
         metrics: vec![],
         metrics2: vec![],
         token: conf_token.to_string(),
@@ -98,7 +94,7 @@ pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, IDSE
     }
     Ok(PreparedPut {
         total_sig: [
-            vec![0x01],
+            vec![0x81],
             total_hasher.finish().to_vec()
         ].concat(),
         chunk_sigs,
@@ -110,26 +106,24 @@ pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, IDSE
 // handles putting into a bucket
 struct MMCSPutContainer {
     target: UploadTarget,
-    hasher: Arc<Mutex<Hasher>>,
+    hasher: Hasher,
     sender: Option<flume::Sender<Result<Vec<u8>, IDSError>>>,
-    finalize: Option<JoinHandle<Result<mmcsp::confirm_response::Request, IDSError>>>,
+    finalize: Option<JoinHandle<Result<(), IDSError>>>,
     length: usize,
-    finish_dsid: String,
-    finish_url: String,
     transfer_progress: usize,
+    finish_binary: Option<Vec<u8>>
 }
 
 impl MMCSPutContainer {
-    fn new(target: UploadTarget, length: usize, finish_dsid: String, finish_url: String) -> MMCSPutContainer {
+    fn new(target: UploadTarget, length: usize, finish_binary: Option<Vec<u8>>) -> MMCSPutContainer {
         MMCSPutContainer {
             target,
-            hasher: Arc::new(Mutex::new(Hasher::new(MessageDigest::md5()).unwrap())),
+            hasher: Hasher::new(MessageDigest::md5()).unwrap(),
             sender: None,
             finalize: None,
             length,
-            finish_dsid,
-            finish_url,
-            transfer_progress: 0
+            transfer_progress: 0,
+            finish_binary
         }
     }
     
@@ -140,7 +134,7 @@ impl MMCSPutContainer {
             } else {
                 5242880
             };
-            ((&chunk[..]).try_into().unwrap(), len)
+            ((&chunk.chunk_id[..]).try_into().unwrap(), len)
         }).collect()
     }
 
@@ -151,15 +145,10 @@ impl MMCSPutContainer {
             self.sender = Some(sender);
             let body: Body = Body::wrap_stream(reciever.into_stream());
             let request = self.target.request.clone().unwrap();
-            let target = self.target.cl_auth_p2.clone();
-            let hasher_cpy = self.hasher.clone();
             let task = tokio::spawn(async move {
                 let response = transfer_mmcs_container(&make_reqwest(), &request, Some(body)).await?;
-                let mut hasher = hasher_cpy.lock().await;
-                let result = hasher.finish()?;
-                let only_confirm = confirm_for_resp(&response, &get_container_url(&request), &target, Some(&result));
                 response.bytes().await?;
-                Ok::<mmcsp::confirm_response::Request, IDSError>(only_confirm)
+                Ok::<(), IDSError>(())
             });
             self.finalize = Some(task);
 
@@ -178,8 +167,7 @@ impl Container for MMCSPutContainer {
         if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data.to_vec())).await {
             err.into_inner()?;
         }
-        let mut hasher = self.hasher.lock().await;
-        hasher.update(data).unwrap();
+        self.hasher.update(data).unwrap();
         self.transfer_progress += data.len();
         Ok(())
     }
@@ -190,55 +178,118 @@ impl Container for MMCSPutContainer {
 
     // finalize the http stream
     async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError> {
-        self.sender = None;
-        let only_confirm = self.finalize.take().unwrap().await.unwrap()?;
+        let result = self.hasher.finish()?;
+        let footer = mmcsp::PutFooter {
+            md5_sum: result.to_vec(),
+            confirm_data: self.finish_binary.clone()
+        };
 
-        // send the confirm message
-        let confirmation = mmcsp::ConfirmResponse {
-            inner: vec![only_confirm]
-        };
         let mut buf: Vec<u8> = Vec::new();
-        buf.reserve(confirmation.encoded_len());
-        confirmation.encode(&mut buf).unwrap();
-        let resp = send_mmcs_req(&make_reqwest(), &self.finish_url, "putComplete", &format!("{} {} {}", self.target.cl_auth_p1, self.length, self.target.cl_auth_p2), &self.finish_dsid, &buf).await?;
-        if !resp.status().is_success() {
-            panic!("confirm failed {}", resp.status())
-        };
+        buf.reserve(footer.encoded_len());
+        footer.encode(&mut buf).unwrap();
+
+        let result = self.sender.as_ref().unwrap().send_async(Ok([
+            (buf.len() as u32).to_be_bytes().to_vec(),
+            buf
+        ].concat())).await;
+        if let Err(err) = result {
+            err.into_inner()?;
+        }
+
+        self.sender = None;
+        self.finalize.take().unwrap().await.unwrap()?;
         Ok(None)
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSUpload {
+    #[serde(rename = "mL")]
+    length: usize,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32,
+    #[serde(rename = "cV")]
+    cv: u32,
+    #[serde(rename = "cH")]
+    headers: String,
+    #[serde(rename = "cB")]
+    body: Data,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSUploadResponse {
+    #[serde(rename = "cB")]
+    response: Data,
+    #[serde(rename = "mR")]
+    domain: String,
+    #[serde(rename = "mU")]
+    object: String
+}
+
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, url: &str, token: &str, object: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<(String, String), IDSError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
-            token: token.to_string(),
+            token: String::new(),
             chunks: prepared.chunk_sigs.iter().map(|chunk| mmcsp::authorize_put::put_data::Chunk {
                 sig: chunk.0.to_vec(),
                 size: chunk.1 as u32
-            }).collect()
+            }).collect(),
+            footer: Some(mmcsp::authorize_put::put_data::Footer {
+                chunk_count: prepared.chunk_sigs.len() as u32,
+                profile_type: "kCKProfileTypeFixed".to_string(),
+                f103: 0
+            })
         }),
-        f: 3
+        f3: 81
     };
     let mut buf: Vec<u8> = Vec::new();
     buf.reserve(get.encoded_len());
     get.encode(&mut buf).unwrap();
 
-    let client = make_reqwest();
-    let resp = send_mmcs_req(&client, &url, "authorizePut", 
-            &format!("{} {} {}", encode_hex(&prepared.total_sig), prepared.total_len, token), object, &buf).await?;
+    let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+    let complete = RequestMMCSUpload {
+        c: 150,
+        ua: "[macOS,12.6.9,21G726,iMac13,1]".to_string(),
+        v: 3,
+        i: u32::from_be_bytes(msg_id),
+        length: prepared.total_len,
+        signature: prepared.total_sig.clone().into(),
+        cv: 2,
+        headers: [
+            "x-apple-mmcs-proto-version:5.0",
+            "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
+            "x-apple-mmcs-plist-version:v1.0",
+            "x-mme-client-info:<iMac13,1> <macOS;12.6.9;21G726> <com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)>",
+            ""
+        ].join("\n"),
+        body: buf.into()
+    };
+    let binary = plist_to_bin(&complete)?;
+    apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
 
-    let resp_data = resp.bytes().await?;
-    let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(resp_data)).unwrap();
+    let response = apns.reader.wait_find_msg(move |loaded| {
+        let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+            return false
+        };
+        c.as_unsigned_integer().unwrap() == 150
+    }).await;
+    let apns_response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
+
+    let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(apns_response.response)).unwrap();
     let sources = vec![ChunkedContainer::new(prepared.chunk_sigs.clone(), source)];
 
     let mut put_containers: Vec<Box<MMCSPutContainer>> = response.targets.iter().map(|target| {
         let len = target.chunks.iter().fold(0, |acc, chunk| {
-            let wanted_chunk = prepared.chunk_sigs.iter().find(|test| &test.0[..] == &chunk[..]).unwrap();
+            let wanted_chunk = prepared.chunk_sigs.iter().find(|test| &test.0[..] == &chunk.chunk_id[..]).unwrap();
             wanted_chunk.1 + acc
         });
-        Box::new(MMCSPutContainer::new(target.clone(), len, object.to_string(), url.to_string()))
+        Box::new(MMCSPutContainer::new(target.clone(), len, response.confirm_data.clone()))
     }).collect();
     let targets = put_containers.iter_mut().map(|target| {
         ChunkedContainer::new(target.get_chunks(), target.as_mut())
@@ -253,7 +304,7 @@ pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, url: &
     };
     matcher.transfer_chunks(progress).await?;
 
-    Ok(())
+    Ok((apns_response.domain, apns_response.object))
 }
 
 fn get_container_url(req: &HttpRequest) -> String {
@@ -268,8 +319,11 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
         _method => panic!("Cannot upload {}", _method)
     }
         .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
-        .header("x-mme-client-info", "<iMac13,1> <Mac OS X;10.11.6;15G31> <com.apple.icloud.content/357.1 (com.apple.Messenger/1.0)>");
+        .header("user-agent", "IMTransferAgent/1000 CFNetwork/1335.0.3.4 Darwin/21.6.0");
     for header in &req.headers {
+        if header.name == "Content-Length" || header.name == "Host" {
+            continue // this isn't a rustpush hack, this is how you *think different*
+        }
         upload_resp = upload_resp.header(header.name.clone(), header.value.clone());
     }
 
@@ -456,14 +510,14 @@ impl MMCSGetContainer {
     }
 
     fn get_chunks(&self) -> Vec<([u8; 21], usize)> {
-        self.container.chunks.iter().map(|chunk| (chunk.checksum.clone().try_into().unwrap(), chunk.size as usize)).collect()
+        self.container.chunks.iter().map(|chunk| (chunk.meta.clone().unwrap().checksum.try_into().unwrap(), chunk.meta.as_ref().unwrap().size as usize)).collect()
     }
 
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) {
         if self.response.is_none() {
             let response = transfer_mmcs_container(&make_reqwest(), &self.container.request.as_ref().unwrap(), None).await.unwrap();
-            self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None));
+            self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2));
             self.response = Some(response);
         }
     }
@@ -501,27 +555,70 @@ impl Container for MMCSGetContainer {
     }
 }
 
-pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, target: &mut dyn Container, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
-    let get = mmcsp::AuthorizeGet {
-        data: Some(mmcsp::authorize_get::GetData {
-            sig: sig.to_vec(),
-            token: token.to_string()
-        }),
-        f: 2
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSDownload {
+    #[serde(rename = "mO")]
+    object: String,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32,
+    #[serde(rename = "cH")]
+    headers: String,
+    #[serde(rename = "mR")]
+    domain: String,
+    #[serde(rename = "cV")]
+    cv: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSDownloadResponse {
+    #[serde(rename = "cB")]
+    response: Data,
+    #[serde(rename = "mU")]
+    object: String
+}
+
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut dyn Container, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+    let domain = url.replace(&format!("/{}", object), "");
+    let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+    let request_download = RequestMMCSDownload {
+        object: object.to_string(),
+        c: 151,
+        ua: "[macOS,12.6.9,21G726,iMac13,1]".to_string(),
+        headers: [
+            "x-apple-mmcs-proto-version:5.0",
+            "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
+            "x-apple-mmcs-plist-version:v1.0",
+            "x-mme-client-info:<iMac13,1> <macOS;12.6.9;21G726> <com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)>",
+            ""
+        ].join("\n"),
+        v: 8,
+        domain,
+        cv: 2,
+        i: u32::from_be_bytes(msg_id),
+        signature: sig.to_vec().into()
     };
-    let mut buf: Vec<u8> = Vec::new();
-    buf.reserve(get.encoded_len());
-    get.encode(&mut buf).unwrap();
+    
+    let binary = plist_to_bin(&request_download)?;
+    apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
 
-    let client = make_reqwest();
-    let resp = send_mmcs_req(&client, url, "authorizeGet", &format!("{} {}", encode_hex(&sig), token), dsid, &buf).await?;
+    let response = apns.reader.wait_find_msg(move |loaded| {
+        let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+            return false
+        };
+        c.as_unsigned_integer().unwrap() == 151
+    }).await;
+    let apns_response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
-    let resp_data = resp.bytes().await?;
-    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(resp_data)).unwrap();
+    let data: Vec<u8> = apns_response.response.clone().into();
+    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(data)).unwrap();
 
     let total_bytes = response.f1.as_ref().unwrap().containers.iter()
         .fold(0, |acc, container| acc + 
-                container.chunks.iter().fold(0, |acc, chunk| acc + chunk.size)) as usize;
+                container.chunks.iter().fold(0, |acc, chunk| acc + chunk.meta.as_ref().unwrap().size)) as usize;
     
     let mut mmcs_sources: Vec<Box<MMCSGetContainer>> = response.f1.as_ref().unwrap().containers.iter().map(|container| Box::new(MMCSGetContainer::new(container.clone()))).collect();
     let sources = mmcs_sources.iter_mut().map(|container| {
@@ -533,7 +630,7 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, target: &m
     let targets = vec![ChunkedContainer::new(wanted_chunks.iter().map(|chunk| {
         let container = data.get(chunk.container_index as usize).unwrap();
         let chunk = &container.chunks[chunk.chunk_index as usize];
-        (chunk.checksum.clone().try_into().unwrap(), chunk.size as usize)
+        (chunk.meta.clone().unwrap().checksum.try_into().unwrap(), chunk.meta.as_ref().unwrap().size as usize)
     }).collect(), target)];
 
     let mut matcher = MMCSMatcher {
@@ -550,7 +647,7 @@ pub async fn get_mmcs(sig: &[u8], token: &str, dsid: &str, url: &str, target: &m
     let mut buf: Vec<u8> = Vec::new();
     buf.reserve(confirmation.encoded_len());
     confirmation.encode(&mut buf).unwrap();
-    let resp = send_mmcs_req(&client, url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), dsid, &buf).await?;
+    let resp = send_mmcs_req(&make_reqwest(), url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &apns_response.object, &buf).await?;
     if !resp.status().is_success() {
         panic!("confirm failed {}", resp.status())
     }
