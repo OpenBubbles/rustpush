@@ -145,8 +145,8 @@ impl IMClient {
         let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
         let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
         let ex = load.as_dictionary().unwrap().get("eX").map(|v| v.as_unsigned_integer().unwrap());
-        let htu = load.as_dictionary().unwrap().get("htu").map(|v| v.as_boolean().unwrap());
-        if get_c == 101 || get_c == 102 || (ex == Some(0) && htu == Some(true)) {
+        let has_p = load.as_dictionary().unwrap().contains_key("P");
+        if get_c == 101 || get_c == 102 || ex == Some(0) {
             let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
             let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
             return Some(RecievedMessage::Message {
@@ -154,7 +154,7 @@ impl IMClient {
                     id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
                     sender: None,
                     after_guid: None,
-                    conversation: if ex == Some(0) && htu == Some(true) {
+                    conversation: if ex == Some(0) {
                         // typing
                         let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
                         let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
@@ -166,8 +166,12 @@ impl IMClient {
                     } else {
                         None
                     },
-                    message: if ex == Some(0) && htu == Some(true) {
-                        Message::Typing
+                    message: if ex == Some(0) {
+                        if has_p {
+                            Message::StopTyping
+                        } else {
+                            Message::Typing
+                        }
                     } else if get_c == 101 {
                         Message::Delivered
                     } else {
@@ -178,7 +182,6 @@ impl IMClient {
             })
         }
 
-        let has_p = load.as_dictionary().unwrap().contains_key("P");
         if !has_p {
             return None
         }

@@ -166,6 +166,24 @@ async fn main() {
                 RecievedMessage::Message { msg } => {
                     if msg.has_payload() {
                         println!("{}", msg);
+                        match msg.message {
+                            Message::Message(inner) => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            Message::React(inner) => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            Message::Typing => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            _ => {}
+                        }
                         /*if let Message::IconChange(msg) = msg.message {
                             let mut file = std::fs::File::create("download.png").unwrap();
                             msg.file.get_attachment(&connection, &mut file, &mut |curr, total| {

@@ -125,7 +125,7 @@ struct RawUnsendMessage {
 #[derive(Serialize, Deserialize)]
 struct RawIMessage {
     #[serde(rename = "t")]
-    text: String,
+    text: Option<String>,
     #[serde(rename = "x")]
     xml: Option<String>,
     #[serde(rename = "p")]

@@ -425,7 +425,7 @@ impl APNSConnection {
         });
 
         submitter.set_state(1).await.unwrap();
-        submitter.filter(&["com.apple.madrid"]).await.unwrap();
+        submitter.filter(&["com.apple.madrid", "com.apple.icloud.presence.mode.status"]).await.unwrap();
 
         Ok(())
     }

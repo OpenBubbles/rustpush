@@ -78,7 +78,7 @@ impl MessageParts {
             let part_idx = part.1.unwrap_or(idx).to_string();
             match &part.0 {
                 MessagePart::Attachment(attachment) => {
-                    let filesize = attachment.size.to_string();
+                    let filesize = attachment.get_size().to_string();
                     let element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
                         .attr("width", "0")
@@ -180,7 +180,6 @@ impl MessageParts {
                             },
                             part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
                             uti_type: get_attr("uti-type", None),
-                            size: get_attr("file-size", None).parse().unwrap(),
                             mime: get_attr("mime-type", Some("application/octet-stream")),
                             name: get_attr("name", None)
                         }), part_idx))
@@ -487,7 +486,6 @@ pub struct Attachment {
     a_type: AttachmentType,
     part: u64,
     uti_type: String,
-    size: usize,
     mime: String,
     name: String
 }
@@ -500,10 +498,16 @@ impl Attachment {
             a_type: AttachmentType::MMCS(mmcs),
             part: 0,
             uti_type: uti.to_string(),
-            size: prepared.mmcs.total_len,
             mime: mime.to_string(),
             name: name.to_string()
         })
+    }
+
+    pub fn get_size(&self) -> usize {
+        match &self.a_type {
+            AttachmentType::Inline(data) => data.len(),
+            AttachmentType::MMCS(mmcs) => mmcs.size
+        }
     }
 
     pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
@@ -537,7 +541,8 @@ pub enum Message {
     Typing,
     Unsend(UnsendMessage),
     Edit(EditMessage),
-    IconChange(IconChangeMessage)
+    IconChange(IconChangeMessage),
+    StopTyping
 }
 
 impl Message {
@@ -554,6 +559,7 @@ impl Message {
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
             Self::IconChange(_) => 190,
+            Self::StopTyping => 100
         }
     }
 
@@ -600,6 +606,9 @@ impl fmt::Display for Message {
             },
             Message::IconChange(_e) => {
                 write!(f, "changed the group icon")
+            },
+            Message::StopTyping => {
+                write!(f, "stopped typing")
             }
         }
     }
@@ -653,6 +662,7 @@ impl IMessage {
     pub fn get_ex(&self) -> Option<u32> {
         match &self.message {
             Message::Typing => Some(0),
+            Message::StopTyping => Some(0),
             _ => None
         }
     }
@@ -673,6 +683,27 @@ impl IMessage {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::StopTyping => {
+                let raw = RawIMessage {
+                    text: None,
+                    xml: None,
+                    participants: conversation.participants.clone(),
+                    after_guid: None,
+                    sender_guid: conversation.sender_guid.clone(),
+                    pv: 0,
+                    gv: "8".to_string(),
+                    v: "1".to_string(),
+                    bid: None,
+                    b: None,
+                    effect: None,
+                    cv_name: conversation.cv_name.clone(),
+                    reply: None,
+                    inline0: None,
+                    inline1: None
+                };
+        
+                plist_to_bin(&raw).unwrap()
+            }
             Message::ChangeParticipants(msg) => {
                 let raw = RawChangeMessage {
                     target_participants: remove_prefix(&msg.new_participants),
@@ -715,7 +746,7 @@ impl IMessage {
             },
             Message::Message (normal) => {
                 let mut raw = RawIMessage {
-                    text: normal.parts.raw_text(),
+                    text: Some(normal.parts.raw_text()),
                     xml: None,
                     participants: conversation.participants.clone(),
                     after_guid: self.after_guid.clone(),
@@ -921,7 +952,7 @@ impl IMessage {
                 (guid, parts.join(":"))
             });
             let parts = loaded.xml.as_ref().map_or_else(|| {
-                MessageParts::from_raw(&loaded.text)
+                loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
             }, |xml| {
                 MessageParts::parse_parts(xml, Some(&loaded))
             });
