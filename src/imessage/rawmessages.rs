@@ -28,7 +28,8 @@ struct RawRenameMessage {
 
 #[derive(Serialize, Deserialize)]
 struct RawChangeMessage {
-    pv: u64,
+    #[serde(rename = "pv")]
+    group_version: u64,
     #[serde(rename = "tp")]
     target_participants: Vec<String>,
     #[serde(rename = "nn")]
@@ -60,8 +61,10 @@ struct IMTransferData {
 
 #[derive(Serialize, Deserialize)]
 struct RawIconChangeMessage {
-    pv: u64,
-    tv: IMTransferData,
+    #[serde(rename = "pv")]
+    group_version: u64,
+    #[serde(rename = "tv")]
+    new_icon: Option<IMTransferData>,
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
     #[serde(rename = "type")]

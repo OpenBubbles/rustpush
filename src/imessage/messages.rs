@@ -2,7 +2,7 @@
 
 use std::{fmt, vec, io::{Cursor, Write, Read}, time::{SystemTime, UNIX_EPOCH}};
 
-use log::debug;
+use log::{debug, warn};
 use openssl::symm::{Cipher, Crypter};
 use plist::Data;
 use regex::Regex;
@@ -225,7 +225,8 @@ pub struct RenameMessage {
 
 #[repr(C)]
 pub struct ChangeParticipantMessage {
-    pub new_participants: Vec<String>
+    pub new_participants: Vec<String>,
+    pub group_version: u64
 }
 
 #[repr(C)]
@@ -424,7 +425,7 @@ impl From<MMCSTransferData> for MMCSFile {
 impl Into<MMCSTransferData> for MMCSFile {
     fn into(self) -> MMCSTransferData {
         MMCSTransferData {
-            mmcs_signature_hex: encode_hex(&self.signature),
+            mmcs_signature_hex: encode_hex(&self.signature).to_uppercase(),
             mmcs_owner: self.object,
             mmcs_url: self.url,
             decryption_key: encode_hex(&[
@@ -518,9 +519,11 @@ impl Attachment {
     }
 }
 
+// file should be 570x570 png
 #[repr(C)]
 pub struct IconChangeMessage {
-    pub file: MMCSFile
+    pub file: Option<MMCSFile>,
+    pub group_version: u64,
 }
 
 #[repr(C)]
@@ -679,7 +682,7 @@ impl IMessage {
                     new_name: conversation.cv_name.clone().unwrap(),
                     name: conversation.cv_name.clone().unwrap(),
                     msg_type: "p".to_string(),
-                    pv: 1
+                    group_version: msg.group_version
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -766,21 +769,24 @@ impl IMessage {
                 let since_the_epoch = start
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards");
+                let random_guid = Uuid::new_v4().to_string().to_uppercase();
                 let raw = RawIconChangeMessage {
-                    pv: 30,
-                    tv: IMTransferData {
+                    group_version: msg.group_version,
+                    new_icon: msg.file.as_ref().map(|file| IMTransferData {
                         created_date: (since_the_epoch.as_nanos() as f64) / 1000000000f64,
                         filename_key: "GroupPhotoImage".to_string(),
-                        local_user_info: msg.file.clone().into(),
-                        transfer_guid: format!("at_0_{}", self.id),
-                        message_guid: self.id.clone()
-                    },
+                        local_user_info: file.clone().into(),
+                        transfer_guid: format!("at_0_{}", random_guid),
+                        message_guid: random_guid.clone()
+                    }),
                     sender_guid: conversation.sender_guid.clone(),
                     msg_type: "v".to_string(),
                     participants: remove_prefix(&conversation.participants),
                     gv: "8".to_string(),
                     cv_name: conversation.cv_name.clone()
                 };
+
+                warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
 
                 plist_to_bin(&raw).unwrap()
             }
@@ -800,23 +806,6 @@ impl IMessage {
     pub(super) fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
-        if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
-            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
-                sender: Some(wrapper.sender.clone()),
-                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
-                after_guid: None,
-                sent_timestamp: wrapper.sent_timestamp / 1000000,
-                conversation: Some(ConversationData {
-                    participants: add_prefix(&loaded.participants),
-                    cv_name: loaded.cv_name.clone(),
-                    sender_guid: loaded.sender_guid.clone()
-                }),
-                message: Message::IconChange(IconChangeMessage {
-                    file: loaded.tv.local_user_info.into()
-                }),
-            })
-        }
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Some(IMessage {
@@ -855,7 +844,26 @@ impl IMessage {
                     cv_name: Some(loaded.name.clone()),
                     sender_guid: loaded.sender_guid.clone()
                 }),
-                message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants) }),
+                message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
+            })
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
+            warn!("recieved {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            return Some(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: Some(ConversationData {
+                    participants: add_prefix(&loaded.participants),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone()
+                }),
+                message: Message::IconChange(IconChangeMessage {
+                    file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
+                    group_version: loaded.group_version
+                }),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawRenameMessage>(&decompressed) {

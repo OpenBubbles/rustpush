@@ -3,7 +3,7 @@ use std::{sync::Arc, io::Seek};
 
 use log::{info, error};
 use openssl::ex_data::Index;
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, Attachment, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart};
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart, IconChangeMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -126,24 +126,33 @@ async fn main() {
     let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
     println!("upload attachment");
     data.rewind().unwrap();
-    let attachment = Attachment::new_mmcs(&connection, &prepared, &mut data, "application/octet-stream", "public.data", "upload.png", &mut |curr, total| {
+    let attachment = MMCSFile::new(&connection, &prepared, &mut data, &mut |curr, total| {
         println!("uploaded attachment bytes {} of {}", curr, total);
     }).await.unwrap();
     println!("uploaded attachment");
     let mut msg = client.new_msg(ConversationData {
-        participants: vec!["tel:+17203818329".to_string()],
-        cv_name: None,
+        participants: vec!["mailto:testu3@icloud.com".to_string(), "mailto:textgpt@icloud.com".to_string()],
+        cv_name: Some("Hjiih".to_string()),
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, Message::Message(NormalMessage {
-        parts: MessageParts(vec![
-            IndexedMessagePart(MessagePart::Attachment(attachment), None),
-            IndexedMessagePart(MessagePart::Text("Sent from pure rust!".to_string()), None)
-        ]),
-        body: None,
-        effect: None,
-        reply_guid: None,
-        reply_part: None
-    })).await;
+    }, Message::IconChange(IconChangeMessage { file: attachment, group_version: 87 })).await;
+    println!("sendingrun");
+    client.send(&mut msg).await.unwrap();
+    println!("sendingdone");*/
+
+    /*println!("prepare attachment");
+    let mut data = std::fs::File::open("upload.png").unwrap();
+    let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
+    println!("upload attachment");
+    data.rewind().unwrap();
+    let attachment = MMCSFile::new(&connection, &prepared, &mut data, &mut |curr, total| {
+        println!("uploaded attachment bytes {} of {}", curr, total);
+    }).await.unwrap();
+    println!("uploaded attachment");
+    let mut msg = client.new_msg(ConversationData {
+        participants: vec!["tel:+17203818329".to_string(), "mailto:jjtech@jjtech.dev".to_string(), "mailto:textgpt@icloud.com".to_string()],
+        cv_name: Some("Test".to_string()),
+        sender_guid: Some(Uuid::new_v4().to_string())
+    }, Message::IconChange(IconChangeMessage { file: attachment })).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");*/
@@ -157,17 +166,13 @@ async fn main() {
                 RecievedMessage::Message { msg } => {
                     if msg.has_payload() {
                         println!("{}", msg);
-                        if let Message::Message(msg) = msg.message {
-                            for part in msg.parts.0 {
-                                if let MessagePart::Attachment(attachment) = part.0 {
-                                    let mut file = std::fs::File::create("download.png").unwrap();
-                                    attachment.get_attachment(&connection, &mut file, &mut |curr, total| {
-                                        //println!("downloaded attachment bytes {} of {}", curr, total);
-                                    }).await.unwrap();
-                                    file.flush().unwrap();
-                                }
-                            }
-                        }
+                        /*if let Message::IconChange(msg) = msg.message {
+                            let mut file = std::fs::File::create("download.png").unwrap();
+                            msg.file.get_attachment(&connection, &mut file, &mut |curr, total| {
+                                //println!("downloaded attachment bytes {} of {}", curr, total);
+                            }).await.unwrap();
+                            file.flush().unwrap();
+                        }*/
                     }
                 }
             }

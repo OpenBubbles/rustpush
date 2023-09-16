@@ -95,7 +95,7 @@ impl APNSSubmitter {
     }
 
     async fn send_payload(&self, id: u8, fields: Vec<(u8, Vec<u8>)>) -> Result<(), APNSError> {
-        debug!("Sending payload {}: {:?}", id, fields);
+        //debug!("Sending payload {}: {:?}", id, fields);
         self.write_data(&APNSPayload::new(id, fields).serialize()).await?;
         Ok(())
     }
@@ -204,7 +204,7 @@ impl APNSReader {
                 }
             }
             
-            debug!("Recieved payload {:?}", payload);
+            //debug!("Recieved payload {:?}", payload);
             let mut locked = self.0.lock().await;
             let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
                 if (item.waiting_for)(&payload) {
