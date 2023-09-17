@@ -181,7 +181,8 @@ impl MessageParts {
                             part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
                             uti_type: get_attr("uti-type", None),
                             mime: get_attr("mime-type", Some("application/octet-stream")),
-                            name: get_attr("name", None)
+                            name: get_attr("name", None),
+                            iris: get_attr("iris", Some("no")) == "yes"
                         }), part_idx))
                     } else if name.local_name == "span" {
                         text_part_idx = part_idx;
@@ -487,7 +488,8 @@ pub struct Attachment {
     part: u64,
     uti_type: String,
     mime: String,
-    name: String
+    name: String,
+    iris: bool // or live photo
 }
 
 impl Attachment {
@@ -499,7 +501,8 @@ impl Attachment {
             part: 0,
             uti_type: uti.to_string(),
             mime: mime.to_string(),
-            name: name.to_string()
+            name: name.to_string(),
+            iris: false
         })
     }
 
@@ -699,7 +702,8 @@ impl IMessage {
                     cv_name: conversation.cv_name.clone(),
                     reply: None,
                     inline0: None,
-                    inline1: None
+                    inline1: None,
+                    live_xml: None
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -760,7 +764,8 @@ impl IMessage {
                     cv_name: conversation.cv_name.clone(),
                     reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
                     inline0: None,
-                    inline1: None
+                    inline1: None,
+                    live_xml: None
                 };
 
                 if normal.parts.has_attachments() {
@@ -951,7 +956,7 @@ impl IMessage {
                 parts.remove(guididx);
                 (guid, parts.join(":"))
             });
-            let parts = loaded.xml.as_ref().map_or_else(|| {
+            let parts = loaded.live_xml.as_ref().or(loaded.xml.as_ref()).map_or_else(|| {
                 loaded.text.as_ref().map_or(MessageParts(vec![]), |text| MessageParts::from_raw(text))
             }, |xml| {
                 MessageParts::parse_parts(xml, Some(&loaded))

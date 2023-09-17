@@ -128,6 +128,8 @@ struct RawIMessage {
     text: Option<String>,
     #[serde(rename = "x")]
     xml: Option<String>,
+    #[serde(rename = "ix")]
+    live_xml: Option<String>,
     #[serde(rename = "p")]
     participants: Vec<String>,
     #[serde(rename = "r")]
