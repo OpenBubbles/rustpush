@@ -21,14 +21,6 @@ const ZERO_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 ];
 
-// a recieved message, for now just an iMessage
-#[repr(C)]
-pub enum RecievedMessage {
-    Message {
-        msg: IMessage
-    }
-}
-
 #[repr(C)]
 pub struct BalloonBody {
     pub bid: String,

@@ -10,19 +10,26 @@ use async_recursion::async_recursion;
 
 use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::plist_to_bin, imessage::messages::{BundledPayload, SendMsg}};
 
-use super::messages::{RecievedMessage, IMessage, ConversationData, Message, RecvMsg};
+use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
 const PAYLOADS_MAX_SIZE: usize = 10000;
 const NORMAL_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
 ];
 
+// a recieved message, for now just an iMessage
+#[repr(C)]
+pub enum RecievedMessage {
+    Message {
+        msg: IMessage
+    }
+}
+
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub users: Arc<Vec<IDSUser>>,
-    key_cache: Mutex<HashMap<String, Vec<IDSIdentityResult>>>,
-    raw_inbound: Mutex<Receiver<APNSPayload>>,
-    pub current_handle: Mutex<String>
+    key_cache: Mutex<HashMap<String, HashMap<String, Vec<IDSIdentityResult>>>>,
+    raw_inbound: Mutex<Receiver<APNSPayload>>
 }
 
 impl IMClient {
@@ -45,7 +52,6 @@ impl IMClient {
                 get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118
             }).await),
             conn,
-            current_handle: Mutex::new(users[0].handles[0].clone()),
             users,
         }
     }
@@ -58,26 +64,28 @@ impl IMClient {
         (body, sig)
     }
 
-    pub async fn use_handle(&self, handle: &str) {
-        let mut cache = self.key_cache.lock().await;
-        cache.clear();
-        let mut current_identity = self.current_handle.lock().await;
-        *current_identity = handle.to_string();
-    }
-
     pub fn get_handles(&self) -> Vec<String> {
         self.users.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
     }
 
-    #[async_recursion]
-    async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], retry: u8) -> bool {
-        self.cache_keys(&[sender.to_string()], retry > 0).await.unwrap();
+    fn get_cache_for_handle<'a>(cache: &'a mut HashMap<String, HashMap<String, Vec<IDSIdentityResult>>>, handle: &str) -> &'a mut HashMap<String, Vec<IDSIdentityResult>> {
+        if !cache.contains_key(handle) {
+            cache.insert(handle.to_string(), HashMap::new());
+        }
+        cache.get_mut(handle).unwrap()
+    }
 
-        let cache = self.key_cache.lock().await;
+    #[async_recursion]
+    async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], handle: &str, retry: u8) -> bool {
+        self.cache_keys(&[sender.to_string()], handle, retry > 0).await.unwrap();
+
+        let mut cache = self.key_cache.lock().await;
+        let cache = Self::get_cache_for_handle(&mut cache, handle);
+
         let Some(keys) = cache.get(sender) else {
             warn!("Cannot verify; no public key");
             if retry < 3 {
-                return self.verify_payload(payload, sender, sender_token, retry+1).await;
+                return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
             } else {
                 warn!("giving up");
             }
@@ -87,7 +95,7 @@ impl IMClient {
         let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
             warn!("Cannot verify; no public key");
             if retry < 3 {
-                return self.verify_payload(payload, sender, sender_token, retry+1).await;
+                return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
             } else {
                 warn!("giving up");
             }
@@ -134,9 +142,8 @@ impl IMClient {
         self.recieve_payload(payload).await
     }
 
-    async fn current_user(&self) -> &IDSUser {
-        let current_handle = self.current_handle.lock().await;
-        self.users.iter().find(|user| user.handles.contains(&current_handle)).unwrap()
+    async fn user_by_handle(&self, handle: &str) -> &IDSUser {
+        self.users.iter().find(|user| user.handles.contains(&handle.to_string())).unwrap()
     }
 
     async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
@@ -194,7 +201,7 @@ impl IMClient {
 
         let payload: Vec<u8> = loaded.payload.clone().into();
         let token: Vec<u8> = loaded.token.clone().into();
-        if !self.verify_payload(&payload, &loaded.sender, &token, 0).await {
+        if !self.verify_payload(&payload, &loaded.sender, &token, &loaded.target, 0).await {
             panic!("Payload verification failed!");
         }
 
@@ -205,7 +212,7 @@ impl IMClient {
         })
     }
 
-    pub async fn cache_keys(&self, participants: &[String], refresh: bool) -> Result<(), IDSError> {
+    pub async fn cache_keys(&self, participants: &[String], sender: &str, refresh: bool) -> Result<(), IDSError> {
         // find participants whose keys need to be fetched
         let key_cache = self.key_cache.lock().await;
         let fetch: Vec<String> = if refresh {
@@ -218,24 +225,24 @@ impl IMClient {
             return Ok(())
         }
         drop(key_cache);
-        let results = self.current_user().await.lookup(self.conn.clone(), fetch).await?;
+        let results = self.user_by_handle(sender).await.lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
+        let key_cache = Self::get_cache_for_handle(&mut key_cache, sender);
         for (id, results) in results {
             key_cache.insert(id, results);
         }
         Ok(())
     }
 
-    pub async fn validate_targets(&self, targets: &[String]) -> Result<Vec<String>, IDSError> {
-        self.cache_keys(targets, false).await?;
+    pub async fn validate_targets(&self, targets: &[String], sender: &str) -> Result<Vec<String>, IDSError> {
+        self.cache_keys(targets, sender, false).await?;
         let key_cache = self.key_cache.lock().await;
         Ok(targets.iter().filter(|target| key_cache.get(*target).unwrap().len() > 0).map(|i| i.clone()).collect())
     }
 
-    pub async fn new_msg(&self, conversation: ConversationData, message: Message) -> IMessage {
-        let current_handle = self.current_handle.lock().await;
+    pub async fn new_msg(&self, conversation: ConversationData, sender: &str, message: Message) -> IMessage {
         IMessage {
-            sender: Some(current_handle.clone()),
+            sender: Some(sender.to_string()),
             id: Uuid::new_v4().to_string().to_uppercase(),
             after_guid: None,
             sent_timestamp: 0,
@@ -244,9 +251,9 @@ impl IMClient {
         }
     }
 
-    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity) -> Result<Vec<u8>, IDSError> {
+    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, IDSError> {
         let rand = rand::thread_rng().gen::<[u8; 11]>();
-        let user = self.current_user().await;
+        let user = self.user_by_handle(sender).await;
 
         let hmac = PKey::hmac(&rand)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;
@@ -298,12 +305,14 @@ impl IMClient {
 
     pub async fn send(&self, message: &mut IMessage) -> Result<(), IDSError> {
         message.sanity_check_send();
-        self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), false).await?;
+        let sender = message.sender.as_ref().unwrap().to_string();
+        self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), &sender, false).await?;
         let raw = if message.has_payload() { message.to_raw() } else { vec![] };
 
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
-        let key_cache = self.key_cache.lock().await;
+        let mut key_cache_orig = self.key_cache.lock().await;
+        let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, &sender);
         for participant in &message.conversation.as_ref().unwrap().participants {
             for token in key_cache.get(participant).unwrap() {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
@@ -311,7 +320,7 @@ impl IMClient {
                     continue;
                 }
                 let encrypted = if message.has_payload() {
-                    let payload = self.encrypt_payload(&raw, &token.identity).await?;
+                    let payload = self.encrypt_payload(&raw, &token.identity, &sender).await?;
                     Some(payload)
                 } else {
                     None
@@ -326,7 +335,7 @@ impl IMClient {
                 }));
             }
         }
-        drop(key_cache);
+        drop(key_cache_orig);
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         debug!("sending {:?}", message.message.to_string());
 
