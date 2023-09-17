@@ -277,7 +277,10 @@ pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, apns: 
         let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
             return false
         };
-        c.as_unsigned_integer().unwrap() == 150
+        let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+            return false
+        };
+        c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
     }).await;
     let apns_response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
@@ -609,7 +612,10 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection
         let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
             return false
         };
-        c.as_unsigned_integer().unwrap() == 151
+        let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+            return false
+        };
+        c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
     }).await;
     let apns_response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
