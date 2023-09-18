@@ -143,7 +143,7 @@ impl IMClient {
     }
 
     async fn user_by_handle(&self, handle: &str) -> &IDSUser {
-        self.users.iter().find(|user| user.handles.contains(&handle.to_string())).unwrap()
+        self.users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
     async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
