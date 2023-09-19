@@ -5,15 +5,17 @@ mod ids;
 mod util;
 mod imessage;
 mod mmcs;
+mod error;
 
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
 
 pub use apns::{APNSState, APNSConnection};
-pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register, IDSError};
+pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register};
 pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::client::{IMClient, RecievedMessage};
+pub use error::PushError;
 extern crate pretty_env_logger;
 extern crate log;
 

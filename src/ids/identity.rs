@@ -3,9 +3,9 @@ use std::{io::Cursor, sync::Arc};
 use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSConnection};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSConnection, error::PushError};
 
-use super::{IDSError, user::{IDSUser, IDSUserType}, signing::auth_sign_req};
+use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::Serialize;
 use serde::Deserialize;
 
@@ -15,7 +15,7 @@ pub struct IDSPublicIdentity {
 }
 
 impl IDSPublicIdentity {
-    pub fn decode(data: &[u8]) -> Result<IDSPublicIdentity, IDSError> {
+    pub fn decode(data: &[u8]) -> Result<IDSPublicIdentity, PushError> {
         if &data[..8] != &[0x30, 0x81, 0xF6, 0x81, 0x43, 0x00, 0x41, 0x04] {
             panic!("Bad public identity cert!");
         }
@@ -50,7 +50,7 @@ impl IDSPublicIdentity {
         sha256(&result)
     }
 
-    pub fn verify(&self, data: &[u8], sig: &[u8]) -> Result<bool, IDSError> {
+    pub fn verify(&self, data: &[u8], sig: &[u8]) -> Result<bool, PushError> {
         let signing_key = PKey::from_ec_key(self.signing_key.clone()).unwrap();
 
         let mut verifier = Verifier::new(MessageDigest::sha1(), signing_key.as_ref())?;
@@ -97,7 +97,7 @@ pub struct IDSIdentity {
 }
 
 impl IDSIdentity {
-    pub fn new() -> Result<IDSIdentity, IDSError> {
+    pub fn new() -> Result<IDSIdentity, PushError> {
         let encryption_key = PKey::from_rsa(Rsa::generate_with_e(1280, BigNum::from_u32(65537)?.as_ref())?)?;
         let ec_group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let signing_key = PKey::from_ec_key(EcKey::generate(&ec_group)?)?;
@@ -133,7 +133,7 @@ impl IDSIdentity {
         IDSPublicIdentity { signing_key: public, encryption_key: rsakey }
     }
 
-    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, IDSError> {
+    pub fn sign(&self, data: &[u8]) -> Result<Vec<u8>, PushError> {
         let signing_key = PKey::private_key_from_der(&self.signing_key).unwrap();
 
         let mut signer = Signer::new(MessageDigest::sha1(), signing_key.as_ref())?;
@@ -141,7 +141,7 @@ impl IDSIdentity {
     }
 }
 
-pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), IDSError> {
+pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), PushError> {
 
     let mut user_payloads: Vec<Value> = vec![];
     for user in users.iter_mut() {
@@ -255,7 +255,7 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
 
     let status = parsed.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {
-        return Err(IDSError::RegisterFailed(status))
+        return Err(PushError::RegisterFailed(status))
     }
 
     // umm parsed.services[0].users[x].cert

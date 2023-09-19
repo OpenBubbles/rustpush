@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{ids::IDSError, mmcsp::{self, HttpRequest, Container as ProtoContainer, authorize_put_response::UploadTarget}, util::{make_reqwest, plist_to_bin}, APNSConnection};
+use crate::{error::PushError, mmcsp::{self, HttpRequest, Container as ProtoContainer, authorize_put_response::UploadTarget}, util::{make_reqwest, plist_to_bin}, APNSConnection};
 use log::{warn, info};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -22,7 +22,7 @@ pub struct MMCSTransferData {
     pub decryption_key: String
 }
 
-async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, IDSError> {
+async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, PushError> {
     Ok(client.post(format!("{}/{}", url, method))
         .header("x-apple-mmcs-dataclass", "com.apple.Dataclass.Messenger")
         .header("x-apple-mmcs-auth", auth)
@@ -78,7 +78,7 @@ pub struct PreparedPut {
     pub total_len: usize
 }
 
-pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, IDSError> {
+pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, PushError> {
     let mut total_len = 0;
     let mut total_hasher = Sha1::new();
     total_hasher.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
@@ -107,8 +107,8 @@ pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, IDSE
 struct MMCSPutContainer {
     target: UploadTarget,
     hasher: Hasher,
-    sender: Option<flume::Sender<Result<Vec<u8>, IDSError>>>,
-    finalize: Option<JoinHandle<Result<(), IDSError>>>,
+    sender: Option<flume::Sender<Result<Vec<u8>, PushError>>>,
+    finalize: Option<JoinHandle<Result<(), PushError>>>,
     length: usize,
     transfer_progress: usize,
     finish_binary: Option<Vec<u8>>
@@ -148,7 +148,7 @@ impl MMCSPutContainer {
             let task = tokio::spawn(async move {
                 let response = transfer_mmcs_container(&make_reqwest(), &request, Some(body)).await?;
                 response.bytes().await?;
-                Ok::<(), IDSError>(())
+                Ok::<(), PushError>(())
             });
             self.finalize = Some(task);
 
@@ -159,10 +159,10 @@ impl MMCSPutContainer {
 
 #[async_trait]
 impl Container for MMCSPutContainer {
-    async fn read(&mut self, _len: usize) -> Result<Vec<u8>, IDSError> {
+    async fn read(&mut self, _len: usize) -> Result<Vec<u8>, PushError> {
         panic!("cannot write to put container!")
     }
-    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
         self.ensure_stream().await;
         if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data.to_vec())).await {
             err.into_inner()?;
@@ -177,7 +177,7 @@ impl Container for MMCSPutContainer {
     }
 
     // finalize the http stream
-    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError> {
+    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, PushError> {
         let result = self.hasher.finish()?;
         let footer = mmcsp::PutFooter {
             md5_sum: result.to_vec(),
@@ -231,7 +231,7 @@ struct MMCSUploadResponse {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<(String, String), IDSError> {
+pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<(String, String), PushError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
@@ -314,7 +314,7 @@ fn get_container_url(req: &HttpRequest) -> String {
     format!("{}://{}:{}{}", req.scheme, req.domain, req.port, req.path)
 }
 
-pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: Option<Body>) -> Result<Response, IDSError> {
+pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: Option<Body>) -> Result<Response, PushError> {
     let data_url = get_container_url(req);
     let mut upload_resp = match req.method.as_str() {
         "GET" => client.get(&data_url),
@@ -340,9 +340,9 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
 #[async_trait]
 pub trait Container {
     // read ONE chunk
-    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError>;
-    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError>;
-    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError>;
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError>;
+    async fn write(&mut self, data: &[u8]) -> Result<(), PushError>;
+    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, PushError>;
     // this should represent the byte count that represents transfer *progress*
     // if this is a file container, return 0 as writing to disk does not indicate progress
     fn get_progress_count(&self) -> usize;
@@ -369,7 +369,7 @@ impl ChunkedContainer<'_> {
     }
 
     // (chunk id, data)
-    async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), IDSError> {
+    async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), PushError> {
         let reading_chunk = &self.chunks[self.current_chunk];
         self.current_chunk += 1;
         Ok((reading_chunk.0, self.container.read(reading_chunk.1).await?))
@@ -383,7 +383,7 @@ impl ChunkedContainer<'_> {
         self.chunks.get(self.current_chunk).map(|c| c.0)
     }
 
-    async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) -> Result<(), IDSError> {
+    async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) -> Result<(), PushError> {
         // are we current chunk?
         if chunk.0 == self.wanted_chunk().unwrap() {
             // write right now (stream)
@@ -424,7 +424,7 @@ impl MMCSMatcher<'_, '_> {
         sources.get_mut(wanted_idx)
     }
 
-    async fn transfer_chunks(&mut self, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+    async fn transfer_chunks(&mut self, progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
         let mut total_source_progress = 0;
         while let Some(source) = Self::best_source(&self.targets, &mut self.sources) {
             while !source.complete() {
@@ -528,7 +528,7 @@ impl MMCSGetContainer {
 
 #[async_trait]
 impl Container for MMCSGetContainer {
-    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError> {
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
         self.ensure_stream().await;
 
         let mut recieved = self.cacher.read_exact(len);
@@ -549,11 +549,11 @@ impl Container for MMCSGetContainer {
         self.transfer_progress
     }
 
-    async fn write(&mut self, _data: &[u8]) -> Result<(), IDSError> {
+    async fn write(&mut self, _data: &[u8]) -> Result<(), PushError> {
         panic!("cannot write to get container!")
     }
 
-    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError> {
+    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, PushError> {
         Ok(self.confirm.clone())
     }
 }
@@ -584,7 +584,7 @@ struct MMCSDownloadResponse {
     object: String
 }
 
-pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut dyn Container, progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut dyn Container, progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
     let domain = url.replace(&format!("/{}", object), "");
     let msg_id = rand::thread_rng().gen::<[u8; 4]>();
     let request_download = RequestMMCSDownload {

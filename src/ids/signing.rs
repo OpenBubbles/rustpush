@@ -4,10 +4,8 @@ use openssl::{rsa::Padding, pkey::PKey, hash::MessageDigest, sign::Signer};
 use plist::Dictionary;
 use reqwest::RequestBuilder;
 
-use crate::{apns::APNSState, util::{base64_encode, KeyPair}};
+use crate::{apns::APNSState, util::{base64_encode, KeyPair}, error::PushError};
 use rand::Rng;
-
-use super::IDSError;
 
 pub fn generate_nonce(key: u8) -> Vec<u8> {
     let start: SystemTime = SystemTime::now();
@@ -38,7 +36,7 @@ fn create_payload(bag_key: &str, query_string: &str, push_token: &[u8], payload:
 }
 
 /* returns (signature, nonce) */
-fn sign_payload(private_key: &[u8], bag_key: &str, query_string: &str, push_token: &[u8], payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), IDSError> {
+fn sign_payload(private_key: &[u8], bag_key: &str, query_string: &str, push_token: &[u8], payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), PushError> {
     let key = PKey::private_key_from_der(&private_key)?;
     let mut signer = Signer::new(MessageDigest::sha1(), key.as_ref())?;
     signer.set_rsa_padding(Padding::PKCS1)?;
@@ -50,7 +48,7 @@ fn sign_payload(private_key: &[u8], bag_key: &str, query_string: &str, push_toke
     Ok((signature, nonce))
 }
 
-pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: &KeyPair, push_state: &APNSState, auth_number: Option<u8>) -> Result<RequestBuilder, IDSError> {
+pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: &KeyPair, push_state: &APNSState, auth_number: Option<u8>) -> Result<RequestBuilder, PushError> {
     let push_token = push_state.token.as_ref().unwrap();
     
     let (push_sig, push_nonce) = sign_payload(&push_state.keypair.private, bag_key, "", push_token, body)?;
@@ -66,7 +64,7 @@ pub fn auth_sign_req(req: RequestBuilder, body: &[u8], bag_key: &str, auth_key: 
         .header("x-auth-cert".to_owned() + &postfix, base64_encode(&auth_key.cert)))
 }
 
-pub fn add_id_signature(headers: &mut Dictionary, body: &[u8], bag_key: &str, id_key: &KeyPair, push_token: &[u8]) -> Result<(), IDSError> {
+pub fn add_id_signature(headers: &mut Dictionary, body: &[u8], bag_key: &str, id_key: &KeyPair, push_token: &[u8]) -> Result<(), PushError> {
     let (id_sig, id_nonce) = sign_payload(&id_key.private, bag_key, "", push_token, body)?;
     headers.insert("x-id-sig".to_string(), base64_encode(&id_sig).into());
     headers.insert("x-id-nonce".to_string(), base64_encode(&id_nonce).into());

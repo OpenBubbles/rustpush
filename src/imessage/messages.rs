@@ -11,7 +11,7 @@ use rand::Rng;
 use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
 
-use crate::{apns::APNSConnection, ids::IDSError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
+use crate::{apns::APNSConnection, error::PushError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
 
 
 include!("./rawmessages.rs");
@@ -343,14 +343,14 @@ impl IMessageContainer<'_> {
 
 #[async_trait]
 impl<'a> Container for IMessageContainer<'a> {
-    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, IDSError> {
+    async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, PushError> {
         let extra = self.finish();
         if let Some(writer) = &mut self.writer {
             writer.write(&extra)?;
         }
         Ok(None)
     }
-    async fn read(&mut self, len: usize) -> Result<Vec<u8>, IDSError> {
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
         let mut recieved = self.cacher.read_exact(len);
         while recieved.is_none() {
             let mut data = vec![0; len];
@@ -373,7 +373,7 @@ impl<'a> Container for IMessageContainer<'a> {
         
         Ok(recieved.unwrap_or(vec![]))
     }
-    async fn write(&mut self, data: &[u8]) -> Result<(), IDSError> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
         let block_size = Cipher::aes_256_ctr().block_size();
         let mut plaintext = vec![0; data.len() + block_size];
         let len = self.crypter.update(&data, &mut plaintext).unwrap();
@@ -431,7 +431,7 @@ impl Into<MMCSTransferData> for MMCSFile {
 
 
 impl MMCSFile {
-    pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> Result<AttachmentPreparedPut, IDSError> {
+    pub async fn prepare_put(reader: &mut (dyn Read + Send + Sync)) -> Result<AttachmentPreparedPut, PushError> {
         let key = rand::thread_rng().gen::<[u8; 32]>();
         let mut send_container = IMessageContainer::new(&key, None, Some(reader));
         let prepared = prepare_put(&mut send_container).await?;
@@ -442,7 +442,7 @@ impl MMCSFile {
     }
 
     // create and upload a new attachment to MMCS
-    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, IDSError> {
+    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, PushError> {
 
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
         let result = put_mmcs(&mut send_container, &prepared.mmcs, apns, progress).await?;
@@ -459,7 +459,7 @@ impl MMCSFile {
     }
 
     // request to get and download attachment from MMCS
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
         let mut recieve_container = IMessageContainer::new(&self.key, Some(writer), None);
         get_mmcs(&self.signature, &self.url, &self.object, apns, &mut recieve_container, progress).await?;
 
@@ -486,7 +486,7 @@ pub struct Attachment {
 
 impl Attachment {
 
-    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, IDSError> {
+    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
@@ -505,7 +505,7 @@ impl Attachment {
         }
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), IDSError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 writer.write_all(&data.clone())?;

@@ -9,35 +9,7 @@ use uuid::Uuid;
 use serde::Serialize;
 use regex::Regex;
 
-use crate::util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest};
-
-
-#[derive(Debug)]
-pub enum CertGenError {
-    SSLError(ErrorStack),
-    PlistError(plist::Error),
-    RequestError(reqwest::Error),
-    ResponseError
-}
-
-impl From<ErrorStack> for CertGenError {
-    fn from(value: ErrorStack) -> Self {
-        CertGenError::SSLError(value)
-    }
-}
-
-impl From<plist::Error> for CertGenError {
-    fn from(value: plist::Error) -> Self {
-        CertGenError::PlistError(value)
-    }
-}
-
-impl From<reqwest::Error> for CertGenError {
-    fn from(value: reqwest::Error) -> Self {
-        CertGenError::RequestError(value)
-    }
-}
-
+use crate::{util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest}, PushError};
 
 
 #[derive(Serialize)]
@@ -95,7 +67,7 @@ fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInf
 
 // Generates an APNs push certificate by talking to Albert
 // Returns (private key PEM, certificate PEM) (actual data buffers)
-pub async fn generate_push_cert() -> Result<KeyPair, CertGenError> {
+pub async fn generate_push_cert() -> Result<KeyPair, PushError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let activation_info = build_activation_info(private_key.as_ref())?;
 
@@ -129,7 +101,7 @@ pub async fn generate_push_cert() -> Result<KeyPair, CertGenError> {
 
     // parse protocol from HTML
     let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap()
-            .captures(&text).ok_or(CertGenError::ResponseError)?.get(1).unwrap();
+            .captures(&text).ok_or(PushError::AlbertCertParseError)?.get(1).unwrap();
     
     let protocol = plist::Value::from_reader(Cursor::new(protocol_raw.as_str()))?;
     let certificate = get_nested_value(&protocol, &["device-activation", "activation-record", "DeviceCertificate"]).unwrap().as_data().unwrap();

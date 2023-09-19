@@ -1,7 +1,7 @@
 use std::{io, sync::Arc, time::Duration};
 
 use log::{debug, warn, info};
-use openssl::{sha::{Sha1, sha1}, pkey::PKey, error::ErrorStack, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
+use openssl::{sha::{Sha1, sha1}, pkey::PKey, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use plist::Value;
 use rustls::Certificate;
 use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
@@ -13,7 +13,7 @@ use serde::{Serialize, Deserialize};
 use async_recursion::async_recursion;
 use tokio::time::interval;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG, BagError}, util::KeyPair, ids::signing::generate_nonce};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, util::KeyPair, ids::signing::generate_nonce, PushError};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -26,7 +26,7 @@ impl APNSPayload {
         APNSPayload { id, fields }
     }
 
-    async fn read(read: &mut ReadHalf<TlsStream<TcpStream>>) -> Result<Option<APNSPayload>, APNSError> {
+    async fn read(read: &mut ReadHalf<TlsStream<TcpStream>>) -> Result<Option<APNSPayload>, PushError> {
         let id = read.read_u8().await?;
 
         if id == 0x0 {
@@ -88,26 +88,26 @@ impl APNSSubmitter {
         locked.token = token.to_vec();
     }
 
-    async fn write_data(&self, buf: &[u8]) -> Result<(), APNSError> {
+    async fn write_data(&self, buf: &[u8]) -> Result<(), PushError> {
         let mut locked = self.0.lock().await;
         locked.stream.write(buf).await?;
         Ok(())
     }
 
-    async fn send_payload(&self, id: u8, fields: Vec<(u8, Vec<u8>)>) -> Result<(), APNSError> {
+    async fn send_payload(&self, id: u8, fields: Vec<(u8, Vec<u8>)>) -> Result<(), PushError> {
         //debug!("Sending payload {}: {:?}", id, fields);
         self.write_data(&APNSPayload::new(id, fields).serialize()).await?;
         Ok(())
     }
 
-    pub async fn set_state(&self, state: u8) -> Result<(), APNSError> {
+    pub async fn set_state(&self, state: u8) -> Result<(), PushError> {
         debug!("Sending state packet {}", state);
         let magic_num: u32 = 0x7FFFFFFF;
         self.send_payload(0x14, vec![(1, state.to_be_bytes().to_vec()), (2, magic_num.to_be_bytes().to_vec())]).await?;
         Ok(())
     }
 
-    async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), APNSError> {
+    async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
         let rand = rand::thread_rng().gen::<[u8; 4]>();
         let id = id.unwrap_or(&rand);
         self.send_payload(0x0A, vec![
@@ -119,19 +119,19 @@ impl APNSSubmitter {
         Ok(())
     }
 
-    async fn keep_alive(&self) -> Result<(), APNSError> {
+    async fn keep_alive(&self) -> Result<(), PushError> {
         self.send_payload(0x0C, vec![]).await?;
         debug!("Sending keep alive");
         Ok(())
     }
 
-    async fn send_ack(&self, id: &[u8]) -> Result<(), APNSError> {
+    async fn send_ack(&self, id: &[u8]) -> Result<(), PushError> {
         debug!("Sending ack for {:?}", id);
         self.send_payload(0x0B, vec![(1, self.token().await), (4, id.to_vec()), (8, vec![0x0])]).await?;
         Ok(())
     }
     
-    pub async fn filter(&self, topics: &[&str]) -> Result<(), APNSError> {
+    pub async fn filter(&self, topics: &[&str]) -> Result<(), PushError> {
         debug!("Sending filter for {:?}", topics);
         let mut fields = vec![(1, self.token().await)];
         for topic in topics {
@@ -293,39 +293,10 @@ pub struct APNSState {
     pub token: Option<Vec<u8>>
 }
 
-#[derive(Debug)]
-pub enum APNSError {
-    RustlsError(rustls::Error),
-    BagError(BagError),
-    IoError(io::Error),
-    SignError(ErrorStack),
-    ConnectError
-}
-impl From<ErrorStack> for APNSError {
-    fn from(value: ErrorStack) -> Self {
-        APNSError::SignError(value)
-    }
-}
-impl From<rustls::Error> for APNSError {
-    fn from(value: rustls::Error) -> Self {
-        APNSError::RustlsError(value)
-    }
-}
-impl From<BagError> for APNSError {
-    fn from(value: BagError) -> Self {
-        APNSError::BagError(value)
-    }
-}
-impl From<io::Error> for APNSError {
-    fn from(value: io::Error) -> Self {
-        APNSError::IoError(value)
-    }
-}
-
 const APNS_PORT: u16 = 5223;
 
 impl APNSConnection {
-    async fn connect() -> Result<TlsStream<TcpStream>, APNSError> {
+    async fn connect() -> Result<TlsStream<TcpStream>, PushError> {
         let x509 = X509::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert"))?;
         let certificate = Certificate(x509.to_der()?);
 
@@ -357,7 +328,7 @@ impl APNSConnection {
         Ok(connection)
     }
 
-    pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), APNSError> {
+    pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
         self.submitter.send_message(topic, payload, id).await?;
         let msg = self.reader.wait_find(0x0B).await;
         if msg.get_field(8).unwrap()[0] != 0x0 {
@@ -366,7 +337,7 @@ impl APNSConnection {
         Ok(())
     }
 
-    async fn init_conn(submitter: &APNSSubmitter, reader: &APNSReader, state: &mut APNSState) -> Result<(), APNSError> {
+    async fn init_conn(submitter: &APNSSubmitter, reader: &APNSReader, state: &mut APNSState) -> Result<(), PushError> {
         // connect
         let flags: u32 = 0b01000001;
 
@@ -399,7 +370,7 @@ impl APNSConnection {
 
         let response = reader.wait_find(8).await;
         if u8::from_be_bytes(response.get_field(1).unwrap().clone().try_into().unwrap()) != 0x00 {
-            return Err(APNSError::ConnectError)
+            return Err(PushError::APNSConnectError)
         }
         
         let new_token = response.get_field(3);
@@ -430,11 +401,11 @@ impl APNSConnection {
         Ok(())
     }
 
-    pub async fn new(state: Option<APNSState>) -> Result<APNSConnection, APNSError> {
+    pub async fn new(state: Option<APNSState>) -> Result<APNSConnection, PushError> {
         let mut state = match state {
             Some(state) => state,
             None => {
-                let keypair = generate_push_cert().await.unwrap();
+                let keypair = generate_push_cert().await?;
                 APNSState {
                     keypair,
                     token: None

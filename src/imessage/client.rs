@@ -8,7 +8,7 @@ use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, IDSError, identity::IDSPublicIdentity}, util::plist_to_bin, imessage::messages::{BundledPayload, SendMsg}};
+use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, identity::IDSPublicIdentity}, util::plist_to_bin, imessage::messages::{BundledPayload, SendMsg}, error::PushError};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -108,7 +108,7 @@ impl IMClient {
         valid
     }
 
-    pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, IDSError> {
+    pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, PushError> {
         let (body, _sig) = Self::parse_payload(payload);
         
         let key = user.identity.as_ref().unwrap().priv_enc_key();
@@ -202,7 +202,8 @@ impl IMClient {
         let payload: Vec<u8> = loaded.payload.clone().into();
         let token: Vec<u8> = loaded.token.clone().into();
         if !self.verify_payload(&payload, &loaded.sender, &token, &loaded.target, 0).await {
-            panic!("Payload verification failed!");
+            warn!("Payload verification failed!");
+            return None
         }
 
         let decrypted = self.decrypt(identity, &payload).await.unwrap();
@@ -212,7 +213,7 @@ impl IMClient {
         })
     }
 
-    pub async fn cache_keys(&self, participants: &[String], sender: &str, refresh: bool) -> Result<(), IDSError> {
+    pub async fn cache_keys(&self, participants: &[String], sender: &str, refresh: bool) -> Result<(), PushError> {
         // find participants whose keys need to be fetched
         let mut key_cache_orig = self.key_cache.lock().await;
         let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, sender);
@@ -238,7 +239,7 @@ impl IMClient {
         Ok(())
     }
 
-    pub async fn validate_targets(&self, targets: &[String], sender: &str) -> Result<Vec<String>, IDSError> {
+    pub async fn validate_targets(&self, targets: &[String], sender: &str) -> Result<Vec<String>, PushError> {
         self.cache_keys(targets, sender, false).await?;
         let key_cache = self.key_cache.lock().await;
         Ok(targets.iter().filter(|target| key_cache.get(*target).unwrap().len() > 0).map(|i| i.clone()).collect())
@@ -255,7 +256,7 @@ impl IMClient {
         }
     }
 
-    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, IDSError> {
+    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, PushError> {
         let rand = rand::thread_rng().gen::<[u8; 11]>();
         let user = self.user_by_handle(sender).await;
 
@@ -307,7 +308,7 @@ impl IMClient {
         Ok(payload)
     }
 
-    pub async fn send(&self, message: &mut IMessage) -> Result<(), IDSError> {
+    pub async fn send(&self, message: &mut IMessage) -> Result<(), PushError> {
         message.sanity_check_send();
         let sender = message.sender.as_ref().unwrap().to_string();
         self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), &sender, false).await?;
@@ -318,7 +319,7 @@ impl IMClient {
         let mut key_cache_orig = self.key_cache.lock().await;
         let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, &sender);
         for participant in &message.conversation.as_ref().unwrap().participants {
-            for token in key_cache.get(participant).ok_or(IDSError::KeyNotFound(participant.clone()))? {
+            for token in key_cache.get(participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
                     // don't send to ourself
                     continue;
@@ -364,7 +365,7 @@ impl IMClient {
                 };
         
                 let binary = plist_to_bin(&complete)?;
-                Ok::<(), IDSError>(self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?)
+                Ok::<(), PushError>(self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?)
             }
         };
 

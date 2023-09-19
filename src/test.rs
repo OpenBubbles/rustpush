@@ -3,7 +3,7 @@ use std::{sync::Arc, io::Seek};
 
 use log::{info, error};
 use openssl::ex_data::Index;
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, IDSError, register, IMClient, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart, IconChangeMessage};
+use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, PushError, register, IMClient, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart, IconChangeMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -61,7 +61,7 @@ async fn main() {
                 Ok(user) => {
                     break vec![user]
                 }
-                Err(IDSError::TwoFaError) => {
+                Err(PushError::TwoFaError) => {
                     print!("2fa code: ");
                     std::io::stdout().flush().unwrap();
                     let stdin = io::stdin();

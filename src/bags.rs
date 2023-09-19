@@ -4,26 +4,7 @@ use tokio::sync::Mutex;
 use lazy_static::lazy_static;
 use plist::{Dictionary, Data};
 
-use crate::util::make_reqwest;
-
-#[derive(Debug)]
-pub enum BagError {
-    RequestError(reqwest::Error),
-    StatusError(reqwest::StatusCode /* code */),
-    ParseError(plist::Error)
-}
-
-impl From<plist::Error> for BagError {
-    fn from(value: plist::Error) -> Self {
-        BagError::ParseError(value)
-    }
-}
-
-impl From<reqwest::Error> for BagError {
-    fn from(value: reqwest::Error) -> Self {
-        BagError::RequestError(value)
-    }
-}
+use crate::{util::make_reqwest, PushError};
 
 #[derive(Deserialize)]
 struct BagResult {
@@ -36,7 +17,7 @@ pub const IDS_BAG: &str = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/g
 lazy_static!{
     static ref BAG_CACHE: Mutex<HashMap<String, Dictionary>> = Mutex::new(HashMap::new());
 }
-pub async fn get_bag(bag_url: &str) -> Result<Dictionary, BagError> {
+pub async fn get_bag(bag_url: &str) -> Result<Dictionary, PushError> {
     let mut cache = BAG_CACHE.lock().await;
     
     if let Some(bag) = cache.get(bag_url) {
@@ -46,7 +27,7 @@ pub async fn get_bag(bag_url: &str) -> Result<Dictionary, BagError> {
     let client = make_reqwest();
     let content = client.get(bag_url).send().await?;
     if !content.status().is_success() {
-        return Err(BagError::StatusError(content.status()))
+        return Err(PushError::StatusError(content.status()))
     }
 
     let data = content.bytes().await?;
