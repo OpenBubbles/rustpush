@@ -153,7 +153,7 @@ async fn main() {
         participants: vec!["mailto:sandboxalt@gmail.com".to_string()],
         cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, &handle, Message::Typing).await;
+    }, &handle, Message::Message(NormalMessage::new("hello world!".to_string()))).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");

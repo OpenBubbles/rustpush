@@ -210,6 +210,18 @@ pub struct NormalMessage {
     pub reply_part: Option<String>
 }
 
+impl NormalMessage {
+    pub fn new(text: String) -> NormalMessage {
+        NormalMessage {
+            parts: MessageParts(vec![IndexedMessagePart(MessagePart::Text(text), None)]),
+            body: None,
+            effect: None,
+            reply_guid: None,
+            reply_part: None
+        }
+    }
+}
+
 #[repr(C)]
 pub struct RenameMessage {
     pub new_name: String

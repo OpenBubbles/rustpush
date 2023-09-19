@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH, Duration}};
 
 use log::{debug, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
@@ -25,17 +25,68 @@ pub enum RecievedMessage {
     }
 }
 
+const KEY_REFRESH_MS: u128 = 1000 * 60 * 60 * 2; // two hours
+
+struct CachedKeys {
+    keys: Vec<IDSIdentityResult>,
+    at_ms: u128
+}
+
+struct KeyCache {
+    cache: HashMap<String, HashMap<String, CachedKeys>>
+}
+
+impl KeyCache {
+    fn new() -> KeyCache {
+        KeyCache {
+            cache: HashMap::new()
+        }
+    }
+    
+    fn get_keys(&self, handle: &str, keys_for: &str) -> Option<&Vec<IDSIdentityResult>> {
+        let Some(handle_cache) = self.cache.get(handle) else {
+            return None
+        };
+        let Some(cached) = handle_cache.get(keys_for) else {
+            return None
+        };
+        let ms_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards").as_millis();
+        if ms_now > cached.at_ms + KEY_REFRESH_MS {
+            // expired
+            None
+        } else {
+            Some(&cached.keys)
+        }
+    }
+
+    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSIdentityResult>) {
+        if !self.cache.contains_key(handle) {
+            self.cache.insert(handle.to_string(), HashMap::new());
+        }
+        let handle_cache = self.cache.get_mut(handle).unwrap();
+        let ms_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards").as_millis();
+        handle_cache.insert(keys_for.to_string(), CachedKeys {
+            keys,
+            at_ms: ms_now
+        });
+    }
+}
+
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub users: Arc<Vec<IDSUser>>,
-    key_cache: Mutex<HashMap<String, HashMap<String, Vec<IDSIdentityResult>>>>,
+    key_cache: Mutex<KeyCache>,
     raw_inbound: Mutex<Receiver<APNSPayload>>
 }
 
 impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
         IMClient {
-            key_cache: Mutex::new(HashMap::new()),
+            key_cache: Mutex::new(KeyCache::new()),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
                     return false
@@ -68,21 +119,20 @@ impl IMClient {
         self.users.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
     }
 
-    fn get_cache_for_handle<'a>(cache: &'a mut HashMap<String, HashMap<String, Vec<IDSIdentityResult>>>, handle: &str) -> &'a mut HashMap<String, Vec<IDSIdentityResult>> {
-        if !cache.contains_key(handle) {
-            cache.insert(handle.to_string(), HashMap::new());
-        }
-        cache.get_mut(handle).unwrap()
-    }
-
     #[async_recursion]
     async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], handle: &str, retry: u8) -> bool {
+        // first retry we force ids to refresh, second retry we back of longer and longer times,
+        // bidding for IDS to let us query
+        if retry > 0 {
+            tokio::time::sleep(Duration::from_millis((retry as u64 - 1) * 60000)).await;
+        }
+
         self.cache_keys(&[sender.to_string()], handle, retry > 0).await.unwrap();
 
-        let mut cache = self.key_cache.lock().await;
-        let cache = Self::get_cache_for_handle(&mut cache, handle);
+        let cache = self.key_cache.lock().await;
 
-        let Some(keys) = cache.get(sender) else {
+        let Some(keys) = cache.get_keys(handle, sender) else {
+            drop(cache); // we're holding the damn mutex :(
             warn!("Cannot verify; no public key");
             if retry < 3 {
                 return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
@@ -93,6 +143,7 @@ impl IMClient {
         };
 
         let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
+            drop(cache); // we're holding the damn mutex :(
             warn!("Cannot verify; no public key");
             if retry < 3 {
                 return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
@@ -213,36 +264,34 @@ impl IMClient {
         })
     }
 
-    pub async fn cache_keys(&self, participants: &[String], sender: &str, refresh: bool) -> Result<(), PushError> {
+    pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool) -> Result<(), PushError> {
         // find participants whose keys need to be fetched
-        let mut key_cache_orig = self.key_cache.lock().await;
-        let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, sender);
+        let key_cache = self.key_cache.lock().await;
         let fetch: Vec<String> = if refresh {
             participants.to_vec()
         } else {
-            participants.iter().filter(|p| !key_cache.contains_key(*p))
+            participants.iter().filter(|p| key_cache.get_keys(handle, *p).is_none())
                 .map(|p| p.to_string()).collect()
         };
         if fetch.len() == 0 {
             return Ok(())
         }
-        drop(key_cache_orig);
-        let results = self.user_by_handle(sender).await.lookup(self.conn.clone(), fetch).await?;
+        drop(key_cache);
+        let results = self.user_by_handle(handle).await.lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
-        let key_cache = Self::get_cache_for_handle(&mut key_cache, sender);
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
         }
         for (id, results) in results {
-            key_cache.insert(id, results);
+            key_cache.put_keys(handle, &id, results);
         }
         Ok(())
     }
 
-    pub async fn validate_targets(&self, targets: &[String], sender: &str) -> Result<Vec<String>, PushError> {
-        self.cache_keys(targets, sender, false).await?;
+    pub async fn validate_targets(&self, targets: &[String], handle: &str) -> Result<Vec<String>, PushError> {
+        self.cache_keys(targets, handle, false).await?;
         let key_cache = self.key_cache.lock().await;
-        Ok(targets.iter().filter(|target| key_cache.get(*target).unwrap().len() > 0).map(|i| i.clone()).collect())
+        Ok(targets.iter().filter(|target| key_cache.get_keys(handle, *target).unwrap().len() > 0).map(|i| i.clone()).collect())
     }
 
     pub async fn new_msg(&self, conversation: ConversationData, sender: &str, message: Message) -> IMessage {
@@ -316,10 +365,9 @@ impl IMClient {
 
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
-        let mut key_cache_orig = self.key_cache.lock().await;
-        let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, &sender);
+        let key_cache = self.key_cache.lock().await;
         for participant in &message.conversation.as_ref().unwrap().participants {
-            for token in key_cache.get(participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
+            for token in key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
                     // don't send to ourself
                     continue;
@@ -340,7 +388,7 @@ impl IMClient {
                 }));
             }
         }
-        drop(key_cache_orig);
+        drop(key_cache);
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
         debug!("sending {:?}", message.message.to_string());
 
