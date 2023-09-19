@@ -22,7 +22,8 @@ pub enum IDSError {
     LookupFailed(u64),
     KeyError(KeyError),
     APNsError(APNSError),
-    TwoFaError
+    TwoFaError,
+    KeyNotFound(String)
 }
 
 impl Display for IDSError {

@@ -214,7 +214,8 @@ impl IMClient {
 
     pub async fn cache_keys(&self, participants: &[String], sender: &str, refresh: bool) -> Result<(), IDSError> {
         // find participants whose keys need to be fetched
-        let key_cache = self.key_cache.lock().await;
+        let mut key_cache_orig = self.key_cache.lock().await;
+        let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, sender);
         let fetch: Vec<String> = if refresh {
             participants.to_vec()
         } else {
@@ -224,10 +225,13 @@ impl IMClient {
         if fetch.len() == 0 {
             return Ok(())
         }
-        drop(key_cache);
+        drop(key_cache_orig);
         let results = self.user_by_handle(sender).await.lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
         let key_cache = Self::get_cache_for_handle(&mut key_cache, sender);
+        if results.len() == 0 {
+            warn!("warn IDS returned zero keys for query {:?}", participants);
+        }
         for (id, results) in results {
             key_cache.insert(id, results);
         }
@@ -314,7 +318,7 @@ impl IMClient {
         let mut key_cache_orig = self.key_cache.lock().await;
         let key_cache = Self::get_cache_for_handle(&mut key_cache_orig, &sender);
         for participant in &message.conversation.as_ref().unwrap().participants {
-            for token in key_cache.get(participant).unwrap() {
+            for token in key_cache.get(participant).ok_or(IDSError::KeyNotFound(participant.clone()))? {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
                     // don't send to ourself
                     continue;

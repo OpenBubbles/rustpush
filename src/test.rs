@@ -97,6 +97,7 @@ async fn main() {
     
     let users = Arc::new(users);
     let mut client = IMClient::new(connection.clone(), users.clone()).await;
+    let handle = client.get_handles()[0].clone();
 
     //client.validate_targets(&["mailto:testu3@icloud.com".to_string()]).await.unwrap();
 
@@ -147,15 +148,15 @@ async fn main() {
     let attachment = MMCSFile::new(&connection, &prepared, &mut data, &mut |curr, total| {
         println!("uploaded attachment bytes {} of {}", curr, total);
     }).await.unwrap();
-    println!("uploaded attachment");
+    println!("uploaded attachment");*/
     let mut msg = client.new_msg(ConversationData {
-        participants: vec!["tel:+17203818329".to_string(), "mailto:jjtech@jjtech.dev".to_string(), "mailto:textgpt@icloud.com".to_string()],
-        cv_name: Some("Test".to_string()),
+        participants: vec!["mailto:sandboxalt@gmail.com".to_string()],
+        cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, Message::IconChange(IconChangeMessage { file: attachment })).await;
+    }, &handle, Message::Typing).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
-    println!("sendingdone");*/
+    println!("sendingdone");
 
     //sleep(Duration::from_millis(10000)).await;
     
@@ -168,17 +169,17 @@ async fn main() {
                         println!("{}", msg);
                         match msg.message {
                             Message::Message(inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), msg.sender.as_ref().unwrap(), Message::Delivered).await;
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                 msg2.id = msg.id;
                                 client.send(&mut msg2).await.unwrap();
                             },
                             Message::React(inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), msg.sender.as_ref().unwrap(), Message::Delivered).await;
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                 msg2.id = msg.id;
                                 client.send(&mut msg2).await.unwrap();
                             },
                             Message::Typing => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), msg.sender.as_ref().unwrap(), Message::Delivered).await;
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                 msg2.id = msg.id;
                                 client.send(&mut msg2).await.unwrap();
                             },
