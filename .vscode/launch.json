@@ -5,12 +5,22 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "(Linux) Launch",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceRoot}/target/debug/rustpush-test",
+            "name": "Debug executable 'rustpush-test'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=rustpush-test",
+                    "--package=rustpush"
+                ],
+                "filter": {
+                    "name": "rustpush-test",
+                    "kind": "bin"
+                }
+            },
             "args": [],
-            "cwd": "${workspaceRoot}",
+            "cwd": "${workspaceFolder}",
             "env": {
                 "RUST_LOG": "debug"
             }
