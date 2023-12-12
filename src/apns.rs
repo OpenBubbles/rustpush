@@ -401,11 +401,12 @@ impl APNSConnection {
         Ok(())
     }
 
-    pub async fn new(state: Option<APNSState>) -> Result<APNSConnection, PushError> {
+    pub async fn new(
+        serial_number: &str,state: Option<APNSState>) -> Result<APNSConnection, PushError> {
         let mut state = match state {
             Some(state) => state,
             None => {
-                let keypair = generate_push_cert().await?;
+                let keypair = generate_push_cert(serial_number).await?;
                 APNSState {
                     keypair,
                     token: None
