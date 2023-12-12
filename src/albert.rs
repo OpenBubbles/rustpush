@@ -33,6 +33,7 @@ struct ActivationInfo {
     product_type: String,
     product_version: String,
     serial_number: String,
+    #[serde(rename = "UniqueDeviceID")]
     unique_device_id: String,
 }
 
@@ -64,6 +65,8 @@ fn build_activation_info(
     csr_builder.sign(private_key, MessageDigest::sha256())?;
     let csr = csr_builder.build();
     let pem = csr.to_pem()?;
+
+    println!("Serial number: {}", serial_number);
 
     Ok(ActivationInfo {
         activation_randomness: Uuid::new_v4().to_string(),
