@@ -66,8 +66,6 @@ fn build_activation_info(
     let csr = csr_builder.build();
     let pem = csr.to_pem()?;
 
-    println!("Serial number: {}", serial_number);
-
     Ok(ActivationInfo {
         activation_randomness: Uuid::new_v4().to_string(),
         activation_state: "Unactivated".to_string(),
@@ -114,30 +112,14 @@ pub async fn generate_push_cert(serial_number: &str) -> Result<KeyPair, PushErro
         fair_play_signature: signature.into(),
     };
 
-    println!(
-        "Generated activation request: {:?}",
-        plist_to_string(&request)?
-    );
-
     // activate with apple
     let client = make_reqwest();
     let form = [("activation-info", plist_to_string(&request)?)];
     let req = client
         .post("https://albert.apple.com/deviceservices/deviceActivation?device=MacOS")
         .form(&form);
-    // let debug_req = req.build().unwrap();
-    // println!("Albert request headers: {:?}", debug_req.headers());
-    // println!(
-    //     "Albert request body: {:?}",
-    //     String::from_utf8_lossy(debug_req.body().unwrap().as_bytes().unwrap())
-    // );
-    // println!("Albert request url: {:?}", debug_req.url());
-    // println!("Albert request method: {:?}", debug_req.method());
     let resp = req.send().await?;
-    println!("Albert response status: {:?}", resp.status());
     let text = resp.text().await?;
-
-    println!("Albert response: {:?}", text);
 
     // parse protocol from HTML
     let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>")
