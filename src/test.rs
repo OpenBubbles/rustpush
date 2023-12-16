@@ -35,11 +35,37 @@ async fn main() {
 			}
 		}
 	};
+    
+    // Read serial number from command line arg, otherwise prompt for it
+    let mut serial_number: Option<String> = None;
+    for arg in std::env::args() {
+        if arg.starts_with("--serial=") {
+            serial_number = Some(arg.split("=").collect::<Vec<&str>>()[1].to_string());
+        }
+    }
+    let serial_number = match serial_number {
+        Some(v) => v,
+        None => {
+            let stdin = io::stdin();
+            print!("Serial Number: ");
+            std::io::stdout().flush().unwrap();
+            let mut reader = BufReader::new(stdin);
+            let mut serial_number = String::new();
+            reader.read_line(&mut serial_number).await.unwrap();
+            serial_number.trim().to_string()
+        }
+    };
 	
     let saved_state: Option<SavedState> = serde_json::from_str(&data).ok();
 
-    let connection = Arc::new(APNSConnection::new(saved_state.as_ref().map(|state| state.push.clone())).await.unwrap());
-
+    let connection = Arc::new(
+        APNSConnection::new(
+            serial_number.as_str(),
+            saved_state.as_ref().map(|state| state.push.clone()),
+        )
+        .await
+        .unwrap(),
+    );
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {

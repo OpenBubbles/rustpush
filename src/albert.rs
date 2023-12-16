@@ -23,6 +23,7 @@ struct ActivationInfo {
     product_type: String,
     product_version: String,
     serial_number: String,
+    #[serde(rename = "UniqueDeviceID")]
     unique_device_id: String
 }
 
@@ -36,7 +37,10 @@ struct ActivationRequest {
     fair_play_signature: Data
 }
 
-fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInfo, ErrorStack> {
+fn build_activation_info(
+    private_key: &PKeyRef<Private>,
+    serial_number: &str,
+) -> Result<ActivationInfo, ErrorStack> {
     let mut csr_builder = X509ReqBuilder::new()?;
     let mut name = X509NameBuilder::new()?;
     name.append_entry_by_nid(Nid::COUNTRYNAME, "US")?;
@@ -55,29 +59,37 @@ fn build_activation_info(private_key: &PKeyRef<Private>) -> Result<ActivationInf
     Ok(ActivationInfo {
         activation_randomness: Uuid::new_v4().to_string(),
         activation_state: "Unactivated".to_string(),
-        build_version: "10.6.4".to_string(),
+        build_version: "22F82".to_string(),
         device_cert_request: pem.into(),
-        device_class: "Windows".to_string(),
-        product_type: "windows1,1".to_string(),
-        product_version: "10.6.4".to_string(),
-        serial_number: "WindowSerial".to_string(),
-        unique_device_id: Uuid::new_v4().to_string()
+        device_class: "MacOS".to_string(),
+        product_type: "MacBookPro18,3".to_string(),
+        product_version: "13.4.1".to_string(),
+        serial_number: serial_number.to_string(),
+        unique_device_id: Uuid::new_v4().to_string(),
     })
 }
 
 // Generates an APNs push certificate by talking to Albert
 // Returns (private key PEM, certificate PEM) (actual data buffers)
-pub async fn generate_push_cert() -> Result<KeyPair, PushError> {
-    let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
-    let activation_info = build_activation_info(private_key.as_ref())?;
+pub async fn generate_push_cert(serial_number: &str) -> Result<KeyPair, PushError> {
+    let private_key = PKey::from_rsa(Rsa::generate_with_e(
+        1024,
+        BigNum::from_u32(65537)?.as_ref(),
+    )?)?;
+    let activation_info = build_activation_info(private_key.as_ref(), serial_number)?;
 
-    info!("Generated activation info (with UUID: {})", &activation_info.unique_device_id);
-    
+    println!(
+        "Generated activation info (with UUID: {})",
+        &activation_info.unique_device_id
+    );
+
     let activation_info_plist = plist_to_buf(&activation_info)?;
 
     // load fairplay key
-    let fairplay_key = PKey::from_rsa(Rsa::private_key_from_pem(include_bytes!("../certs/fairplay.pem"))?)?;
-    
+    let fairplay_key = PKey::from_rsa(Rsa::private_key_from_pem(include_bytes!(
+        "../certs/fairplay.pem"
+    ))?)?;
+
     // sign activation info
     let mut signer = Signer::new(MessageDigest::sha1(), fairplay_key.as_ref())?;
     signer.set_rsa_padding(Padding::PKCS1)?;
@@ -87,16 +99,16 @@ pub async fn generate_push_cert() -> Result<KeyPair, PushError> {
         activation_info_complete: true,
         activation_info_xml: activation_info_plist.into(),
         fair_play_cert_chain: include_bytes!("../certs/fairplay.cert").to_vec().into(),
-        fair_play_signature: signature.into()
+        fair_play_signature: signature.into(),
     };
 
     // activate with apple
     let client = make_reqwest();
     let form = [("activation-info", plist_to_string(&request)?)];
-    let resp = client.post("https://albert.apple.com/WebObjects/ALUnbrick.woa/wa/deviceActivation?device=Windows")
-            .form(&form)
-            .send()
-            .await?;
+    let req = client
+        .post("https://albert.apple.com/deviceservices/deviceActivation?device=MacOS")
+        .form(&form);
+    let resp = req.send().await?;
     let text = resp.text().await?;
 
     // parse protocol from HTML
