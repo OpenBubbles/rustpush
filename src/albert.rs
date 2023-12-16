@@ -1,26 +1,16 @@
+
 use std::io::Cursor;
 
 use log::info;
-use openssl::{
-    bn::BigNum,
-    error::ErrorStack,
-    hash::MessageDigest,
-    nid::Nid,
-    pkey::{PKey, PKeyRef, Private},
-    rsa::{Padding, Rsa},
-    sign::Signer,
-    x509::{X509NameBuilder, X509ReqBuilder},
-};
+use openssl::{rsa::{Rsa, Padding}, x509::{X509ReqBuilder, X509NameBuilder}, error::ErrorStack, nid::Nid, bn::BigNum, hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, sign::Signer};
 use plist::Data;
 use uuid::Uuid;
 
-use regex::Regex;
 use serde::Serialize;
+use regex::Regex;
 
-use crate::{
-    util::{get_nested_value, make_reqwest, plist_to_buf, plist_to_string, KeyPair},
-    PushError,
-};
+use crate::{util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest}, PushError};
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -34,7 +24,7 @@ struct ActivationInfo {
     product_version: String,
     serial_number: String,
     #[serde(rename = "UniqueDeviceID")]
-    unique_device_id: String,
+    unique_device_id: String
 }
 
 #[derive(Serialize)]
@@ -44,7 +34,7 @@ struct ActivationRequest {
     #[serde(rename = "ActivationInfoXML")]
     activation_info_xml: Data,
     fair_play_cert_chain: Data,
-    fair_play_signature: Data,
+    fair_play_signature: Data
 }
 
 fn build_activation_info(
@@ -122,32 +112,14 @@ pub async fn generate_push_cert(serial_number: &str) -> Result<KeyPair, PushErro
     let text = resp.text().await?;
 
     // parse protocol from HTML
-    let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>")
-        .unwrap()
-        .captures(&text)
-        .ok_or(PushError::AlbertCertParseError)?
-        .get(1)
-        .unwrap();
-
+    let protocol_raw = Regex::new(r"<Protocol>(.*)</Protocol>").unwrap()
+            .captures(&text).ok_or(PushError::AlbertCertParseError)?.get(1).unwrap();
+    
     let protocol = plist::Value::from_reader(Cursor::new(protocol_raw.as_str()))?;
-    let certificate = get_nested_value(
-        &protocol,
-        &[
-            "device-activation",
-            "activation-record",
-            "DeviceCertificate",
-        ],
-    )
-    .unwrap()
-    .as_data()
-    .unwrap();
+    let certificate = get_nested_value(&protocol, &["device-activation", "activation-record", "DeviceCertificate"]).unwrap().as_data().unwrap();
 
     Ok(KeyPair {
         private: private_key.rsa().unwrap().private_key_to_der()?,
-        cert: rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec()))
-            .unwrap()
-            .into_iter()
-            .nth(0)
-            .unwrap(),
+        cert: rustls_pemfile::certs(&mut Cursor::new(certificate.to_vec())).unwrap().into_iter().nth(0).unwrap()
     })
 }
