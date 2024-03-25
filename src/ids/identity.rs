@@ -1,6 +1,6 @@
 use std::{io::Cursor, sync::Arc};
 
-use openssl::{pkey::{PKey, Private, Public, HasPublic}, rsa::Rsa, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, nid::Nid, sha::sha256, sign::{Signer, Verifier}, hash::MessageDigest};
+use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
 
 use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSConnection, error::PushError};
@@ -107,6 +107,14 @@ impl IDSIdentity {
             encryption_key: encryption_key.private_key_to_der()?,
             id_keypair: None
         })
+    }
+
+    // returns seconds since epoch
+    pub fn get_exp(&self) -> Result<i64, PushError> {
+        let x509 = X509::from_der(&self.id_keypair.as_ref().unwrap().cert)?;
+        let expiration = x509.not_after();
+        let unix = Asn1Time::from_unix(0)?.as_ref().diff(expiration)?;
+        Ok((unix.days as i64) * 86400 + (unix.secs as i64))
     }
 
     pub fn priv_enc_key(&self) -> PKey<Private> {
