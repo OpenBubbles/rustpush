@@ -454,7 +454,7 @@ impl MMCSFile {
     }
 
     // create and upload a new attachment to MMCS
-    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<MMCSFile, PushError> {
+    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<MMCSFile, PushError> {
 
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
         let result = put_mmcs(&mut send_container, &prepared.mmcs, apns, progress).await?;
@@ -471,7 +471,7 @@ impl MMCSFile {
     }
 
     // request to get and download attachment from MMCS
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
         let mut recieve_container = IMessageContainer::new(&self.key, Some(writer), None);
         get_mmcs(&self.signature, &self.url, &self.object, apns, &mut recieve_container, progress).await?;
 
@@ -498,7 +498,7 @@ pub struct Attachment {
 
 impl Attachment {
 
-    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut dyn FnMut(usize, usize)) -> Result<Attachment, PushError> {
+    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
@@ -517,7 +517,7 @@ impl Attachment {
         }
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 writer.write_all(&data.clone())?;
@@ -628,7 +628,7 @@ fn remove_prefix(participants: &[String]) -> Vec<String> {
 }
 
 fn add_prefix(participants: &[String]) -> Vec<String> {
-    participants.clone().iter().map(|p| if p.contains("@") {
+    participants.iter().map(|p| if p.contains("@") {
         format!("mailto:{}", p)
     } else {
         format!("tel:{}", p)

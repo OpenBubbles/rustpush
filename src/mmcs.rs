@@ -78,7 +78,7 @@ pub struct PreparedPut {
     pub total_len: usize
 }
 
-pub async fn prepare_put(reader: &mut dyn Container) -> Result<PreparedPut, PushError> {
+pub async fn prepare_put(reader: &mut (dyn Container + Send + Sync)) -> Result<PreparedPut, PushError> {
     let mut total_len = 0;
     let mut total_hasher = Sha1::new();
     total_hasher.update(b"com.apple.XattrObjectSalt\0com.apple.DataObjectSalt\0");
@@ -231,7 +231,7 @@ struct MMCSUploadResponse {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut dyn Container, prepared: &PreparedPut, apns: &APNSConnection, progress: &mut dyn FnMut(usize, usize)) -> Result<(String, String), PushError> {
+pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APNSConnection, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
@@ -355,11 +355,11 @@ struct ChunkedContainer<'a> {
     current_chunk: usize,
     // only used when writing
     cached_chunks: HashMap<[u8; 21], Vec<u8>>,
-    container: &'a mut dyn Container,
+    container: &'a mut (dyn Container + Send + Sync),
 }
 
 impl ChunkedContainer<'_> {
-    fn new<'a>(chunks: Vec<([u8; 21], usize)>, container: &'a mut dyn Container) -> ChunkedContainer<'a> {
+    fn new<'a>(chunks: Vec<([u8; 21], usize)>, container: &'a mut (dyn Container + Send + Sync)) -> ChunkedContainer<'a> {
         ChunkedContainer {
             chunks,
             current_chunk: 0,
@@ -424,7 +424,7 @@ impl MMCSMatcher<'_, '_> {
         sources.get_mut(wanted_idx)
     }
 
-    async fn transfer_chunks(&mut self, progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+    async fn transfer_chunks(&mut self, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
         let mut total_source_progress = 0;
         while let Some(source) = Self::best_source(&self.targets, &mut self.sources) {
             while !source.complete() {
@@ -584,7 +584,7 @@ struct MMCSDownloadResponse {
     object: String
 }
 
-pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut dyn Container, progress: &mut dyn FnMut(usize, usize)) -> Result<(), PushError> {
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
     let domain = url.replace(&format!("/{}", object), "");
     let msg_id = rand::thread_rng().gen::<[u8; 4]>();
     let request_download = RequestMMCSDownload {

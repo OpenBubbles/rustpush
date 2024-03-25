@@ -193,7 +193,7 @@ impl IMClient {
         self.recieve_payload(payload).await
     }
 
-    async fn user_by_handle(&self, handle: &str) -> &IDSUser {
+    fn user_by_handle(&self, handle: &str) -> &IDSUser {
         self.users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
@@ -277,7 +277,7 @@ impl IMClient {
             return Ok(())
         }
         drop(key_cache);
-        let results = self.user_by_handle(handle).await.lookup(self.conn.clone(), fetch).await?;
+        let results = self.user_by_handle(handle).lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
@@ -307,7 +307,7 @@ impl IMClient {
 
     async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, PushError> {
         let rand = rand::thread_rng().gen::<[u8; 11]>();
-        let user = self.user_by_handle(sender).await;
+        let user = self.user_by_handle(sender);
 
         let hmac = PKey::hmac(&rand)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;

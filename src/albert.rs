@@ -1,7 +1,6 @@
 
 use std::io::Cursor;
 
-use log::info;
 use openssl::{rsa::{Rsa, Padding}, x509::{X509ReqBuilder, X509NameBuilder}, error::ErrorStack, nid::Nid, bn::BigNum, hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, sign::Signer};
 use plist::Data;
 use uuid::Uuid;
