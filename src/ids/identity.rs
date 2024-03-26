@@ -3,7 +3,7 @@ use std::{io::Cursor, sync::Arc};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest, ec_deserialize, ec_serialize, rsa_deserialize, rsa_serialize, bin_serialize, bin_deserialize}, apns::APNSConnection, error::PushError};
+use crate::{apns::APNSConnection, error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, OSConfig};
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::{Deserialize, Serialize};
@@ -155,7 +155,7 @@ impl IDSIdentity {
     }
 }
 
-pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), PushError> {
+pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), PushError> {
 
     let mut user_payloads: Vec<Value> = vec![];
     for user in users.iter_mut() {
@@ -224,11 +224,14 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
         user_payloads.push(Value::Dictionary(dict));
     }
 
+    let validation_data = os_config.generate_validation_data().await?;
+    let meta = os_config.get_register_meta();
+
     let body = Value::Dictionary(Dictionary::from_iter([
-        ("hardware-version", Value::String("MacBookPro18,3".to_string())),
+        ("hardware-version", Value::String(meta.hardware_version)),
         ("language", Value::String("en-US".to_string())),
-        ("os-version", Value::String("macOS,13.2.1,22D68".to_string())),
-        ("software-version", Value::String("22D68".to_string())),
+        ("os-version", Value::String(meta.os_version)),
+        ("software-version", Value::String(meta.software_version)),
         ("services", Value::Array(vec![
             Value::Dictionary(Dictionary::from_iter([
                 ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
@@ -240,14 +243,14 @@ pub async fn register(valid_ctx: &str, users: &mut [IDSUser], conn: Arc<APNSConn
                 ("users", Value::Array(user_payloads))
             ].into_iter()))
         ])),
-        ("validation-data", Value::Data(base64_decode(valid_ctx)))
+        ("validation-data", Value::Data(validation_data))
     ].into_iter()));
 
     let body = plist_to_string(&body)?;
     let client = make_reqwest();
 
     let mut builder = client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
-        .header("x-protocol-version", "1640");
+        .header("x-protocol-version", os_config.get_protocol_version().to_string());
     for (idx, user) in users.iter().enumerate() {
         builder = auth_sign_req(
             builder

@@ -1,5 +1,7 @@
 use std::{io, fmt::Display};
 
+#[cfg(feature = "macOS")]
+use open_abinsthe::AbinstheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 
@@ -19,12 +21,21 @@ pub enum PushError {
     APNSConnectError,
     TLSError(rustls::Error),
     StatusError(reqwest::StatusCode /* code */),
-    AlbertCertParseError
+    AlbertCertParseError,
+    #[cfg(feature = "macOS")]
+    AbinstheError(AbinstheError),
 }
 
 impl Display for PushError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", format!("{:?}", self))
+    }
+}
+
+#[cfg(feature = "macOS")]
+impl From<AbinstheError> for PushError {
+    fn from(value: AbinstheError) -> Self {
+        PushError::AbinstheError(value)
     }
 }
 

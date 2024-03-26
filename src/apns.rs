@@ -13,7 +13,7 @@ use serde::{Serialize, Deserialize};
 use async_recursion::async_recursion;
 use tokio::time::interval;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, util::{KeyPair, bin_serialize_opt, bin_deserialize_opt}, ids::signing::generate_nonce, PushError};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, OSConfig, util::{bin_deserialize_opt, bin_serialize_opt, KeyPair}, PushError};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -403,11 +403,11 @@ impl APNSConnection {
     }
 
     pub async fn new(
-        serial_number: &str,state: Option<APNSState>) -> Result<APNSConnection, PushError> {
+        os_config: &dyn OSConfig, state: Option<APNSState>) -> Result<APNSConnection, PushError> {
         let mut state = match state {
             Some(state) => state,
             None => {
-                let keypair = generate_push_cert(serial_number).await?;
+                let keypair = generate_push_cert(os_config).await?;
                 APNSState {
                     keypair,
                     token: None

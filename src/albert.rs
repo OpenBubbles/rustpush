@@ -8,22 +8,22 @@ use uuid::Uuid;
 use serde::Serialize;
 use regex::Regex;
 
-use crate::{util::{plist_to_string, plist_to_buf, KeyPair, get_nested_value, make_reqwest}, PushError};
+use crate::{OSConfig, util::{get_nested_value, make_reqwest, plist_to_buf, plist_to_string, KeyPair}, PushError};
 
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct ActivationInfo {
-    activation_randomness: String,
-    activation_state: String,
-    build_version: String,
-    device_cert_request: Data,
-    device_class: String,
-    product_type: String,
-    product_version: String,
-    serial_number: String,
+pub struct ActivationInfo {
+    pub activation_randomness: String,
+    pub activation_state: String,
+    pub build_version: String,
+    pub device_cert_request: Data,
+    pub device_class: String,
+    pub product_type: String,
+    pub product_version: String,
+    pub serial_number: String,
     #[serde(rename = "UniqueDeviceID")]
-    unique_device_id: String
+    pub unique_device_id: String
 }
 
 #[derive(Serialize)]
@@ -38,7 +38,7 @@ struct ActivationRequest {
 
 fn build_activation_info(
     private_key: &PKeyRef<Private>,
-    serial_number: &str,
+    os_config: &dyn OSConfig,
 ) -> Result<ActivationInfo, ErrorStack> {
     let mut csr_builder = X509ReqBuilder::new()?;
     let mut name = X509NameBuilder::new()?;
@@ -55,27 +55,17 @@ fn build_activation_info(
     let csr = csr_builder.build();
     let pem = csr.to_pem()?;
 
-    Ok(ActivationInfo {
-        activation_randomness: Uuid::new_v4().to_string(),
-        activation_state: "Unactivated".to_string(),
-        build_version: "22F82".to_string(),
-        device_cert_request: pem.into(),
-        device_class: "MacOS".to_string(),
-        product_type: "MacBookPro18,3".to_string(),
-        product_version: "13.4.1".to_string(),
-        serial_number: serial_number.to_string(),
-        unique_device_id: Uuid::new_v4().to_string(),
-    })
+    Ok(os_config.build_activation_info(pem))
 }
 
 // Generates an APNs push certificate by talking to Albert
 // Returns (private key PEM, certificate PEM) (actual data buffers)
-pub async fn generate_push_cert(serial_number: &str) -> Result<KeyPair, PushError> {
+pub async fn generate_push_cert(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(
         1024,
         BigNum::from_u32(65537)?.as_ref(),
     )?)?;
-    let activation_info = build_activation_info(private_key.as_ref(), serial_number)?;
+    let activation_info = build_activation_info(private_key.as_ref(), os_config)?;
 
     println!(
         "Generated activation info (with UUID: {})",
@@ -105,7 +95,7 @@ pub async fn generate_push_cert(serial_number: &str) -> Result<KeyPair, PushErro
     let client = make_reqwest();
     let form = [("activation-info", plist_to_string(&request)?)];
     let req = client
-        .post("https://albert.apple.com/deviceservices/deviceActivation?device=MacOS")
+        .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
         .form(&form);
     let resp = req.send().await?;
     let text = resp.text().await?;

@@ -6,7 +6,7 @@ use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, util::{bin_serialize, bin_deserialize, plist_to_string, KeyPair, plist_to_bin, gzip, ungzip, make_reqwest}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req, error::PushError};
+use crate::{apns::{APNSConnection, APNSState}, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, OSConfig};
 
 use super::{identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -133,12 +133,12 @@ struct HandleResult {
     handles: Vec<ResultHandle>
 }
 
-pub async fn get_handles(user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, PushError> {
+pub async fn get_handles(protocol_ver: u32, user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, PushError> {
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = make_reqwest();
     let resp = auth_sign_req(
             client.get(ids_bag.get("id-get-handles").unwrap().as_string().unwrap())
-            .header("x-protocol-version", "1640")
+            .header("x-protocol-version", protocol_ver.to_string())
             .header("x-auth-user-id", user_id),
             &[],
             "id-get-handles",
@@ -168,7 +168,8 @@ pub struct IDSUser {
     pub user_id: String,
     pub handles: Vec<String>, // usable handles
     pub identity: Option<IDSIdentity>,
-    pub user_type: IDSUserType
+    pub user_type: IDSUserType,
+    pub protocol_version: u32,
 }
 
 pub struct IDSAppleUser;
@@ -215,7 +216,7 @@ pub struct IDSIdentityResult {
 impl IDSUser {
     // possible handles, which may have changed since registration
     pub async fn possible_handles(&self, conn: Arc<APNSConnection>) -> Result<Vec<String>, PushError> {
-        get_handles(&self.user_id, &self.auth_keypair, &conn.state).await
+        get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &conn.state).await
     }
 
     pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
@@ -227,7 +228,7 @@ impl IDSUser {
         let handle = self.handles.first().unwrap();
         let mut headers = Dictionary::from_iter([
             ("x-id-self-uri", Value::String(handle.clone())),
-            ("x-protocol-version", "1640".into())
+            ("x-protocol-version", self.protocol_version.to_string().into())
         ].into_iter());
 
         add_id_signature(&mut headers, &encoded, "id-query", 
@@ -285,7 +286,7 @@ impl IDSUser {
 }
 
 impl IDSAppleUser {
-    pub async fn authenticate(_conn: Arc<APNSConnection>, username: &str, password: &str) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(_conn: Arc<APNSConnection>, username: &str, password: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let (token, user_id) = get_auth_token(username, password).await?;
         let auth_keypair = get_auth_cert(&user_id, &token).await?;
 
@@ -294,13 +295,14 @@ impl IDSAppleUser {
             user_id,
             handles: vec![],
             identity: None,
-            user_type: IDSUserType::Apple
+            user_type: IDSUserType::Apple,
+            protocol_version: os_config.get_protocol_version()
         })
     }
 }
 
 impl IDSPhoneUser {
-    pub async fn authenticate(conn: Arc<APNSConnection>, phone_number: &str, phone_sig: &[u8]) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(conn: Arc<APNSConnection>, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let auth_keypair = get_phone_cert(phone_number, 
                 conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()]).await?;
 
@@ -309,7 +311,8 @@ impl IDSPhoneUser {
             user_id: format!("P:{}", phone_number),
             handles: vec![],
             identity: None,
-            user_type: IDSUserType::Phone
+            user_type: IDSUserType::Phone,
+            protocol_version: os_config.get_protocol_version(),
         })
     }
 }

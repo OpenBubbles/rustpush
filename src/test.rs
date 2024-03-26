@@ -1,15 +1,18 @@
 
 use std::{io::{Cursor, Seek}, sync::Arc};
 
+use base64::engine::general_purpose;
 use log::{info, error};
+use open_abinsthe::nac::HardwareConfig;
 use openssl::ex_data::Index;
-use rustpush::{APNSState, IDSUser, APNSConnection, IDSAppleUser, PushError, register, IMClient, ConversationData, Message, NormalMessage, MessageParts, MessagePart, RecievedMessage, init_logger, MMCSFile, IndexedMessagePart, IconChangeMessage};
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, IconChangeMessage, IndexedMessagePart, MMCSFile, MacOSConfig, Message, MessagePart, MessageParts, NormalMessage, PushError, RecievedMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use tokio::time::{sleep, Duration};
 use serde::{Serialize, Deserialize};
 use std::io::Write;
+use base64::Engine;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -47,31 +50,42 @@ async fn main() {
 		}
 	};
     
-    // Read serial number from command line arg, otherwise prompt for it
-    let mut serial_number: Option<String> = None;
-    for arg in std::env::args() {
-        if arg.starts_with("--serial=") {
-            serial_number = Some(arg.split("=").collect::<Vec<&str>>()[1].to_string());
-        }
-    }
-    let serial_number = match serial_number {
-        Some(v) => v,
-        None => {
-            let stdin = io::stdin();
-            print!("Serial Number: ");
-            std::io::stdout().flush().unwrap();
-            let mut reader = BufReader::new(stdin);
-            let mut serial_number = String::new();
-            reader.read_line(&mut serial_number).await.unwrap();
-            serial_number.trim().to_string()
+    
+    
+    let config: MacOSConfig = if let Ok(config) = plist::from_file("hwconfig.plist") {
+        config
+    } else {
+        println!("Missing hardware config!");
+        println!("The easiest way to get your hardware config is to extract it from validation data from a Mac.");
+        println!("This validation data will not be used to authenticate, and therefore does not need to be recent or valid.");
+        println!("If you need help obtaining validation data, please visit https://github.com/beeper/mac-registration-provider");
+        println!("As long as the hardware identifiers are valid rustpush will work fine.");
+        println!("Validation data will not be required for subsequent re-registrations.");
+        // save hardware config
+        let stdin = io::stdin();
+        print!("Validation data: ");
+        std::io::stdout().flush().unwrap();
+        let mut reader = BufReader::new(stdin);
+        let mut validation_data_b64 = String::new();
+        reader.read_line(&mut validation_data_b64).await.unwrap();
+
+        let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
+        let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
+
+        MacOSConfig {
+            inner: extracted,
+            version: "13.6.4".to_string(),
+            protocol_version: 1660,
+            device_id: Uuid::new_v4().to_string(),
         }
     };
+    fs::write("hwconfig.plist", plist_to_string(&config).unwrap()).await.unwrap();
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
     let connection = Arc::new(
         APNSConnection::new(
-            serial_number.as_str(),
+            &config,
             saved_state.as_ref().map(|state| state.push.clone()),
         )
         .await
@@ -93,7 +107,7 @@ async fn main() {
 
         let mut twofa_code = "".to_string();
         loop {
-            let resp = IDSAppleUser::authenticate(connection.clone(), username.trim(), &(password.trim().to_string() + &twofa_code)).await;
+            let resp = IDSAppleUser::authenticate(connection.clone(), username.trim(), &(password.trim().to_string() + &twofa_code), &config).await;
             match resp {
                 Ok(user) => {
                     break vec![user]
@@ -116,13 +130,7 @@ async fn main() {
 
     if users[0].identity.is_none() {
         info!("Registering new identity...");
-        print!("Enter validation data: ");
-        std::io::stdout().flush().unwrap();
-        let stdin = io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut validation = String::new();
-        reader.read_line(&mut validation).await.unwrap();
-        register(&validation, &mut users, connection.clone()).await.unwrap();
+        register(&config, &mut users, connection.clone()).await.unwrap();
     }
 
     println!("registration expires at {}", users[0].identity.as_ref().unwrap().get_exp().unwrap());
@@ -188,10 +196,10 @@ async fn main() {
     }).await.unwrap();
     println!("uploaded attachment");*/
     let mut msg = client.new_msg(ConversationData {
-        participants: vec!["mailto:sandboxalt@gmail.com".to_string()],
+        participants: vec!["mailto:jjtech@jjtech.dev".to_string()],
         cv_name: None,
         sender_guid: Some(Uuid::new_v4().to_string())
-    }, &handle, Message::Message(NormalMessage::new("hello world!".to_string()))).await;
+    }, &handle, Message::Message(NormalMessage::new("hi".to_string()))).await;
     println!("sendingrun");
     client.send(&mut msg).await.unwrap();
     println!("sendingdone");
