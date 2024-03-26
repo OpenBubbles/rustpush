@@ -6,7 +6,7 @@ use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, util::{plist_to_string, KeyPair, plist_to_bin, gzip, ungzip, make_reqwest}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req, error::PushError};
+use crate::{apns::{APNSConnection, APNSState}, util::{bin_serialize, bin_deserialize, plist_to_string, KeyPair, plist_to_bin, gzip, ungzip, make_reqwest}, bags::{get_bag, IDS_BAG}, ids::signing::auth_sign_req, error::PushError};
 
 use super::{identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -206,7 +206,9 @@ struct IDSIdentityRespRes {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IDSIdentityResult {
     pub identity: IDSPublicIdentity,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub push_token: Vec<u8>,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub session_token: Vec<u8>
 }
 

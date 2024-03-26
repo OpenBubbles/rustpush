@@ -79,10 +79,42 @@ where
     Rsa::public_key_from_der(s.as_ref()).map_err(Error::custom)
 }
 
+pub fn bin_serialize<S>(x: &Vec<u8>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_bytes(x)
+}
+
+pub fn bin_deserialize<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Data = Deserialize::deserialize(d)?;
+    Ok(s.into())
+}
+
+pub fn bin_serialize_opt<S>(x: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    x.clone().map(|i| Data::new(i)).serialize(s)
+}
+
+pub fn bin_deserialize_opt<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Data> = Deserialize::deserialize(d)?;
+    Ok(s.map(|i| i.into()))
+}
+
 // both in der
 #[derive(Serialize, Deserialize, Clone)]
 pub struct KeyPair {
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub cert: Vec<u8>,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub private: Vec<u8>
 }
 

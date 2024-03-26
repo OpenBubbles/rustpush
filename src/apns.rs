@@ -13,7 +13,7 @@ use serde::{Serialize, Deserialize};
 use async_recursion::async_recursion;
 use tokio::time::interval;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, util::KeyPair, ids::signing::generate_nonce, PushError};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, util::{KeyPair, bin_serialize_opt, bin_deserialize_opt}, ids::signing::generate_nonce, PushError};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -290,6 +290,7 @@ pub struct APNSConnection {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct APNSState {
     pub keypair: KeyPair,
+    #[serde(serialize_with = "bin_serialize_opt", deserialize_with = "bin_deserialize_opt")]
     pub token: Option<Vec<u8>>
 }
 

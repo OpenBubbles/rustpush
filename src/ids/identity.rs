@@ -3,17 +3,18 @@ use std::{io::Cursor, sync::Arc};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest, ec_deserialize, ec_serialize, rsa_deserialize, rsa_serialize}, apns::APNSConnection, error::PushError};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest, ec_deserialize, ec_serialize, rsa_deserialize, rsa_serialize, bin_serialize, bin_deserialize}, apns::APNSConnection, error::PushError};
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
-use serde::Serialize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IDSPublicIdentity {
+    #[serde(serialize_with = "ec_serialize", deserialize_with = "ec_deserialize")]
     signing_key: EcKey<Public>,
+    #[serde(serialize_with = "rsa_serialize", deserialize_with = "rsa_deserialize")]
     pub encryption_key: Rsa<Public>,
 }
 
@@ -94,7 +95,9 @@ fn encode(encryption_key: &PKey<Private>, signing_key: &PKey<Private>) -> Vec<u8
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSIdentity {
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     signing_key: Vec<u8>,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     encryption_key: Vec<u8>,
     pub id_keypair: Option<KeyPair>
 }
