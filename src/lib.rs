@@ -31,7 +31,7 @@ pub struct RegisterMeta {
 }
 
 #[async_trait]
-pub trait OSConfig {
+pub trait OSConfig: Sync + Send {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo;
     fn get_activation_device(&self) -> String;
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError>;

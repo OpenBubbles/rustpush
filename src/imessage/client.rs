@@ -1,15 +1,15 @@
 
 use std::{collections::HashMap, fs, io::Cursor, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
-use log::{debug, warn};
+use log::{debug, error, info, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc::Receiver, Mutex};
+use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, util::{plist_to_bin, plist_to_string}};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{plist_to_bin, plist_to_string}, OSConfig};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -102,14 +102,14 @@ impl KeyCache {
 
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
-    pub users: Arc<Vec<IDSUser>>,
+    pub users: Arc<RwLock<Vec<IDSUser>>>,
     key_cache: Mutex<KeyCache>,
     raw_inbound: Mutex<Receiver<APNSPayload>>
 }
 
 impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>, cache_path: String) -> IMClient {
-        IMClient {
+    pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: String, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+        let client = IMClient {
             key_cache: Mutex::new(KeyCache::new(cache_path)),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
@@ -127,8 +127,46 @@ impl IMClient {
                 get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118
             }).await),
             conn,
-            users,
+            users: Arc::new(RwLock::new(users)),
+        };
+        Self::schedule_ids_rereg(client.conn.clone(), client.users.clone(), os_config, 0, keys_updated).await;
+        client
+    }
+
+    #[async_recursion]
+    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>, users_ref: Arc<RwLock<Vec<IDSUser>>>, os_config: Arc<dyn OSConfig>, mut retry_count: u8, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) {
+        let users_lock = users_ref.read().await;
+        if users_lock.len() == 0 {
+            return
         }
+        // reregister 60 seconds before exp
+        let (next_rereg, next_rereg_in) = users_lock.iter()
+            .map(|user| (user.handles.clone(), user.identity.as_ref().unwrap().get_exp().unwrap() - 60))
+            .min_by_key(|(_handles, exp)| *exp).unwrap();
+        drop(users_lock);
+        tokio::spawn(async move {
+            info!("Reregistering {:?} in {} seconds", next_rereg, next_rereg_in);
+            if next_rereg_in > 0 {
+                sleep(Duration::from_secs(next_rereg_in as u64)).await;
+            }
+            info!("Reregistering {:?} now!", next_rereg);
+            let mut users_lock = users_ref.write().await;
+            let user = users_lock.iter_mut().find(|user| user.handles == next_rereg).unwrap();
+            if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), conn_ref.clone()).await {
+                let retry_in = 2_u64.pow(retry_count as u32) * 300; // 5 minutes doubling
+                error!("Reregistering failed {:?}, retrying in {}s", err, retry_in);
+                sleep(Duration::from_secs(retry_in)).await;
+                if retry_count < 8 {
+                    retry_count += 1; // max retry a day
+                }
+            } else {
+                retry_count = 0;
+                keys_updated(users_lock.clone());
+                info!("Successfully reregistered!");
+            }
+            drop(users_lock);
+            Self::schedule_ids_rereg(conn_ref, users_ref, os_config, retry_count, keys_updated).await;
+        });
     }
 
     fn parse_payload(payload: &[u8]) -> (&[u8], &[u8]) {
@@ -139,8 +177,9 @@ impl IMClient {
         (body, sig)
     }
 
-    pub fn get_handles(&self) -> Vec<String> {
-        self.users.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
+    pub async fn get_handles(&self) -> Vec<String> {
+        let users_locked = self.users.read().await;
+        users_locked.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
     }
 
     #[async_recursion]
@@ -217,8 +256,8 @@ impl IMClient {
         self.recieve_payload(payload).await
     }
 
-    fn user_by_handle(&self, handle: &str) -> &IDSUser {
-        self.users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
+    fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
+        users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
     async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
@@ -278,7 +317,8 @@ impl IMClient {
 
         let loaded: RecvMsg = plist::from_bytes(body).unwrap();
 
-        let Some(identity) = self.users.iter().find(|user| user.handles.contains(&loaded.target)) else {
+        let users_locked = self.users.read().await;
+        let Some(identity) = users_locked.iter().find(|user| user.handles.contains(&loaded.target)) else {
             panic!("No identity for sender {}", loaded.sender);
         };
 
@@ -309,7 +349,8 @@ impl IMClient {
             return Ok(())
         }
         drop(key_cache);
-        let results = self.user_by_handle(handle).lookup(self.conn.clone(), fetch).await?;
+        let users = self.users.read().await;
+        let results = Self::user_by_handle(&users, handle).lookup(self.conn.clone(), fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
@@ -342,7 +383,8 @@ impl IMClient {
 
     async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, PushError> {
         let rand = rand::thread_rng().gen::<[u8; 11]>();
-        let user = self.user_by_handle(sender);
+        let users = self.users.read().await;
+        let user = Self::user_by_handle(&users, sender);
 
         let hmac = PKey::hmac(&rand)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;

@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
@@ -115,11 +115,17 @@ impl IDSIdentity {
         })
     }
 
-    // returns seconds since epoch
+    // returns seconds valid for
     pub fn get_exp(&self) -> Result<i64, PushError> {
         let x509 = X509::from_der(&self.id_keypair.as_ref().unwrap().cert)?;
         let expiration = x509.not_after();
-        let unix = Asn1Time::from_unix(0)?.as_ref().diff(expiration)?;
+
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+
+        let unix = Asn1Time::from_unix(since_the_epoch.as_secs() as i64)?.as_ref().diff(expiration)?;
         Ok((unix.days as i64) * 86400 + (unix.secs as i64))
     }
 

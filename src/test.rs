@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use log::{info, error};
 use open_abinsthe::nac::HardwareConfig;
 use openssl::ex_data::Index;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, IconChangeMessage, IndexedMessagePart, MMCSFile, MacOSConfig, Message, MessagePart, MessageParts, NormalMessage, PushError, RecievedMessage};
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, IconChangeMessage, IndexedMessagePart, MMCSFile, MacOSConfig, Message, MessagePart, MessageParts, NormalMessage, OSConfig, PushError, RecievedMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -135,15 +135,19 @@ async fn main() {
 
     println!("registration expires at {}", users[0].identity.as_ref().unwrap().get_exp().unwrap());
 
-    let state = SavedState {
+    let mut state = SavedState {
         push: connection.state.clone(),
         users: users.clone()
     };
     fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
+
+    let os_config: Arc<dyn OSConfig> = Arc::new(config);
     
-    let users = Arc::new(users);
-    let mut client = IMClient::new(connection.clone(), users.clone(), "cached_ids.plist".to_string()).await;
-    let handle = client.get_handles()[0].clone();
+    let mut client = IMClient::new(connection.clone(), users, "cached_ids.plist".to_string(), os_config, Box::new(move |updated_keys| {
+        state.users = updated_keys;
+        std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
+    })).await;
+    let handle = client.get_handles().await[0].clone();
 
     //client.validate_targets(&["mailto:testu3@icloud.com".to_string()]).await.unwrap();
 
