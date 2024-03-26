@@ -1,14 +1,15 @@
 
-use std::{collections::HashMap, vec, io::Cursor, sync::Arc, str::FromStr, time::{SystemTime, UNIX_EPOCH, Duration}};
+use std::{collections::HashMap, fs, io::Cursor, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, warn};
 use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc::Receiver, Mutex};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, ids::{user::{IDSUser, IDSIdentityResult}, identity::IDSPublicIdentity}, util::plist_to_bin, imessage::messages::{BundledPayload, SendMsg}, error::PushError};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, util::{plist_to_bin, plist_to_string}};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -25,22 +26,44 @@ pub enum RecievedMessage {
     }
 }
 
-const KEY_REFRESH_MS: u128 = 1000 * 60 * 60 * 2; // two hours
+const KEY_REFRESH_MS: u64 = 86400 * 1000; // one day
 
+#[derive(Serialize, Deserialize, Debug)]
 struct CachedKeys {
     keys: Vec<IDSIdentityResult>,
-    at_ms: u128
+    at_ms: u64
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 struct KeyCache {
-    cache: HashMap<String, HashMap<String, CachedKeys>>
+    cache: HashMap<String, HashMap<String, CachedKeys>>,
+    #[serde(skip)]
+    cache_location: String,
 }
 
 impl KeyCache {
-    fn new() -> KeyCache {
-        KeyCache {
-            cache: HashMap::new()
+    fn new(path: String) -> KeyCache {
+        if let Ok(data) = fs::read(&path) {
+            if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
+                loaded.cache_location = path;
+                return loaded
+            }
         }
+        KeyCache {
+            cache: HashMap::new(),
+            cache_location: path
+        }
+    }
+
+    fn save(&self) {
+        let saved = plist_to_string(self).unwrap();
+        fs::write(&self.cache_location, saved).unwrap();
+    }
+
+    fn invalidate(&mut self, handle: &str, keys_for: &str) {
+        let handle_cache = self.cache.get_mut(handle).unwrap();
+        handle_cache.remove(keys_for);
+        self.save();
     }
     
     fn get_keys(&self, handle: &str, keys_for: &str) -> Option<&Vec<IDSIdentityResult>> {
@@ -52,7 +75,7 @@ impl KeyCache {
         };
         let ms_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards").as_millis();
+            .expect("Time went backwards").as_millis() as u64; // make serde happy
         if ms_now > cached.at_ms + KEY_REFRESH_MS {
             // expired
             None
@@ -71,8 +94,9 @@ impl KeyCache {
             .expect("Time went backwards").as_millis();
         handle_cache.insert(keys_for.to_string(), CachedKeys {
             keys,
-            at_ms: ms_now
+            at_ms: ms_now as u64
         });
+        self.save();
     }
 }
 
@@ -84,9 +108,9 @@ pub struct IMClient {
 }
 
 impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>) -> IMClient {
+    pub async fn new(conn: Arc<APNSConnection>, users: Arc<Vec<IDSUser>>, cache_path: String) -> IMClient {
         IMClient {
-            key_cache: Mutex::new(KeyCache::new()),
+            key_cache: Mutex::new(KeyCache::new(cache_path)),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
                     return false
@@ -240,6 +264,14 @@ impl IMClient {
             })
         }
 
+        if get_c == 130 {
+            let mut cache_lock = self.key_cache.lock().await;
+            let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
+            let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+            cache_lock.invalidate(source, target);
+            return None
+        }
+
         if !has_p {
             return None
         }
@@ -283,6 +315,9 @@ impl IMClient {
             warn!("warn IDS returned zero keys for query {:?}", participants);
         }
         for (id, results) in results {
+            if results.len() == 0 {
+                warn!("IDS returned zero keys for participant {}", id);
+            }
             key_cache.put_keys(handle, &id, results);
         }
         Ok(())

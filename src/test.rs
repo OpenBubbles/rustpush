@@ -114,6 +114,8 @@ async fn main() {
         register(&validation, &mut users, connection.clone()).await.unwrap();
     }
 
+    println!("registration expires at {}", users[0].identity.as_ref().unwrap().get_exp().unwrap());
+
     let state = SavedState {
         push: connection.state.clone(),
         users: users.clone()
@@ -122,7 +124,7 @@ async fn main() {
     fs::write("config.json", serialized).await.unwrap();
     
     let users = Arc::new(users);
-    let mut client = IMClient::new(connection.clone(), users.clone()).await;
+    let mut client = IMClient::new(connection.clone(), users.clone(), "cached_ids.plist".to_string()).await;
     let handle = client.get_handles()[0].clone();
 
     //client.validate_targets(&["mailto:testu3@icloud.com".to_string()]).await.unwrap();

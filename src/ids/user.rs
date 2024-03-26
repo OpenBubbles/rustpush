@@ -203,6 +203,7 @@ struct IDSIdentityRespRes {
     session_token: Data
 }
 
+#[derive(Serialize, Deserialize, Debug)]
 pub struct IDSIdentityResult {
     pub identity: IDSPublicIdentity,
     pub push_token: Vec<u8>,

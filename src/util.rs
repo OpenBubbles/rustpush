@@ -3,10 +3,13 @@ use std::num::ParseIntError;
 
 use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
-use plist::{Error, Value};
+use openssl::ec::EcKey;
+use openssl::pkey::Public;
+use openssl::rsa::Rsa;
+use plist::{Data, Error, Value};
 use base64::Engine;
 use reqwest::{Client, Certificate};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::{Write, Read};
 use std::fmt::Write as FmtWrite;
 
@@ -40,6 +43,40 @@ pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> 
         curr_val = curr_val.as_dictionary()?.get(el)?;
     }
     Some(curr_val)
+}
+
+pub fn ec_serialize<S>(x: &EcKey<Public>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.public_key_to_der().map_err(Error::custom)?)
+}
+
+pub fn ec_deserialize<'de, D>(d: D) -> Result<EcKey<Public>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    EcKey::public_key_from_der(s.as_ref()).map_err(Error::custom)
+}
+
+pub fn rsa_serialize<S>(x: &Rsa<Public>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.public_key_to_der().map_err(Error::custom)?)
+}
+
+pub fn rsa_deserialize<'de, D>(d: D) -> Result<Rsa<Public>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    Rsa::public_key_from_der(s.as_ref()).map_err(Error::custom)
 }
 
 // both in der

@@ -1,4 +1,6 @@
 /target
 /config.json
+/config.plist
 /out
 /jniLibs
+/cached_ids.plist

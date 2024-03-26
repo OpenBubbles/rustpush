@@ -3,12 +3,15 @@ use std::{io::Cursor, sync::Arc};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
 
-use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest}, apns::APNSConnection, error::PushError};
+use crate::{util::{base64_decode, plist_to_string, KeyPair, make_reqwest, ec_deserialize, ec_serialize, rsa_deserialize, rsa_serialize}, apns::APNSConnection, error::PushError};
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::Serialize;
 use serde::Deserialize;
 
+
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct IDSPublicIdentity {
     signing_key: EcKey<Public>,
     pub encryption_key: Rsa<Public>,
