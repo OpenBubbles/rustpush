@@ -107,7 +107,7 @@ async fn main() {
 
         let mut twofa_code = "".to_string();
         loop {
-            let resp = IDSAppleUser::authenticate(connection.clone(), username.trim(), &(password.trim().to_string() + &twofa_code), &config).await;
+            let resp = IDSAppleUser::authenticate(&connection, username.trim(), &(password.trim().to_string() + &twofa_code), &config).await;
             match resp {
                 Ok(user) => {
                     break vec![user]
@@ -130,7 +130,7 @@ async fn main() {
 
     if users[0].identity.is_none() {
         info!("Registering new identity...");
-        register(&config, &mut users, connection.clone()).await.unwrap();
+        register(&config, &mut users, &connection).await.unwrap();
     }
 
     println!("registration expires at {}", users[0].identity.as_ref().unwrap().get_exp().unwrap());

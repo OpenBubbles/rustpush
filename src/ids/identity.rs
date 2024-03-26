@@ -161,11 +161,11 @@ impl IDSIdentity {
     }
 }
 
-pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: Arc<APNSConnection>) -> Result<(), PushError> {
+pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &APNSConnection) -> Result<(), PushError> {
 
     let mut user_payloads: Vec<Value> = vec![];
     for user in users.iter_mut() {
-        user.handles = user.possible_handles(conn.clone()).await?;
+        user.handles = user.possible_handles(conn).await?;
         let identity = user.identity.get_or_insert_with(|| {
             IDSIdentity::new().unwrap()
         });

@@ -215,11 +215,11 @@ pub struct IDSIdentityResult {
 
 impl IDSUser {
     // possible handles, which may have changed since registration
-    pub async fn possible_handles(&self, conn: Arc<APNSConnection>) -> Result<Vec<String>, PushError> {
+    pub async fn possible_handles(&self, conn: &APNSConnection) -> Result<Vec<String>, PushError> {
         get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &conn.state).await
     }
 
-    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+    pub async fn lookup(&self, conn: &APNSConnection, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
         let body = plist_to_string(&LookupReq { uris: query })?;
 
         // gzip encode
@@ -286,7 +286,7 @@ impl IDSUser {
 }
 
 impl IDSAppleUser {
-    pub async fn authenticate(_conn: Arc<APNSConnection>, username: &str, password: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(_conn: &APNSConnection, username: &str, password: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let (token, user_id) = get_auth_token(username, password).await?;
         let auth_keypair = get_auth_cert(&user_id, &token).await?;
 
@@ -302,7 +302,7 @@ impl IDSAppleUser {
 }
 
 impl IDSPhoneUser {
-    pub async fn authenticate(conn: Arc<APNSConnection>, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(conn: &APNSConnection, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let auth_keypair = get_phone_cert(phone_number, 
                 conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()]).await?;
 

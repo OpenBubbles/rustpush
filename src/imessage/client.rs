@@ -152,7 +152,7 @@ impl IMClient {
             info!("Reregistering {:?} now!", next_rereg);
             let mut users_lock = users_ref.write().await;
             let user = users_lock.iter_mut().find(|user| user.handles == next_rereg).unwrap();
-            if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), conn_ref.clone()).await {
+            if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), &conn_ref).await {
                 let retry_in = 2_u64.pow(retry_count as u32) * 300; // 5 minutes doubling
                 error!("Reregistering failed {:?}, retrying in {}s", err, retry_in);
                 sleep(Duration::from_secs(retry_in)).await;
@@ -350,7 +350,7 @@ impl IMClient {
         }
         drop(key_cache);
         let users = self.users.read().await;
-        let results = Self::user_by_handle(&users, handle).lookup(self.conn.clone(), fetch).await?;
+        let results = Self::user_by_handle(&users, handle).lookup(&self.conn, fetch).await?;
         let mut key_cache = self.key_cache.lock().await;
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
