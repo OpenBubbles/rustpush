@@ -1,5 +1,5 @@
 
-use std::{sync::Arc, io::Seek};
+use std::{io::{Cursor, Seek}, sync::Arc};
 
 use log::{info, error};
 use openssl::ex_data::Index;
@@ -17,15 +17,26 @@ struct SavedState {
     users: Vec<IDSUser>
 }
 
+pub fn plist_to_buf<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, plist::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    let writer = Cursor::new(&mut buf);
+    plist::to_writer_xml(writer, &value)?;
+    Ok(buf)
+}
+
+pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, plist::Error> {
+    plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
+}
+
 #[tokio::main]
 async fn main() {
     init_logger();
-    let data: String = match fs::read_to_string("config.json").await {
+    let data: String = match fs::read_to_string("config.plist").await {
 		Ok(v) => v,
 		Err(e) => {
 			match e.kind() {
 				io::ErrorKind::NotFound => {
-					let _ = fs::File::create("config.json").await.expect("Unable to create file").write_all(b"{}");
+					let _ = fs::File::create("config.plist").await.expect("Unable to create file").write_all(b"{}");
 					"{}".to_string()
 				}
 				_ => {
@@ -56,7 +67,7 @@ async fn main() {
         }
     };
 	
-    let saved_state: Option<SavedState> = serde_json::from_str(&data).ok();
+    let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
     let connection = Arc::new(
         APNSConnection::new(
@@ -120,8 +131,7 @@ async fn main() {
         push: connection.state.clone(),
         users: users.clone()
     };
-    let serialized = serde_json::to_string(&state).unwrap();
-    fs::write("config.json", serialized).await.unwrap();
+    fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
     
     let users = Arc::new(users);
     let mut client = IMClient::new(connection.clone(), users.clone(), "cached_ids.plist".to_string()).await;
