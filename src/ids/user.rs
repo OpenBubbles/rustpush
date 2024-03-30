@@ -1,4 +1,4 @@
-use std::{io::Cursor, collections::HashMap, sync::Arc};
+use std::{io::Cursor, collections::HashMap};
 
 use log::info;
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
@@ -220,6 +220,7 @@ impl IDSUser {
     }
 
     pub async fn lookup(&self, conn: &APNSConnection, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+        println!("Performing an IDS Lookup for: {:?}", query);
         let body = plist_to_string(&LookupReq { uris: query })?;
 
         // gzip encode

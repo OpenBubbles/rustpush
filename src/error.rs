@@ -1,7 +1,7 @@
 use std::{io, fmt::Display};
 
 #[cfg(feature = "macOS")]
-use open_abinsthe::AbinstheError;
+use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 
@@ -23,7 +23,7 @@ pub enum PushError {
     StatusError(reqwest::StatusCode /* code */),
     AlbertCertParseError,
     #[cfg(feature = "macOS")]
-    AbinstheError(AbinstheError),
+    AbsintheError(AbsintheError),
 }
 
 impl Display for PushError {
@@ -33,9 +33,9 @@ impl Display for PushError {
 }
 
 #[cfg(feature = "macOS")]
-impl From<AbinstheError> for PushError {
-    fn from(value: AbinstheError) -> Self {
-        PushError::AbinstheError(value)
+impl From<AbsintheError> for PushError {
+    fn from(value: AbsintheError) -> Self {
+        PushError::AbsintheError(value)
     }
 }
 

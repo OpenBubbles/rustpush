@@ -1,6 +1,6 @@
 
 use async_trait::async_trait;
-use open_abinsthe::nac::{HardwareConfig, ValidationCtx};
+use open_absinthe::nac::{HardwareConfig, ValidationCtx};
 use plist::Data;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
