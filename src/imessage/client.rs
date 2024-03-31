@@ -242,7 +242,7 @@ impl IMClient {
         Ok(decrypted_sym)
     }
 
-    pub async fn recieve(&mut self) -> Option<RecievedMessage> {
+    pub async fn recieve(&self) -> Option<RecievedMessage> {
         let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
             return None
         };
