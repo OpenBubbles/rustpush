@@ -358,6 +358,7 @@ impl IMClient {
         for (id, results) in results {
             if results.len() == 0 {
                 warn!("IDS returned zero keys for participant {}", id);
+                continue;
             }
             key_cache.put_keys(handle, &id, results);
         }
@@ -503,7 +504,9 @@ impl IMClient {
                 staged_payloads = vec![];
             }
         }
+        println!("send_start");
         send_staged(staged_payloads).await?;
+        println!("send_end");
 
         let start = SystemTime::now();
         let since_the_epoch = start

@@ -6,25 +6,39 @@ use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
-use crate::{apns::{APNSConnection, APNSState}, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, OSConfig};
+use uuid::Uuid;
+use crate::{apns::{APNSConnection, APNSState}, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, OSConfig};
 
 use super::{identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
 
 
 #[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
 struct AuthRequest {
-    username: String,
+    apple_id: String,
+    client_id: String,
+    delegates: Value,
     password: String
 }
-async fn attempt_auth(username: &str, password: &str) -> Result<Value, PushError> {
+async fn attempt_auth(username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<Value, PushError> {
     let request = AuthRequest {
-        username: username.to_string(),
-        password: password.to_string()
+        apple_id: username.to_string(),
+        client_id: Uuid::new_v4().to_string(),
+        delegates: Value::Dictionary(Dictionary::from_iter([
+            ("com.apple.private.ids", Value::Dictionary(Dictionary::from_iter([
+                ("protocol-version", Value::String("4".to_string()))
+            ].into_iter()))),
+        ].into_iter())),
+        password: pet.to_string()
     };
 
     let client = make_reqwest();
-    let resp = client.post("https://profile.ess.apple.com/WebObjects/VCProfileService.woa/wa/authenticateUser")
+    let resp = client.post("https://setup.icloud.com/setup/prefpane/loginDelegates")
+            .header("User-Agent", os_config.get_icloud_ua())
+            .header("Accept-Encoding", "gzip")
+            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo())
+            .basic_auth(username, Some(pet))
             .body(plist_to_string(&request)?)
             .send()
             .await?;
@@ -34,8 +48,8 @@ async fn attempt_auth(username: &str, password: &str) -> Result<Value, PushError
     Ok(response)
 }
 
-async fn get_auth_token(username: &str, password: &str) -> Result<(String, String), PushError> {
-    let result = attempt_auth(username, password).await?;
+async fn get_auth_token(username: &str, password: &str, os_config: &dyn OSConfig) -> Result<(String, String), PushError> {
+    let result = attempt_auth(username, password, os_config).await?;
     // attempt 2fa
     let result_dict = result.as_dictionary().unwrap();
     if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() == 5000 {
@@ -45,8 +59,12 @@ async fn get_auth_token(username: &str, password: &str) -> Result<(String, Strin
         return Err(PushError::AuthError(result.clone()));
     }
 
-    let token = result_dict.get("auth-token").unwrap().as_string().unwrap();
-    let user_id = result_dict.get("profile-id").unwrap().as_string().unwrap();
+    let ids_data = result_dict.get("delegates").unwrap().as_dictionary().unwrap()
+        .get("com.apple.private.ids").unwrap().as_dictionary().unwrap()
+        .get("service-data").unwrap().as_dictionary().unwrap();
+
+    let token = ids_data.get("auth-token").unwrap().as_string().unwrap();
+    let user_id = ids_data.get("profile-id").unwrap().as_string().unwrap();
     
     info!("Got auth token for IDS {}", token);
     Ok((token.to_string(), user_id.to_string()))
@@ -87,19 +105,24 @@ fn gen_csr(priv_key: &PKey<Private>) -> Result<Vec<u8>, PushError> {
 }
 
 /* result is in der format (private, public) */
-async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str) -> Result<KeyPair, PushError> {
+async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str, os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let body = AuthCertRequest {
         authentication_data: auth_data,
         csr: gen_csr(&private_key)?.into(),
         realm_user_id: user_id.to_string()
     };
+
+
     
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = make_reqwest();
     let resp = client.post(ids_bag.get(endpoint_key).unwrap().as_string().unwrap())
-            .header("x-protocol-version", "1630")
-            .body(plist_to_string(&body)?)
+            .header("x-protocol-version", os_config.get_protocol_version())
+            .header("accept-encoding", "gzip")
+            .header("user-agent", os_config.get_registration_ua())
+            .header("content-encoding", "gzip")
+            .body(gzip_normal(plist_to_string(&body)?.as_bytes())?)
             .send()
             .await?;
     let text = resp.text().await?;
@@ -113,15 +136,15 @@ async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str) -> Re
     Ok(KeyPair { cert: cert, private: private_key.private_key_to_der()? })
 }
 
-async fn get_auth_cert(user_id: &str, token: &str) -> Result<KeyPair, PushError> {
-    authenticate(user_id, plist::to_value(&AuthCertData { auth_token: token.to_string() })?, "id-authenticate-ds-id").await
+async fn get_auth_cert(user_id: &str, token: &str, os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
+    authenticate(user_id, plist::to_value(&AuthCertData { auth_token: token.to_string() })?, "id-authenticate-ds-id", os_config).await
 }
 
-async fn get_phone_cert(phone_number: &str, push_token: &[u8], phone_signatures: &[Vec<u8>]) -> Result<KeyPair, PushError> {
+async fn get_phone_cert(phone_number: &str, push_token: &[u8], phone_signatures: &[Vec<u8>], os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
     authenticate(&format!("P:{}", phone_number), plist::to_value(&AuthPhoneNumber {
         push_token: push_token.to_vec().into(),
         sigs: phone_signatures.iter().map(|number| number.clone().into()).collect()
-    })?, "id-authenticate-phone-number").await
+    })?, "id-authenticate-phone-number", os_config).await
 }
 
 #[derive(Deserialize)]
@@ -288,8 +311,8 @@ impl IDSUser {
 
 impl IDSAppleUser {
     pub async fn authenticate(_conn: &APNSConnection, username: &str, password: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
-        let (token, user_id) = get_auth_token(username, password).await?;
-        let auth_keypair = get_auth_cert(&user_id, &token).await?;
+        let (token, user_id) = get_auth_token(username, password, os_config).await?;
+        let auth_keypair = get_auth_cert(&user_id, &token, os_config).await?;
 
         Ok(IDSUser {
             auth_keypair,
@@ -305,7 +328,7 @@ impl IDSAppleUser {
 impl IDSPhoneUser {
     pub async fn authenticate(conn: &APNSConnection, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let auth_keypair = get_phone_cert(phone_number, 
-                conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()]).await?;
+                conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()], os_config).await?;
 
         Ok(IDSUser {
             auth_keypair,

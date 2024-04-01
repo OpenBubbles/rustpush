@@ -77,6 +77,8 @@ async fn main() {
             version: "13.6.4".to_string(),
             protocol_version: 1660,
             device_id: Uuid::new_v4().to_string(),
+            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         }
     };
     fs::write("hwconfig.plist", plist_to_string(&config).unwrap()).await.unwrap();

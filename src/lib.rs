@@ -37,6 +37,9 @@ pub trait OSConfig: Sync + Send {
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError>;
     fn get_protocol_version(&self) -> u32;
     fn get_register_meta(&self) -> RegisterMeta;
+    fn get_icloud_ua(&self) -> String;
+    fn get_mme_clientinfo(&self) -> String;
+    fn get_registration_ua(&self) -> String;
 }
 
 extern crate pretty_env_logger;

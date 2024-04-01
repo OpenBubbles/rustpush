@@ -15,6 +15,8 @@ pub struct MacOSConfig {
     pub version: String,
     pub protocol_version: u32,
     pub device_id: String,
+    pub icloud_ua: String,
+    pub aoskit_version: String,
 }
 
 
@@ -50,6 +52,19 @@ impl OSConfig for MacOSConfig {
             unique_device_id: self.device_id.clone(),
         }
     }
+
+    fn get_icloud_ua(&self) -> String {
+        self.icloud_ua.clone()
+    }
+
+    fn get_mme_clientinfo(&self) -> String {
+        format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, self.aoskit_version)
+    }
+
+    fn get_registration_ua(&self) -> String {
+        format!("com.apple.invitation-registration [macOS,{},{},{},1]", self.version, self.inner.os_build_num, self.inner.product_name)
+    }
+
     fn get_activation_device(&self) -> String {
         "MacOS".to_string()
     }

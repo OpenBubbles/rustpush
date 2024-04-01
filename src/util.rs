@@ -148,6 +148,12 @@ pub fn gzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     Ok(encoder.finish().into_result()?)
 }
 
+pub fn gzip_normal(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut encoder = Encoder::new(Vec::new())?;
+    encoder.write_all(bytes)?;
+    Ok(encoder.finish().into_result()?)
+}
+
 pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoder = Decoder::new(bytes)?;
     let mut decoded_data = Vec::new();

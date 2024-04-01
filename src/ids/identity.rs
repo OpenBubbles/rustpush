@@ -3,7 +3,7 @@ use std::{io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
 
-use crate::{apns::APNSConnection, error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, OSConfig};
+use crate::{apns::APNSConnection, error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, gzip_normal, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, OSConfig};
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::{Deserialize, Serialize};
@@ -252,16 +252,19 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
         ("validation-data", Value::Data(validation_data))
     ].into_iter()));
 
-    let body = plist_to_string(&body)?;
+    let body = gzip_normal(plist_to_string(&body)?.as_bytes())?;
     let client = make_reqwest();
 
     let mut builder = client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
-        .header("x-protocol-version", os_config.get_protocol_version().to_string());
+        .header("x-protocol-version", os_config.get_protocol_version().to_string())
+        .header("user-agent", os_config.get_registration_ua())
+        .header("content-encoding", "gzip")
+        .header("accept-encoding", "gzip");
     for (idx, user) in users.iter().enumerate() {
         builder = auth_sign_req(
             builder
                 .header(format!("x-auth-user-id-{}", idx), user.user_id.clone()),
-            body.as_bytes(), 
+            &body, 
             "id-register", 
             &user.auth_keypair, 
             &conn.state, 
