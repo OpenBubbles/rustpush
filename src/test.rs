@@ -1,15 +1,13 @@
 
-use std::{io::{Cursor, Seek}, sync::Arc};
+use std::{io::Cursor, sync::Arc};
 
 use base64::engine::general_purpose;
 use log::{info, error};
-use open_abinsthe::nac::HardwareConfig;
-use openssl::ex_data::Index;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, IconChangeMessage, IndexedMessagePart, MMCSFile, MacOSConfig, Message, MessagePart, MessageParts, NormalMessage, OSConfig, PushError, RecievedMessage};
+use open_absinthe::nac::HardwareConfig;
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig, PushError, RecievedMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
-use tokio::time::{sleep, Duration};
 use serde::{Serialize, Deserialize};
 use std::io::Write;
 use base64::Engine;
@@ -31,9 +29,18 @@ pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, plist::
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
 }
 
+async fn read_input() -> String {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut username = String::new();
+    reader.read_line(&mut username).await.unwrap();
+    username
+}
+
 #[tokio::main]
 async fn main() {
     init_logger();
+
     let data: String = match fs::read_to_string("config.plist").await {
 		Ok(v) => v,
 		Err(e) => {
@@ -62,12 +69,9 @@ async fn main() {
         println!("As long as the hardware identifiers are valid rustpush will work fine.");
         println!("Validation data will not be required for subsequent re-registrations.");
         // save hardware config
-        let stdin = io::stdin();
         print!("Validation data: ");
         std::io::stdout().flush().unwrap();
-        let mut reader = BufReader::new(stdin);
-        let mut validation_data_b64 = String::new();
-        reader.read_line(&mut validation_data_b64).await.unwrap();
+        let validation_data_b64 = read_input().await;
 
         let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
         let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
@@ -96,16 +100,12 @@ async fn main() {
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {
-        let stdin = io::stdin();
         print!("Username: ");
         std::io::stdout().flush().unwrap();
-        let mut reader = BufReader::new(stdin);
-        let mut username = String::new();
-        reader.read_line(&mut username).await.unwrap();
+        let username = read_input().await;
         print!("Password: ");
         std::io::stdout().flush().unwrap();
-        let mut password = String::new();
-        reader.read_line(&mut password).await.unwrap();
+        let password = read_input().await;
 
         let mut twofa_code = "".to_string();
         loop {
@@ -145,109 +145,75 @@ async fn main() {
 
     let os_config: Arc<dyn OSConfig> = Arc::new(config);
     
-    let mut client = IMClient::new(connection.clone(), users, "cached_ids.plist".to_string(), os_config, Box::new(move |updated_keys| {
+    let client = IMClient::new(connection.clone(), users, "cached_ids.plist".to_string(), os_config, Box::new(move |updated_keys| {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
     let handle = client.get_handles().await[0].clone();
 
-    //client.validate_targets(&["mailto:testu3@icloud.com".to_string()]).await.unwrap();
-
-
-    //let mut msg = client.new_msg("ya test", &["tel:+17203818329".to_string()]);
-    //let mut msg = client.new_msg("woah test", &["mailto:jjtech@jjtech.dev".to_string()]);
-    /*let data = fs::read("upload.png").await.expect("Unable to read file");
-    let attachment = Attachment::new_mmcs(&connection, &data, "image/jpeg", "public.jpeg", "3f80ecc9-2ca9-4a77-a208-cfe3104ca27f.jpeg", 1).await.unwrap();
-    let mut msg = client.new_msg(ConversationData {
-        participants: vec!["mailto:tanay@neotia.in".to_string()],
-        cv_name: None,
-        sender_guid: Some(Uuid::new_v4().to_string())
-    }, imessage::Message::Message(NormalMessage {
-        text: "".to_string(),
-        attachments: vec![attachment],
-        body: None,
-        effect: None,
-        reply_guid: None,
-        reply_part: None
-    })).await;
-    println!("sendingrun");
-    client.send(&mut msg).await.unwrap();
-    println!("sendingdone");*/
-
-    /*println!("prepare attachment");
-    let mut data = std::fs::File::open("upload.png").unwrap();
-    let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
-    println!("upload attachment");
-    data.rewind().unwrap();
-    let attachment = MMCSFile::new(&connection, &prepared, &mut data, &mut |curr, total| {
-        println!("uploaded attachment bytes {} of {}", curr, total);
-    }).await.unwrap();
-    println!("uploaded attachment");
-    let mut msg = client.new_msg(ConversationData {
-        participants: vec!["mailto:testu3@icloud.com".to_string(), "mailto:textgpt@icloud.com".to_string()],
-        cv_name: Some("Hjiih".to_string()),
-        sender_guid: Some(Uuid::new_v4().to_string())
-    }, Message::IconChange(IconChangeMessage { file: attachment, group_version: 87 })).await;
-    println!("sendingrun");
-    client.send(&mut msg).await.unwrap();
-    println!("sendingdone");*/
-
-    /*println!("prepare attachment");
-    let mut data = std::fs::File::open("upload.png").unwrap();
-    let prepared = MMCSFile::prepare_put(&mut data).await.unwrap();
-    println!("upload attachment");
-    data.rewind().unwrap();
-    let attachment = MMCSFile::new(&connection, &prepared, &mut data, &mut |curr, total| {
-        println!("uploaded attachment bytes {} of {}", curr, total);
-    }).await.unwrap();
-    println!("uploaded attachment");*/
-    let mut msg = client.new_msg(ConversationData {
-        participants: vec!["mailto:jjtech@jjtech.dev".to_string()],
-        cv_name: None,
-        sender_guid: Some(Uuid::new_v4().to_string())
-    }, &handle, Message::Message(NormalMessage::new("hi".to_string()))).await;
-    println!("sendingrun");
-    client.send(&mut msg).await.unwrap();
-    println!("sendingdone");
 
     //sleep(Duration::from_millis(10000)).await;
+
+    let mut filter_target = String::new();
+
+    print!(">> ");
+    std::io::stdout().flush().unwrap();
     
     loop {
-        let msg = client.recieve().await;
-        if let Some(msg) = msg {
-            match msg {
-                RecievedMessage::Message { msg } => {
-                    if msg.has_payload() {
-                        println!("{}", msg);
-                        match msg.message {
-                            Message::Message(inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                client.send(&mut msg2).await.unwrap();
-                            },
-                            Message::React(inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                client.send(&mut msg2).await.unwrap();
-                            },
-                            Message::Typing => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                client.send(&mut msg2).await.unwrap();
-                            },
-                            _ => {}
+        tokio::select! {
+            msg = client.recieve_wait() => {
+                if let Some(msg) = msg {
+                    match msg {
+                        RecievedMessage::Message { msg } => {
+                            if msg.has_payload() {
+                                println!("{}", msg);
+                                match msg.message {
+                                    Message::Message(_inner) => {
+                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                        msg2.id = msg.id;
+                                        client.send(&mut msg2).await.unwrap();
+                                    },
+                                    Message::React(_inner) => {
+                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                        msg2.id = msg.id;
+                                        client.send(&mut msg2).await.unwrap();
+                                    },
+                                    Message::Typing => {
+                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                        msg2.id = msg.id;
+                                        client.send(&mut msg2).await.unwrap();
+                                    },
+                                    _ => {}
+                                }
+                            }
                         }
-                        /*if let Message::IconChange(msg) = msg.message {
-                            let mut file = std::fs::File::create("download.png").unwrap();
-                            msg.file.get_attachment(&connection, &mut file, &mut |curr, total| {
-                                //println!("downloaded attachment bytes {} of {}", curr, total);
-                            }).await.unwrap();
-                            file.flush().unwrap();
-                        }*/
                     }
                 }
-            }
+            },
+            input = read_input() => {
+                if input.trim() == "" {
+                    print!(">> ");
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
+                if input.starts_with("filter ") {
+                    filter_target = input.strip_prefix("filter ").unwrap().to_string().trim().to_string();
+                    println!("Filtering to {}", filter_target);
+                } else {
+                    if filter_target == "" {
+                        println!("Usage: filter [target]");
+                    } else {
+                        let mut msg = client.new_msg(ConversationData {
+                            participants: vec![filter_target.clone()],
+                            cv_name: None,
+                            sender_guid: Some(Uuid::new_v4().to_string())
+                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string()))).await;
+                        client.send(&mut msg).await.unwrap();
+                    }
+                }
+                print!(">> ");
+                std::io::stdout().flush().unwrap();
+            },
         }
-        sleep(Duration::from_millis(100)).await;
     }
 }
