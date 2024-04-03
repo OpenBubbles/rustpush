@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig, PushError, RecievedMessage};
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig, RecievedMessage};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -158,8 +158,12 @@ async fn main() {
 
     let mut filter_target = String::new();
 
+    let mut read_task = tokio::spawn(read_input());
+
     print!(">> ");
     std::io::stdout().flush().unwrap();
+
+    let mut received_msgs = vec![];
     
     loop {
         tokio::select! {
@@ -167,8 +171,11 @@ async fn main() {
                 if let Some(msg) = msg {
                     match msg {
                         RecievedMessage::Message { msg } => {
-                            if msg.has_payload() {
+                            if msg.has_payload() && !received_msgs.contains(&msg.id) {
+                                received_msgs.push(msg.id.clone());
                                 println!("{}", msg);
+                                print!(">> ");
+                                std::io::stdout().flush().unwrap();
                                 match msg.message {
                                     Message::Message(_inner) => {
                                         let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
@@ -192,10 +199,15 @@ async fn main() {
                     }
                 }
             },
-            input = read_input() => {
+            input = &mut read_task => {
+                let Ok(input) = input else {
+                    read_task = tokio::spawn(read_input());
+                    continue;
+                };
                 if input.trim() == "" {
                     print!(">> ");
                     std::io::stdout().flush().unwrap();
+                    read_task = tokio::spawn(read_input());
                     continue;
                 }
                 if input.starts_with("filter ") {
@@ -215,6 +227,7 @@ async fn main() {
                 }
                 print!(">> ");
                 std::io::stdout().flush().unwrap();
+                read_task = tokio::spawn(read_input());
             },
         }
     }

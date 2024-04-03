@@ -662,6 +662,7 @@ impl IMessage {
             Message::Read => false,
             Message::Delivered => false,
             Message::Typing => false,
+            Message::StopTyping => false,
             _ => true
         }
     }

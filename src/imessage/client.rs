@@ -504,9 +504,7 @@ impl IMClient {
                 staged_payloads = vec![];
             }
         }
-        println!("send_start");
         send_staged(staged_payloads).await?;
-        println!("send_end");
 
         let start = SystemTime::now();
         let since_the_epoch = start
