@@ -93,6 +93,19 @@ fn encode(encryption_key: &PKey<Private>, signing_key: &PKey<Private>) -> Vec<u8
     ].concat()
 }
 
+#[derive(Deserialize, Debug)]
+pub struct SupportAction {
+    pub url: String,
+    pub button: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SupportAlert {
+    pub title: String,
+    pub body: String,
+    pub action: Option<SupportAction>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSIdentity {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
@@ -289,6 +302,11 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
             .as_dictionary().unwrap().get("users").unwrap().as_array().unwrap();
     for user in users_array {
         let dict = user.as_dictionary().unwrap();
+        let status = dict.get("status").unwrap().as_signed_integer().unwrap();
+        if status == 6009 {
+            let status = dict.get("alert").unwrap();
+            return Err(PushError::CustomerMessage(plist::from_value(status)?))
+        }
         let cert = dict.get("cert").unwrap().as_data().unwrap();
         for uri in dict.get("uris").unwrap().as_array().unwrap() {
             if uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap() != 0 {

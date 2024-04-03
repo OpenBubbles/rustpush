@@ -5,6 +5,8 @@ use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 
+use crate::ids::identity::SupportAlert;
+
 #[derive(Error, Debug)]
 pub enum PushError {
     SSLError(#[from] ErrorStack),
@@ -16,7 +18,6 @@ pub enum PushError {
     IoError(#[from] io::Error),
     LookupFailed(u64),
     KeyError(KeyError),
-    TwoFaError,
     KeyNotFound(String),
     APNSConnectError,
     TLSError(#[from] rustls::Error),
@@ -24,6 +25,7 @@ pub enum PushError {
     AlbertCertParseError,
     #[cfg(feature = "macOS")]
     AbsintheError(#[from] AbsintheError),
+    CustomerMessage(SupportAlert),
 }
 
 impl Display for PushError {
