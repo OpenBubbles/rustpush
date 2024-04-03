@@ -1,7 +1,8 @@
 
-use std::{io::Cursor, sync::Arc};
+use std::{io::Cursor, path::PathBuf, sync::Arc};
 
 use base64::engine::general_purpose;
+use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
 use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig, PushError, RecievedMessage};
@@ -11,6 +12,7 @@ use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use std::io::Write;
 use base64::Engine;
+use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -107,27 +109,27 @@ async fn main() {
         std::io::stdout().flush().unwrap();
         let password = read_input().await;
 
-        let mut twofa_code = "".to_string();
-        loop {
-            let resp = IDSAppleUser::authenticate(&connection, username.trim(), &(password.trim().to_string() + &twofa_code), &config).await;
-            match resp {
-                Ok(user) => {
-                    break vec![user]
-                }
-                Err(PushError::TwoFaError) => {
-                    print!("2fa code: ");
-                    std::io::stdout().flush().unwrap();
-                    let stdin = io::stdin();
-                    let mut reader = BufReader::new(stdin);
-                    let mut code = String::new();
-                    reader.read_line(&mut code).await.unwrap();
-                    twofa_code = code.trim().to_string();
-                }
-                Err(err) => {
-                    panic!("{:?}", err);
-                }
-            }
-        }
+        let user_trimmed = username.trim().to_string();
+        let pw_trimmed = password.trim().to_string();
+
+        let user_two = user_trimmed.clone();
+        let appleid_closure = move || (user_two.clone(), pw_trimmed.clone());
+        // ask console for 2fa code, make sure it is only 6 digits, no extra characters
+        let tfa_closure = || {
+            println!("Enter 2FA code: ");
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            input.trim().to_string()
+        };
+        let acc = AppleAccount::login(appleid_closure, tfa_closure, AnisetteConfiguration::new()
+            .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
+
+        let account = acc.unwrap();
+        let pet = account.get_pet();
+
+        let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, &config).await.unwrap();
+
+        vec![user]
     };
 
     if users[0].identity.is_none() {

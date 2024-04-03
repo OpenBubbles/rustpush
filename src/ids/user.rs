@@ -48,13 +48,10 @@ async fn attempt_auth(username: &str, pet: &str, os_config: &dyn OSConfig) -> Re
     Ok(response)
 }
 
-async fn get_auth_token(username: &str, password: &str, os_config: &dyn OSConfig) -> Result<(String, String), PushError> {
-    let result = attempt_auth(username, password, os_config).await?;
+async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<(String, String), PushError> {
+    let result = attempt_auth(username, pet, os_config).await?;
     // attempt 2fa
     let result_dict = result.as_dictionary().unwrap();
-    if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() == 5000 {
-        return Err(PushError::TwoFaError)
-    }
     if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
         return Err(PushError::AuthError(result.clone()));
     }
@@ -310,8 +307,8 @@ impl IDSUser {
 }
 
 impl IDSAppleUser {
-    pub async fn authenticate(_conn: &APNSConnection, username: &str, password: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
-        let (token, user_id) = get_auth_token(username, password, os_config).await?;
+    pub async fn authenticate(_conn: &APNSConnection, username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+        let (token, user_id) = get_auth_token(username, pet, os_config).await?;
         let auth_keypair = get_auth_cert(&user_id, &token, os_config).await?;
 
         Ok(IDSUser {

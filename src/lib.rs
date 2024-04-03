@@ -17,7 +17,7 @@ pub mod mmcsp {
 use albert::ActivationInfo;
 pub use apns::{APNSState, APNSConnection};
 use async_trait::async_trait;
-pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::register};
+pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};
 pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::client::{IMClient, RecievedMessage};
 pub use error::PushError;
