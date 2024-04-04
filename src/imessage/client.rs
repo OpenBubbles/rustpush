@@ -2,14 +2,14 @@
 use std::{collections::HashMap, fs, io::Cursor, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
-use openssl::{pkey::PKey, sign::Signer, hash::MessageDigest, encrypt::{Encrypter, Decrypter}, symm::{Cipher, encrypt, decrypt}, rsa::Padding, sha::sha1};
+use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{plist_to_bin, plist_to_string}, OSConfig};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{plist_to_bin, plist_to_string, bin_serialize, bin_deserialize_sha}, OSConfig};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -34,24 +34,58 @@ struct CachedKeys {
     at_ms: u64
 }
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct CachedHandle {
+    keys: HashMap<String, CachedKeys>,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize_sha")]
+    env_hash: [u8; 20],
+}
+
+impl CachedHandle {
+    // hash key factors
+    fn verity(&mut self, conn: &APNSConnection, user: &IDSUser) {
+        let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
+        env.update(&user.identity.as_ref().unwrap().id_keypair.as_ref().unwrap().cert).unwrap();
+        env.update(&conn.state.token.as_ref().unwrap()).unwrap();
+        let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
+        if hash != self.env_hash {
+            // invalidate cache
+            self.env_hash = hash;
+            self.keys.clear();
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 struct KeyCache {
-    cache: HashMap<String, HashMap<String, CachedKeys>>,
+    cache: HashMap<String, CachedHandle>,
     #[serde(skip)]
     cache_location: String,
 }
 
 impl KeyCache {
-    fn new(path: String) -> KeyCache {
+    fn new(path: String, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
+                loaded.verity(conn, users);
                 return loaded
             }
         }
-        KeyCache {
+        let mut cache = KeyCache {
             cache: HashMap::new(),
-            cache_location: path
+            cache_location: path,
+        };
+        cache.verity(conn, users);
+        cache
+    }
+
+    // verify integrity
+    fn verity(&mut self, conn: &APNSConnection, users: &[IDSUser]) {
+        for user in users {
+            for handle in &user.handles {
+                self.cache.entry(handle.clone()).or_default().verity(conn, user);
+            }
         }
     }
 
@@ -61,8 +95,10 @@ impl KeyCache {
     }
 
     fn invalidate(&mut self, handle: &str, keys_for: &str) {
-        let handle_cache = self.cache.get_mut(handle).unwrap();
-        handle_cache.remove(keys_for);
+        let Some(handle_cache) = self.cache.get_mut(handle) else {
+            panic!("No handle cache for handle {}!", handle);
+        };
+        handle_cache.keys.remove(keys_for);
         self.save();
     }
     
@@ -70,7 +106,7 @@ impl KeyCache {
         let Some(handle_cache) = self.cache.get(handle) else {
             return None
         };
-        let Some(cached) = handle_cache.get(keys_for) else {
+        let Some(cached) = handle_cache.keys.get(keys_for) else {
             return None
         };
         let ms_now = SystemTime::now()
@@ -85,14 +121,13 @@ impl KeyCache {
     }
 
     fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSIdentityResult>) {
-        if !self.cache.contains_key(handle) {
-            self.cache.insert(handle.to_string(), HashMap::new());
-        }
-        let handle_cache = self.cache.get_mut(handle).unwrap();
+        let Some(handle_cache) = self.cache.get_mut(handle) else {
+            panic!("No handle cache for handle {}!", handle);
+        };
         let ms_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards").as_millis();
-        handle_cache.insert(keys_for.to_string(), CachedKeys {
+        handle_cache.keys.insert(keys_for.to_string(), CachedKeys {
             keys,
             at_ms: ms_now as u64
         });
@@ -103,14 +138,14 @@ impl KeyCache {
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub users: Arc<RwLock<Vec<IDSUser>>>,
-    key_cache: Mutex<KeyCache>,
+    key_cache: Arc<Mutex<KeyCache>>,
     raw_inbound: Mutex<Receiver<APNSPayload>>
 }
 
 impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: String, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         let client = IMClient {
-            key_cache: Mutex::new(KeyCache::new(cache_path)),
+            key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users))),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
                     return false
@@ -129,12 +164,12 @@ impl IMClient {
             conn,
             users: Arc::new(RwLock::new(users)),
         };
-        Self::schedule_ids_rereg(client.conn.clone(), client.users.clone(), os_config, 0, keys_updated).await;
+        Self::schedule_ids_rereg(client.conn.clone(), client.users.clone(), client.key_cache.clone(), os_config, 0, keys_updated).await;
         client
     }
 
     #[async_recursion]
-    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>, users_ref: Arc<RwLock<Vec<IDSUser>>>, os_config: Arc<dyn OSConfig>, mut retry_count: u8, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) {
+    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>, users_ref: Arc<RwLock<Vec<IDSUser>>>, key_cache_ref: Arc<Mutex<KeyCache>>, os_config: Arc<dyn OSConfig>, mut retry_count: u8, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) {
         let users_lock = users_ref.read().await;
         if users_lock.len() == 0 {
             return
@@ -161,11 +196,12 @@ impl IMClient {
                 }
             } else {
                 retry_count = 0;
+                key_cache_ref.lock().await.verity(&conn_ref, &users_lock);
                 keys_updated(users_lock.clone());
                 info!("Successfully reregistered!");
             }
             drop(users_lock);
-            Self::schedule_ids_rereg(conn_ref, users_ref, os_config, retry_count, keys_updated).await;
+            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated).await;
         });
     }
 

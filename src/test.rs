@@ -125,7 +125,7 @@ async fn main() {
             .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
 
         let account = acc.unwrap();
-        let pet = account.get_pet();
+        let pet = account.get_pet().unwrap();
 
         let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, &config).await.unwrap();
 

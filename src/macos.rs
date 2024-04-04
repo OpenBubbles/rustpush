@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{albert::ActivationInfo, util::{make_reqwest, plist_to_buf}, OSConfig, PushError, RegisterMeta};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
     pub inner: HardwareConfig,
 

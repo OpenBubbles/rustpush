@@ -79,7 +79,7 @@ where
     Rsa::public_key_from_der(s.as_ref()).map_err(Error::custom)
 }
 
-pub fn bin_serialize<S>(x: &Vec<u8>, s: S) -> Result<S::Ok, S::Error>
+pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
@@ -92,6 +92,15 @@ where
 {
     let s: Data = Deserialize::deserialize(d)?;
     Ok(s.into())
+}
+
+pub fn bin_deserialize_sha<'de, D>(d: D) -> Result<[u8; 20], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Data = Deserialize::deserialize(d)?;
+    let vec: Vec<u8> = s.into();
+    Ok(vec.try_into().unwrap())
 }
 
 pub fn bin_serialize_opt<S>(x: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
