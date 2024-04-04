@@ -147,7 +147,7 @@ async fn main() {
 
     let os_config: Arc<dyn OSConfig> = Arc::new(config);
     
-    let client = IMClient::new(connection.clone(), users, "cached_ids.plist".to_string(), os_config, Box::new(move |updated_keys| {
+    let client = IMClient::new(connection.clone(), users, "id_cache.plist".into(), os_config, Box::new(move |updated_keys| {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;

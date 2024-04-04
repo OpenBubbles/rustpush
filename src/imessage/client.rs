@@ -1,5 +1,5 @@
 
-use std::{collections::HashMap, fs, io::Cursor, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::HashMap, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
@@ -60,11 +60,11 @@ impl CachedHandle {
 struct KeyCache {
     cache: HashMap<String, CachedHandle>,
     #[serde(skip)]
-    cache_location: String,
+    cache_location: PathBuf,
 }
 
 impl KeyCache {
-    fn new(path: String, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
+    fn new(path: PathBuf, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
@@ -143,7 +143,7 @@ pub struct IMClient {
 }
 
 impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: String, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+    pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         let client = IMClient {
             key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users))),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
