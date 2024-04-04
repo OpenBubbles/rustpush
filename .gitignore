@@ -3,6 +3,6 @@
 /config.plist
 /out
 /jniLibs
-/cached_ids.plist
+/id_cache.plist
 /hwconfig.plist
 /anisette_test
