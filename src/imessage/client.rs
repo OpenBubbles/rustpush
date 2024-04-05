@@ -139,11 +139,15 @@ pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub users: Arc<RwLock<Vec<IDSUser>>>,
     key_cache: Arc<Mutex<KeyCache>>,
-    raw_inbound: Mutex<Receiver<APNSPayload>>
+    raw_inbound: Mutex<Receiver<APNSPayload>>,
+    rereg_signal: Mutex<flume::Sender<()>>,
+    rereg_success: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl IMClient {
     pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+        let (rereg_signal, recieve) = flume::bounded(0);
+        let (rereg_finish, recv_finish) = tokio::sync::broadcast::channel(1);
         let client = IMClient {
             key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users))),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
@@ -163,13 +167,28 @@ impl IMClient {
             }).await),
             conn,
             users: Arc::new(RwLock::new(users)),
+            rereg_signal: Mutex::new(rereg_signal),
+            rereg_success: recv_finish,
         };
-        Self::schedule_ids_rereg(client.conn.clone(), client.users.clone(), client.key_cache.clone(), os_config, 0, keys_updated).await;
+        Self::schedule_ids_rereg(client.conn.clone(), 
+            client.users.clone(), 
+            client.key_cache.clone(), 
+            os_config, 
+            0, keys_updated, 
+            recieve,
+            rereg_finish).await;
         client
     }
 
     #[async_recursion]
-    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>, users_ref: Arc<RwLock<Vec<IDSUser>>>, key_cache_ref: Arc<Mutex<KeyCache>>, os_config: Arc<dyn OSConfig>, mut retry_count: u8, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) {
+    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>,
+            users_ref: Arc<RwLock<Vec<IDSUser>>>,
+            key_cache_ref: Arc<Mutex<KeyCache>>,
+            os_config: Arc<dyn OSConfig>,
+            mut retry_count: u8,
+            mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>,
+            rereg_signal: flume::Receiver<()>,
+            rereg_finished: tokio::sync::broadcast::Sender<()>) {
         let users_lock = users_ref.read().await;
         if users_lock.len() == 0 {
             return
@@ -182,8 +201,10 @@ impl IMClient {
         tokio::spawn(async move {
             info!("Reregistering {:?} in {} seconds", next_rereg, next_rereg_in);
             if next_rereg_in > 0 {
-                sleep(Duration::from_secs(next_rereg_in as u64)).await;
+                // wait until expiry, or until someone requests a reregister
+                let _ = tokio::time::timeout(Duration::from_secs(next_rereg_in as u64), rereg_signal.recv_async()).await;
             }
+            let _ = rereg_signal.try_recv(); // clear any pending reregs
             info!("Reregistering {:?} now!", next_rereg);
             let mut users_lock = users_ref.write().await;
             let user = users_lock.iter_mut().find(|user| user.handles == next_rereg).unwrap();
@@ -198,10 +219,11 @@ impl IMClient {
                 retry_count = 0;
                 key_cache_ref.lock().await.verity(&conn_ref, &users_lock);
                 keys_updated(users_lock.clone());
+                rereg_finished.send(()).unwrap();
                 info!("Successfully reregistered!");
             }
             drop(users_lock);
-            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated).await;
+            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated, rereg_signal, rereg_finished).await;
         });
     }
 
@@ -372,6 +394,17 @@ impl IMClient {
         })
     }
 
+    async fn reregister(&self) {
+        // first one who gets here drives the reregister process
+        if let Ok(channel) = self.rereg_signal.try_lock() {
+            channel.send_async(()).await.unwrap();
+            self.rereg_success.resubscribe().recv().await.unwrap();
+        } else {
+            self.rereg_success.resubscribe().recv().await.unwrap();
+        }
+    }
+
+    #[async_recursion]
     pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool) -> Result<(), PushError> {
         // find participants whose keys need to be fetched
         let key_cache = self.key_cache.lock().await;
@@ -386,7 +419,19 @@ impl IMClient {
         }
         drop(key_cache);
         let users = self.users.read().await;
-        let results = Self::user_by_handle(&users, handle).lookup(&self.conn, fetch).await?;
+        let results = match Self::user_by_handle(&users, handle).lookup(&self.conn, fetch).await {
+            Ok(results) => results,
+            Err(err) => {
+                if let PushError::LookupFailed(6005) = err {
+                    warn!("IDS returned 6005; attempting to re-register");
+                    drop(users); // release mutex
+                    self.reregister().await;
+                    return self.cache_keys(participants, handle, refresh).await;
+                } else {
+                    return Err(err)
+                }
+            }
+        };
         let mut key_cache = self.key_cache.lock().await;
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
