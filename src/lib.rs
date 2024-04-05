@@ -23,6 +23,8 @@ pub use imessage::client::{IMClient, RecievedMessage};
 pub use error::PushError;
 #[cfg(feature = "macOS")]
 pub use macos::MacOSConfig;
+#[cfg(feature = "macOS")]
+pub use open_absinthe::nac::HardwareConfig;
 
 pub struct RegisterMeta {
     pub hardware_version: String,
@@ -47,6 +49,10 @@ extern crate log;
 
 //not sure if this can be called outside of this library and still have it work
 pub fn init_logger() {
+    // default WARN level
+    if let Err(_) = std::env::var("RUST_LOG") {
+        std::env::set_var("RUST_LOG", "warn");
+    }
     let res = pretty_env_logger::try_init();
     if res.is_err() {
         println!("{}", res.unwrap_err())
