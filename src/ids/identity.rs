@@ -1,4 +1,4 @@
-use std::{io::Cursor, time::{SystemTime, UNIX_EPOCH}};
+use std::{fmt::Display, io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
@@ -104,6 +104,17 @@ pub struct SupportAlert {
     pub title: String,
     pub body: String,
     pub action: Option<SupportAction>,
+}
+
+impl Display for SupportAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.title)?;
+        write!(f, "{}", self.body)?;
+        if let Some(action) = self.action.as_ref() {
+            write!(f, "\n\n{}", action.url)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]

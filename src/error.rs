@@ -9,27 +9,37 @@ use crate::ids::identity::SupportAlert;
 
 #[derive(Error, Debug)]
 pub enum PushError {
+    #[error("Cryptography error: {0}")]
     SSLError(#[from] ErrorStack),
+    #[error("Plist parsing error: {0}")]
     PlistError(#[from] plist::Error),
+    #[error("HTTP error: {0}")]
     RequestError(#[from] reqwest::Error),
+    #[error("Authentication error error: {0:?}")]
     AuthError(plist::Value),
+    #[error("Authentication establishment error {0:?}")]
     CertError(plist::Dictionary),
+    #[error("Error registering with IDS: {0}")]
     RegisterFailed(u64),
+    #[error("IO error: {0}")]
     IoError(#[from] io::Error),
+    #[error("IDS Lookup failed {0}")]
     LookupFailed(u64),
+    #[error("AES key error: {0:?}")]
     KeyError(KeyError),
+    #[error("IDS key missing for {0}")]
     KeyNotFound(String),
+    #[error("Failed to connect to APNs")]
     APNSConnectError,
+    #[error("TLS error {0}")]
     TLSError(#[from] rustls::Error),
+    #[error("Response error {0}")]
     StatusError(reqwest::StatusCode /* code */),
+    #[error("Failed to parse Albert Cert")]
     AlbertCertParseError,
     #[cfg(feature = "macOS")]
+    #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
+    #[error("{0}")]
     CustomerMessage(SupportAlert),
-}
-
-impl Display for PushError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", format!("{:?}", self))
-    }
 }
