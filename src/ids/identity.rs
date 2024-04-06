@@ -93,12 +93,14 @@ fn encode(encryption_key: &PKey<Private>, signing_key: &PKey<Private>) -> Vec<u8
     ].concat()
 }
 
+#[repr(C)]
 #[derive(Deserialize, Debug)]
 pub struct SupportAction {
     pub url: String,
     pub button: String,
 }
 
+#[repr(C)]
 #[derive(Deserialize, Debug)]
 pub struct SupportAlert {
     pub title: String,
@@ -149,7 +151,7 @@ impl IDSIdentity {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
 
-        let unix = Asn1Time::from_unix(since_the_epoch.as_secs() as i64)?.as_ref().diff(expiration)?;
+        let unix = Asn1Time::from_unix(since_the_epoch.as_secs().try_into().unwrap())?.as_ref().diff(expiration)?;
         Ok((unix.days as i64) * 86400 + (unix.secs as i64))
     }
 

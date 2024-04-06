@@ -365,6 +365,10 @@ impl IMClient {
             let mut cache_lock = self.key_cache.lock().await;
             let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
             let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+            if self.get_handles().await.contains(&source.to_string()) && source == target {
+                info!("Re-registering due to new handles");
+                self.reregister().await;
+            }
             cache_lock.invalidate(source, target);
             return None
         }
