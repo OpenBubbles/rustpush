@@ -42,4 +42,8 @@ pub enum PushError {
     AbsintheError(#[from] AbsintheError),
     #[error("{0}")]
     CustomerMessage(SupportAlert),
+    #[error("Send timeout")]
+    SendTimedOut,
+    #[error("Send error {0}")]
+    SendErr(i64),
 }

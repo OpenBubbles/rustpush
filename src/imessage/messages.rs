@@ -675,7 +675,7 @@ impl IMessage {
         }
     }
 
-    pub(super) fn to_raw(&mut self) -> Vec<u8> {
+    pub(super) fn to_raw(&self) -> Vec<u8> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {

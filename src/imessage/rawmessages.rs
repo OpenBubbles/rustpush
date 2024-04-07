@@ -154,7 +154,7 @@ struct RawIMessage {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub(super) struct BundledPayload {
     #[serde(rename = "tP")]
     pub(super) participant: String,

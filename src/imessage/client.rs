@@ -1,15 +1,18 @@
 
-use std::{collections::HashMap, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
+use flume::RecvError;
 use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
+use plist::Data;
+use regex::bytes;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{plist_to_bin, plist_to_string, bin_serialize, bin_deserialize_sha}, OSConfig};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -202,7 +205,10 @@ impl IMClient {
             info!("Reregistering {:?} in {} seconds", next_rereg, next_rereg_in);
             if next_rereg_in > 0 {
                 // wait until expiry, or until someone requests a reregister
-                let _ = tokio::time::timeout(Duration::from_secs(next_rereg_in as u64), rereg_signal.recv_async()).await;
+                if let Ok(Err(RecvError::Disconnected)) = tokio::time::timeout(Duration::from_secs(next_rereg_in as u64), rereg_signal.recv_async()).await {
+                    // do not reregister on crashes :P
+                    return
+                }
             }
             let _ = rereg_signal.try_recv(); // clear any pending reregs
             info!("Reregistering {:?} now!", next_rereg);
@@ -328,10 +334,11 @@ impl IMClient {
         if get_c == 101 || get_c == 102 || ex == Some(0) {
             let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
             let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
+            debug!("recv {load:?}");
             return Some(RecievedMessage::Message {
                 msg: IMessage {
                     id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
-                    sender: None,
+                    sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
                     after_guid: None,
                     conversation: if ex == Some(0) {
                         // typing
@@ -408,6 +415,7 @@ impl IMClient {
         }
     }
 
+    // keyCache and users must be unlocked
     #[async_recursion]
     pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool) -> Result<(), PushError> {
         // find participants whose keys need to be fetched
@@ -522,6 +530,18 @@ impl IMClient {
 
     pub async fn send(&self, message: &mut IMessage) -> Result<(), PushError> {
         message.sanity_check_send();
+
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        message.sent_timestamp = since_the_epoch.as_millis() as u64;
+        
+        self.send_payloads(&message, &message.conversation.as_ref().unwrap().participants, 0).await
+    }
+
+    #[async_recursion]
+    async fn send_payloads(&self, message: &IMessage, with_participants: &[String], retry_count: u8) -> Result<(), PushError> {
         let sender = message.sender.as_ref().unwrap().to_string();
         self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), &sender, false).await?;
         let raw = if message.has_payload() { message.to_raw() } else { vec![] };
@@ -529,7 +549,8 @@ impl IMClient {
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
         let key_cache = self.key_cache.lock().await;
-        for participant in &message.conversation.as_ref().unwrap().participants {
+        for participant in with_participants {
+            debug!("sending to participant {}", participant);
             for token in key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
                 if &token.push_token == self.conn.state.token.as_ref().unwrap() {
                     // don't send to ourself
@@ -542,6 +563,8 @@ impl IMClient {
                     None
                 };
 
+                debug!("sending to token {}", base64_encode(&token.push_token));
+
                 payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
                     participant: participant.clone(),
                     not_me: participant != message.sender.as_ref().unwrap(),
@@ -552,8 +575,64 @@ impl IMClient {
             }
         }
         drop(key_cache);
+
         let msg_id = rand::thread_rng().gen::<[u8; 4]>();
-        debug!("sending {:?}", message.message.to_string());
+
+        let bytes_id = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
+
+        let my_reader = self.conn.clone();
+        let payloads_cnt = payloads.len();
+        let bytes_id_1 = bytes_id.clone();
+
+        // spawn task so it's waiting before we even send our message
+        let check_task = if message.message.get_nr() != Some(true) {
+            let mut confirm_reciever = my_reader.reader.register_for(move |pay| {
+                if pay.id != 0x0A {
+                    return false
+                }
+                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) {
+                    return false
+                }
+                let Some(body) = pay.get_field(3) else {
+                    return false
+                };
+                let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
+                let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
+                if get_c == 255 {
+                    // make sure it's my message
+                    let get_u = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
+                    get_u == bytes_id_1
+                } else {
+                    false
+                }
+            }).await;
+
+            Some(tokio::spawn(async move {
+                let mut refresh_tokens: Vec<Vec<u8>> = vec![];
+                info!("payload {payloads_cnt}");
+                for _i in 0..payloads_cnt {
+                    let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(15), confirm_reciever.recv()).await else {
+                        error!("timeout with {_i}");
+                        return Err(PushError::SendTimedOut)
+                    };
+                    debug!("taken {:?}", msg);
+                    let payload = msg.expect("APN service was dropped??");
+                    let body = payload.get_field(3).unwrap();
+                    let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
+                    let s = load.as_dictionary().unwrap().get("s").unwrap().as_signed_integer().unwrap();
+                    if s == 5032 {
+                        info!("got 5032, refreshing keys!");
+                        let t = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap();
+                        refresh_tokens.push(t.to_vec())
+                    } else if s != 0 {
+                        return Err(PushError::SendErr(s))
+                    }
+                }
+                Ok(refresh_tokens)
+            }))
+        } else {
+            None
+        };
 
         // chunk payloads together, but if they get too big split them up into mulitple messages.
         // When sending attachments, APNs gets mad at us if we send too much at the same time.
@@ -568,7 +647,7 @@ impl IMClient {
                     ua: "[macOS,13.4.1,22F82,MacBookPro18,3]".to_string(),
                     v: 8,
                     i: u32::from_be_bytes(msg_id),
-                    u: Uuid::from_str(&message.id).unwrap().as_bytes().to_vec().into(),
+                    u: bytes_id.clone().into(),
                     dtl: send,
                     sp: message.sender.clone().unwrap(),
                     ex: message.get_ex(),
@@ -580,8 +659,8 @@ impl IMClient {
             }
         };
 
-        for payload in payloads {
-            staged_payloads.push(payload.1);
+        for payload in &payloads {
+            staged_payloads.push(payload.1.clone());
             staged_size += payload.0;
             if staged_size > PAYLOADS_MAX_SIZE {
                 staged_size = 0;
@@ -591,11 +670,33 @@ impl IMClient {
         }
         send_staged(staged_payloads).await?;
 
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        message.sent_timestamp = since_the_epoch.as_millis() as u64;
+        if let Some(check_task) = check_task {
+            let needs_refresh = check_task.await.unwrap()?;
+            let sender = message.sender.as_ref().unwrap().to_string();
+            let mut key_cache = self.key_cache.lock().await;
+            let refresh_msg: HashSet<_> = payloads.into_iter().filter_map(|i| {
+                let found = needs_refresh.contains(&i.1.token.as_ref().into());
+                if found {
+                    // invalidate keys
+                    key_cache.invalidate(&sender, &i.1.participant);
+                    Some(i.1.participant)
+                } else {
+                    None
+                }
+            }).collect();
+            drop(key_cache);
+            
+            if refresh_msg.len() > 0 {
+                if retry_count == 0 {
+                    let refresh_msg = refresh_msg.into_iter().collect::<Vec<_>>();
+                    warn!("retrying sending after invalidation to {refresh_msg:?}!");
+                    self.send_payloads(message, &refresh_msg, retry_count + 1).await?;
+                } else {
+                    info!("retried once, still bad, bailing!");
+                    return Err(PushError::SendErr(5032))
+                }
+            }
+        }
 
         Ok(())
     }
