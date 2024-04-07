@@ -206,25 +206,35 @@ impl APNSReader {
             
             //debug!("Recieved payload {:?}", payload);
             let mut locked = self.0.lock().await;
-            let remove_idxs: Vec<usize> = locked.iter().enumerate().filter_map(|(i, item)| {
-                if (item.waiting_for)(&payload) {
-                    Some(i)
-                } else {
-                    None
+
+            // garbage collect old senders
+            locked.retain(|sender| {
+                !match &sender.when {
+                    WaitingCb::OneShot(cb) => cb.is_closed(),
+                    WaitingCb::Cont(cb) => cb.is_closed()
                 }
-            }).collect();
-            for idx in remove_idxs.iter().rev() {
-                match &locked.get(*idx).unwrap().when {
+            });
+            
+            let mut remove_idxs = vec![]; // will be sorted in order
+            for (idx, item) in locked.iter_mut().enumerate() {
+                if !(item.waiting_for)(&payload) {
+                    continue;
+                }
+                match &item.when {
                     WaitingCb::OneShot(_cb) => {
-                        let WaitingCb::OneShot(cb) = locked.remove(*idx).when else {
-                            panic!("no")
-                        };
-                        cb.send(payload.clone()).unwrap();
+                        remove_idxs.push(idx);
                     },
                     WaitingCb::Cont(cb) => {
                         cb.send(payload.clone()).await.unwrap();
                     }
                 }
+            }
+            for (elapsed, idx_to_remove) in remove_idxs.into_iter().enumerate() {
+                // account for shift as removing elements
+                let WaitingCb::OneShot(cb) = locked.remove(idx_to_remove - elapsed).when else {
+                    panic!("no")
+                };
+                cb.send(payload.clone()).unwrap();
             }
         }
     }
@@ -331,6 +341,7 @@ impl APNSConnection {
 
     pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
         self.submitter.send_message(topic, payload, id).await?;
+        // wait for ack
         let msg = self.reader.wait_find(0x0B).await;
         if msg.get_field(8).unwrap()[0] != 0x0 {
             panic!("Failed to send message");
