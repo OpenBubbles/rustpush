@@ -13,6 +13,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::{Write, Read};
 use std::fmt::Write as FmtWrite;
 
+// make reqwest using system roots
+pub fn make_reqwest_system() -> Client {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .unwrap()
+}
+
 pub fn make_reqwest() -> Client {
     let certificates = vec![
         Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),

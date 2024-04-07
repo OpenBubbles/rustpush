@@ -529,7 +529,16 @@ impl IMClient {
             .expect("Time went backwards");
         message.sent_timestamp = since_the_epoch.as_millis() as u64;
         
-        self.send_payloads(&message, &message.conversation.as_ref().unwrap().participants, 0).await
+        let handles = self.get_handles().await;
+        let mut target_participants = message.conversation.as_ref().unwrap().participants.clone();
+        if let Message::Delivered = message.message {
+            // do not send delivery reciepts to other devices on same acct
+            target_participants.retain(|p| {
+                !handles.contains(p)
+            });
+        }
+
+        self.send_payloads(&message, &target_participants, 0).await
     }
 
     #[async_recursion]
@@ -616,7 +625,7 @@ impl IMClient {
                         info!("got 5032, refreshing keys!");
                         let t = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap();
                         refresh_tokens.push(t.to_vec())
-                    } else if s != 0 {
+                    } else if s != 0 && s != 5008 {
                         return Err(PushError::SendErr(s))
                     }
                 }
