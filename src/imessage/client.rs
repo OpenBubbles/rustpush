@@ -21,14 +21,6 @@ const NORMAL_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
 ];
 
-// a recieved message, for now just an iMessage
-#[repr(C)]
-pub enum RecievedMessage {
-    Message {
-        msg: IMessage
-    }
-}
-
 const KEY_REFRESH_MS: u64 = 86400 * 1000; // one day
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -306,25 +298,29 @@ impl IMClient {
         Ok(decrypted_sym)
     }
 
-    pub async fn recieve(&self) -> Option<RecievedMessage> {
+    pub async fn recieve(&self) -> Option<IMessage> {
         let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
             return None
         };
-        self.recieve_payload(payload).await
+        let recieved = self.recieve_payload(payload).await;
+        if let Some(recieved) = &recieved { info!("recieved {recieved}"); }
+        recieved
     }
 
-    pub async fn recieve_wait(&self) -> Option<RecievedMessage> {
+    pub async fn recieve_wait(&self) -> Option<IMessage> {
         let Some(payload) = self.raw_inbound.lock().await.recv().await else {
             return None
         };
-        self.recieve_payload(payload).await
+        let recieved = self.recieve_payload(payload).await;
+        if let Some(recieved) = &recieved { info!("recieved {recieved}"); }
+        recieved
     }
 
     fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
         users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
-    async fn recieve_payload(&self, payload: APNSPayload) -> Option<RecievedMessage> {
+    async fn recieve_payload(&self, payload: APNSPayload) -> Option<IMessage> {
         let body = payload.get_field(3).unwrap();
 
         let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
@@ -335,36 +331,34 @@ impl IMClient {
             let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
             let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
             debug!("recv {load:?}");
-            return Some(RecievedMessage::Message {
-                msg: IMessage {
-                    id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
-                    sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
-                    after_guid: None,
-                    conversation: if ex == Some(0) {
-                        // typing
-                        let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
-                        let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
-                        Some(ConversationData {
-                            participants: vec![source.to_string(), target.to_string()],
-                            cv_name: None,
-                            sender_guid: None
-                        })
+            return Some(IMessage {
+                id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
+                sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
+                after_guid: None,
+                conversation: if ex == Some(0) {
+                    // typing
+                    let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
+                    let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+                    Some(ConversationData {
+                        participants: vec![source.to_string(), target.to_string()],
+                        cv_name: None,
+                        sender_guid: None
+                    })
+                } else {
+                    None
+                },
+                message: if ex == Some(0) {
+                    if has_p {
+                        Message::StopTyping
                     } else {
-                        None
-                    },
-                    message: if ex == Some(0) {
-                        if has_p {
-                            Message::StopTyping
-                        } else {
-                            Message::Typing
-                        }
-                    } else if get_c == 101 {
-                        Message::Delivered
-                    } else {
-                        Message::Read
-                    },
-                    sent_timestamp: time_recv / 1000000
-                }
+                        Message::Typing
+                    }
+                } else if get_c == 101 {
+                    Message::Delivered
+                } else {
+                    Message::Read
+                },
+                sent_timestamp: time_recv / 1000000
             })
         }
 
@@ -400,9 +394,7 @@ impl IMClient {
 
         let decrypted = self.decrypt(identity, &payload).await.unwrap();
         
-        IMessage::from_raw(&decrypted, &loaded).map(|msg| RecievedMessage::Message {
-            msg
-        })
+        IMessage::from_raw(&decrypted, &loaded)
     }
 
     async fn reregister(&self) {

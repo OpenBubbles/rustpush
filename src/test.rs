@@ -1,11 +1,11 @@
 
-use std::{io::Cursor, path::PathBuf, sync::Arc};
+use std::{io::Cursor, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
 
 use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig, RecievedMessage};
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -137,8 +137,6 @@ async fn main() {
         register(&config, &mut users, &connection).await.unwrap();
     }
 
-    println!("registration expires at {}", users[0].identity.as_ref().unwrap().get_exp().unwrap());
-
     let mut state = SavedState {
         push: connection.state.clone(),
         users: users.clone()
@@ -169,32 +167,28 @@ async fn main() {
         tokio::select! {
             msg = client.recieve_wait() => {
                 if let Some(msg) = msg {
-                    match msg {
-                        RecievedMessage::Message { msg } => {
-                            if msg.has_payload() && !received_msgs.contains(&msg.id) {
-                                received_msgs.push(msg.id.clone());
-                                println!("{}", msg);
-                                print!(">> ");
-                                std::io::stdout().flush().unwrap();
-                                match msg.message {
-                                    Message::Message(_inner) => {
-                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                        msg2.id = msg.id;
-                                        client.send(&mut msg2).await.unwrap();
-                                    },
-                                    Message::React(_inner) => {
-                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                        msg2.id = msg.id;
-                                        client.send(&mut msg2).await.unwrap();
-                                    },
-                                    Message::Typing => {
-                                        let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                        msg2.id = msg.id;
-                                        client.send(&mut msg2).await.unwrap();
-                                    },
-                                    _ => {}
-                                }
-                            }
+                    if msg.has_payload() && !received_msgs.contains(&msg.id) {
+                        received_msgs.push(msg.id.clone());
+                        println!("{}", msg);
+                        print!(">> ");
+                        std::io::stdout().flush().unwrap();
+                        match msg.message {
+                            Message::Message(_inner) => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            Message::React(_inner) => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            Message::Typing => {
+                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                msg2.id = msg.id;
+                                client.send(&mut msg2).await.unwrap();
+                            },
+                            _ => {}
                         }
                     }
                 }
