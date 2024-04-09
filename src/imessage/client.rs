@@ -130,6 +130,15 @@ impl KeyCache {
     }
 }
 
+pub enum RegisterState {
+    Registered,
+    Registering,
+    Failed {
+        retry_wait: u64,
+        error: PushError
+    }
+}
+
 pub struct IMClient {
     pub conn: Arc<APNSConnection>,
     pub users: Arc<RwLock<Vec<IDSUser>>>,
@@ -137,6 +146,7 @@ pub struct IMClient {
     raw_inbound: Mutex<Receiver<APNSPayload>>,
     rereg_signal: Mutex<flume::Sender<()>>,
     rereg_success: tokio::sync::broadcast::Receiver<()>,
+    register_state: Arc<Mutex<RegisterState>>,
 }
 
 impl IMClient {
@@ -164,6 +174,7 @@ impl IMClient {
             users: Arc::new(RwLock::new(users)),
             rereg_signal: Mutex::new(rereg_signal),
             rereg_success: recv_finish,
+            register_state: Arc::new(Mutex::new(RegisterState::Registered))
         };
         Self::schedule_ids_rereg(client.conn.clone(), 
             client.users.clone(), 
@@ -171,7 +182,8 @@ impl IMClient {
             os_config, 
             0, keys_updated, 
             recieve,
-            rereg_finish).await;
+            rereg_finish,
+            client.register_state.clone()).await;
         client
     }
 
@@ -183,7 +195,8 @@ impl IMClient {
             mut retry_count: u8,
             mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>,
             rereg_signal: flume::Receiver<()>,
-            rereg_finished: tokio::sync::broadcast::Sender<()>) {
+            rereg_finished: tokio::sync::broadcast::Sender<()>,
+            register_state: Arc<Mutex<RegisterState>>) {
         let users_lock = users_ref.read().await;
         if users_lock.len() == 0 {
             return
@@ -202,6 +215,7 @@ impl IMClient {
                     return
                 }
             }
+            *register_state.lock().await = RegisterState::Registering;
             let _ = rereg_signal.try_recv(); // clear any pending reregs
             info!("Reregistering {:?} now!", next_rereg);
             let mut users_lock = users_ref.write().await;
@@ -209,6 +223,7 @@ impl IMClient {
             if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), &conn_ref).await {
                 let retry_in = 2_u64.pow(retry_count as u32) * 300; // 5 minutes doubling
                 error!("Reregistering failed {:?}, retrying in {}s", err, retry_in);
+                *register_state.lock().await = RegisterState::Failed { retry_wait: retry_in, error: err };
                 sleep(Duration::from_secs(retry_in)).await;
                 if retry_count < 8 {
                     retry_count += 1; // max retry a day
@@ -218,11 +233,16 @@ impl IMClient {
                 key_cache_ref.lock().await.verity(&conn_ref, &users_lock);
                 keys_updated(users_lock.clone());
                 rereg_finished.send(()).unwrap();
+                *register_state.lock().await = RegisterState::Registered;
                 info!("Successfully reregistered!");
             }
             drop(users_lock);
-            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated, rereg_signal, rereg_finished).await;
+            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated, rereg_signal, rereg_finished, register_state).await;
         });
+    }
+
+    pub async fn get_regstate(&self) -> Arc<Mutex<RegisterState>> {
+        self.register_state.clone()
     }
 
     fn parse_payload(payload: &[u8]) -> (&[u8], &[u8]) {
