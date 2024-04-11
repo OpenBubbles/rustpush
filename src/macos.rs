@@ -69,6 +69,10 @@ impl OSConfig for MacOSConfig {
         "MacOS".to_string()
     }
 
+    fn get_device_name(&self) -> String {
+        format!("Mac-{}", self.inner.platform_serial_number)
+    }
+
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
         let client = make_reqwest();
 

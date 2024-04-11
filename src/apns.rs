@@ -417,7 +417,7 @@ impl APNSConnection {
         });
 
         submitter.set_state(1).await.unwrap();
-        submitter.filter(&["com.apple.madrid"]).await.unwrap();
+        submitter.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await.unwrap();
 
         Ok(())
     }

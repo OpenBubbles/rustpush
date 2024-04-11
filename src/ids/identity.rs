@@ -2,6 +2,7 @@ use std::{fmt::Display, io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
+use uuid::Uuid;
 
 use crate::{apns::APNSConnection, error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, gzip_normal, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, OSConfig};
 
@@ -260,18 +261,28 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
     let meta = os_config.get_register_meta();
 
     let body = Value::Dictionary(Dictionary::from_iter([
+        ("device-name", Value::String(format!("Mac-{}", os_config.get_device_name()))),
         ("hardware-version", Value::String(meta.hardware_version)),
         ("language", Value::String("en-US".to_string())),
         ("os-version", Value::String(meta.os_version)),
         ("software-version", Value::String(meta.software_version)),
+        ("private-device-data", Value::Dictionary(Dictionary::from_iter([
+            ("u", Value::String(Uuid::new_v4().to_string().to_uppercase())),
+        ]))),
         ("services", Value::Array(vec![
             Value::Dictionary(Dictionary::from_iter([
                 ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
-                    ("flags", Value::Integer(1.into())),
+                    ("flags", Value::Integer(17.into())),
                     ("name", "Messenger".into()),
                     ("version", Value::Integer(1.into())),
                 ].into_iter()))])),
                 ("service", Value::String("com.apple.madrid".to_string())),
+                ("sub-services", Value::Array(vec![
+                    Value::String("com.apple.private.alloy.sms".to_string()),
+                    Value::String("com.apple.private.alloy.gelato".to_string()),
+                    Value::String("com.apple.private.alloy.biz".to_string()),
+                    Value::String("com.apple.private.alloy.gamecenter.imessage".to_string()),
+                ])),
                 ("users", Value::Array(user_payloads))
             ].into_iter()))
         ])),

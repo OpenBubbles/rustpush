@@ -42,6 +42,7 @@ pub trait OSConfig: Sync + Send {
     fn get_icloud_ua(&self) -> String;
     fn get_mme_clientinfo(&self) -> String;
     fn get_registration_ua(&self) -> String;
+    fn get_device_name(&self) -> String;
 }
 
 extern crate pretty_env_logger;
