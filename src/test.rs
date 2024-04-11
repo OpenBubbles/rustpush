@@ -138,7 +138,7 @@ async fn main() {
     }
 
     let mut state = SavedState {
-        push: connection.state.clone(),
+        push: connection.clone_state().await,
         users: users.clone()
     };
     fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();

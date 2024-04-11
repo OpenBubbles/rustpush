@@ -4,7 +4,7 @@ use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use plist::Value;
 use rustls::Certificate;
-use tokio::{net::TcpStream, io::{WriteHalf, ReadHalf, AsyncReadExt, AsyncWriteExt}, sync::{Mutex, oneshot, mpsc::{self, Receiver}}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, sync::{mpsc::{self, Receiver}, oneshot, Mutex, RwLock}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
 use std::net::ToSocketAddrs;
@@ -159,7 +159,7 @@ pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>);
 
 impl APNSReader {
     #[async_recursion]
-    async fn reload_connection(self, write: APNSSubmitter, state: APNSState, retry: u64) {
+    async fn reload_connection(self, write: APNSSubmitter, state: Arc<RwLock<APNSState>>, retry: u64) {
         info!("attempting to reconnect to APNs!");
         tokio::time::sleep(Duration::from_secs(std::cmp::min(10 * retry, 30))).await;
         let stream = match APNSConnection::connect().await {
@@ -175,17 +175,18 @@ impl APNSReader {
         write_half.stream = writer;
         drop(write_half);
         let self2 = self.clone();
-        let mut state2 = state.clone();
+        let my_ref = state.clone();
         let write2 = write.clone();
         tokio::spawn(async move {
-            if let Err(err) = APNSConnection::init_conn(&write2, &self2, &mut state2).await {
+            let mut wait_lock = my_ref.write().await;
+            if let Err(err) = APNSConnection::init_conn(&write2, &self2, &mut *wait_lock).await {
                 warn!("failed to conenct to APNs: {:?}", err);
             }
         });
         self.read_connection(read, write, state).await;
     }
 
-    async fn read_connection(self, mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: APNSState) {
+    async fn read_connection(self, mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: Arc<RwLock<APNSState>>) {
         loop {
             let result = APNSPayload::read(&mut read).await;
             let Ok(payload) = result else {
@@ -239,7 +240,7 @@ impl APNSReader {
         }
     }
 
-    fn new(read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: APNSState) -> APNSReader {
+    fn new(read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: Arc<RwLock<APNSState>>) -> APNSReader {
         let reader = APNSReader(Arc::new(Mutex::new(vec![])));
         let reader_clone = reader.clone();
         tokio::spawn(async move {
@@ -292,7 +293,7 @@ impl APNSReader {
 
 pub struct APNSConnection {
     pub submitter: APNSSubmitter,
-    pub state: APNSState,
+    pub state: Arc<RwLock<APNSState>>,
     pub reader: APNSReader
 }
 
@@ -337,6 +338,14 @@ impl APNSConnection {
         info!("Connected to APNs ({})", host);
 
         Ok(connection)
+    }
+
+    pub async fn get_token(&self) -> Vec<u8> {
+        self.state.read().await.token.clone().unwrap()
+    }
+
+    pub async fn clone_state(&self) -> APNSState {
+        self.state.read().await.clone()
     }
 
     pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
@@ -415,7 +424,7 @@ impl APNSConnection {
 
     pub async fn new(
         os_config: &dyn OSConfig, state: Option<APNSState>) -> Result<APNSConnection, PushError> {
-        let mut state = match state {
+        let mut state = Arc::new(RwLock::new(match state {
             Some(state) => state,
             None => {
                 let keypair = generate_push_cert(os_config).await?;
@@ -424,13 +433,13 @@ impl APNSConnection {
                     token: None
                 }
             }
-        };
+        }));
         let stream = APNSConnection::connect().await?;
         let (read, writer) = split(stream);
         let writer = APNSSubmitter::make(writer);
         let reader = APNSReader::new(read, writer.clone(), state.clone());
 
-        APNSConnection::init_conn(&writer, &reader, &mut state).await?;
+        APNSConnection::init_conn(&writer, &reader, &mut *state.write().await).await?;
 
         let conn: APNSConnection = APNSConnection {
             reader,

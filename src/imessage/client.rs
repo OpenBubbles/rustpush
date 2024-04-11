@@ -38,10 +38,10 @@ struct CachedHandle {
 
 impl CachedHandle {
     // hash key factors
-    fn verity(&mut self, conn: &APNSConnection, user: &IDSUser) {
+    async fn verity(&mut self, conn: &APNSConnection, user: &IDSUser) {
         let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
         env.update(&user.identity.as_ref().unwrap().id_keypair.as_ref().unwrap().cert).unwrap();
-        env.update(&conn.state.token.as_ref().unwrap()).unwrap();
+        env.update(&conn.get_token().await).unwrap();
         let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
         if hash != self.env_hash {
             // invalidate cache
@@ -573,7 +573,7 @@ impl IMClient {
         for participant in with_participants {
             debug!("sending to participant {}", participant);
             for token in key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
-                if &token.push_token == self.conn.state.token.as_ref().unwrap() {
+                if &token.push_token == &self.conn.get_token().await {
                     // don't send to ourself
                     continue;
                 }

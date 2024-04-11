@@ -293,7 +293,7 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
             &body, 
             "id-register", 
             &user.auth_keypair, 
-            &conn.state, 
+            &*(conn.state.read().await), 
             Some(idx as u8)
         )?;
     }

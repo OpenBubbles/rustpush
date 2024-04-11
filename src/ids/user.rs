@@ -236,7 +236,7 @@ pub struct IDSIdentityResult {
 impl IDSUser {
     // possible handles, which may have changed since registration
     pub async fn possible_handles(&self, conn: &APNSConnection) -> Result<Vec<String>, PushError> {
-        get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &conn.state).await
+        get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &*conn.state.read().await).await
     }
 
     pub async fn lookup(&self, conn: &APNSConnection, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
@@ -253,7 +253,7 @@ impl IDSUser {
         ].into_iter());
 
         add_id_signature(&mut headers, &encoded, "id-query", 
-            self.identity.as_ref().unwrap().id_keypair.as_ref().unwrap(), &conn.state.token.as_ref().unwrap())?;
+            self.identity.as_ref().unwrap().id_keypair.as_ref().unwrap(), &conn.get_token().await)?;
         
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();
         let ids_bag = get_bag(IDS_BAG).await?;
@@ -325,7 +325,7 @@ impl IDSAppleUser {
 impl IDSPhoneUser {
     pub async fn authenticate(conn: &APNSConnection, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let auth_keypair = get_phone_cert(phone_number, 
-                conn.state.token.as_ref().unwrap(), &[phone_sig.to_vec()], os_config).await?;
+                &conn.get_token().await, &[phone_sig.to_vec()], os_config).await?;
 
         Ok(IDSUser {
             auth_keypair,
