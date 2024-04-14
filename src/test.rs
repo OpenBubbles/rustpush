@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, NormalMessage, OSConfig};
+use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, OSConfig};
 use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -166,17 +166,19 @@ async fn main() {
     loop {
         tokio::select! {
             msg = client.recieve_wait() => {
-                if let Some(msg) = msg {
+                if let Some(msg) = msg.unwrap() {
                     if msg.has_payload() && !received_msgs.contains(&msg.id) {
                         received_msgs.push(msg.id.clone());
                         println!("{}", msg);
                         print!(">> ");
                         std::io::stdout().flush().unwrap();
                         match msg.message {
-                            Message::Message(_inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                client.send(&mut msg2).await.unwrap();
+                            Message::Message(inner) => {
+                                if inner.service == MessageType::IMessage {
+                                    let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                                    msg2.id = msg.id;
+                                    client.send(&mut msg2).await.unwrap();
+                                }
                             },
                             Message::React(_inner) => {
                                 let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
@@ -207,6 +209,14 @@ async fn main() {
                 if input.starts_with("filter ") {
                     filter_target = input.strip_prefix("filter ").unwrap().to_string().trim().to_string();
                     println!("Filtering to {}", filter_target);
+                } else if input.trim() == "sms" {
+                    let mut msg = client.new_msg(ConversationData {
+                        participants: vec![],
+                        cv_name: None,
+                        sender_guid: Some(Uuid::new_v4().to_string())
+                    }, &handle, Message::EnableSmsActivation(true)).await;
+                    client.send(&mut msg).await.unwrap();
+                    println!("sms activated");
                 } else {
                     if filter_target == "" {
                         println!("Usage: filter [target]");
@@ -215,7 +225,7 @@ async fn main() {
                             participants: vec![filter_target.clone()],
                             cv_name: None,
                             sender_guid: Some(Uuid::new_v4().to_string())
-                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string()))).await;
+                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage))).await;
                         client.send(&mut msg).await.unwrap();
                     }
                 }

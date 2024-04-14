@@ -18,7 +18,7 @@ use albert::ActivationInfo;
 pub use apns::{APNSState, APNSConnection};
 use async_trait::async_trait;
 pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};
-pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
+pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::client::{IMClient, RegisterState};
 pub use error::PushError;
 #[cfg(feature = "macOS")]
@@ -52,7 +52,7 @@ extern crate log;
 pub fn init_logger() {
     // default WARN level
     if let Err(_) = std::env::var("RUST_LOG") {
-        std::env::set_var("RUST_LOG", "warn");
+        std::env::set_var("RUST_LOG", "debug");
     }
     let res = pretty_env_logger::try_init();
     if res.is_err() {

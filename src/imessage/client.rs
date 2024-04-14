@@ -6,6 +6,7 @@ use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
 use plist::Data;
 use regex::bytes;
+use rustls::internal::msgs::message;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
@@ -59,11 +60,11 @@ struct KeyCache {
 }
 
 impl KeyCache {
-    fn new(path: PathBuf, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
+    async fn new(path: PathBuf, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
-                loaded.verity(conn, users);
+                loaded.verity(conn, users).await;
                 return loaded
             }
         }
@@ -71,15 +72,15 @@ impl KeyCache {
             cache: HashMap::new(),
             cache_location: path,
         };
-        cache.verity(conn, users);
+        cache.verity(conn, users).await;
         cache
     }
 
     // verify integrity
-    fn verity(&mut self, conn: &APNSConnection, users: &[IDSUser]) {
+    async fn verity(&mut self, conn: &APNSConnection, users: &[IDSUser]) {
         for user in users {
             for handle in &user.handles {
-                self.cache.entry(handle.clone()).or_default().verity(conn, user);
+                self.cache.entry(handle.clone()).or_default().verity(conn, user).await;
             }
         }
     }
@@ -154,12 +155,13 @@ impl IMClient {
         let (rereg_signal, recieve) = flume::bounded(0);
         let (rereg_finish, recv_finish) = tokio::sync::broadcast::channel(1);
         let client = IMClient {
-            key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users))),
+            key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users).await)),
             raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
                 if pay.id != 0x0A {
                     return false
                 }
-                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) {
+                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) &&
+                    pay.get_field(2).unwrap() != &sha1("com.apple.private.alloy.sms".as_bytes()) {
                     return false
                 }
                 let Some(body) = pay.get_field(3) else {
@@ -168,7 +170,8 @@ impl IMClient {
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
                 debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118
+                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || 
+                    get_c == 145 || get_c == 143 || get_c == 146 || get_c == 144 || get_c == 140 || get_c == 141
             }).await),
             conn,
             users: Arc::new(RwLock::new(users)),
@@ -230,7 +233,7 @@ impl IMClient {
                 }
             } else {
                 retry_count = 0;
-                key_cache_ref.lock().await.verity(&conn_ref, &users_lock);
+                key_cache_ref.lock().await.verity(&conn_ref, &users_lock).await;
                 keys_updated(users_lock.clone());
                 rereg_finished.send(()).unwrap();
                 *register_state.lock().await = RegisterState::Registered;
@@ -318,21 +321,21 @@ impl IMClient {
         Ok(decrypted_sym)
     }
 
-    pub async fn recieve(&self) -> Option<IMessage> {
+    pub async fn recieve(&self) -> Result<Option<IMessage>, PushError> {
         let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
-            return None
+            return Ok(None)
         };
         let recieved = self.recieve_payload(payload).await;
-        if let Some(recieved) = &recieved { info!("recieved {recieved}"); }
+        if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
         recieved
     }
 
-    pub async fn recieve_wait(&self) -> Option<IMessage> {
+    pub async fn recieve_wait(&self) -> Result<Option<IMessage>, PushError> {
         let Some(payload) = self.raw_inbound.lock().await.recv().await else {
-            return None
+            return Ok(None)
         };
         let recieved = self.recieve_payload(payload).await;
-        if let Some(recieved) = &recieved { info!("recieved {recieved}"); }
+        if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
         recieved
     }
 
@@ -340,18 +343,18 @@ impl IMClient {
         users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
-    async fn recieve_payload(&self, payload: APNSPayload) -> Option<IMessage> {
+    async fn recieve_payload(&self, payload: APNSPayload) -> Result<Option<IMessage>, PushError> {
         let body = payload.get_field(3).unwrap();
 
-        let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
+        let load = plist::Value::from_reader(Cursor::new(body))?;
         let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
         let ex = load.as_dictionary().unwrap().get("eX").map(|v| v.as_unsigned_integer().unwrap());
         let has_p = load.as_dictionary().unwrap().contains_key("P");
         if get_c == 101 || get_c == 102 || ex == Some(0) {
             let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
-            let time_recv = load.as_dictionary().unwrap().get("e")?.as_unsigned_integer().unwrap();
+            let time_recv = load.as_dictionary().unwrap().get("e").unwrap().as_unsigned_integer().unwrap();
             debug!("recv {load:?}");
-            return Some(IMessage {
+            return Ok(Some(IMessage {
                 id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
                 sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
                 after_guid: None,
@@ -379,7 +382,7 @@ impl IMClient {
                     Message::Read
                 },
                 sent_timestamp: time_recv / 1000000
-            })
+            }))
         }
 
         if get_c == 130 {
@@ -391,30 +394,49 @@ impl IMClient {
                 self.reregister().await;
             }
             cache_lock.invalidate(source, target);
-            return None
+            return Ok(None)
         }
 
         if !has_p {
-            return None
+            return Ok(None)
         }
 
-        let loaded: RecvMsg = plist::from_bytes(body).unwrap();
+        let loaded: RecvMsg = plist::from_bytes(body)?;
 
         let users_locked = self.users.read().await;
         let Some(identity) = users_locked.iter().find(|user| user.handles.contains(&loaded.target)) else {
-            panic!("No identity for sender {}", loaded.sender);
+            return Err(PushError::KeyNotFound(loaded.sender))
         };
 
         let payload: Vec<u8> = loaded.payload.clone().into();
         let token: Vec<u8> = loaded.token.clone().into();
         if !self.verify_payload(&payload, &loaded.sender, &token, &loaded.target, 0).await {
             warn!("Payload verification failed!");
-            return None
+            return Err(PushError::KeyNotFound(loaded.sender))
         }
 
-        let decrypted = self.decrypt(identity, &payload).await.unwrap();
+        if get_c == 145 && loaded.no_reply != Some(true) {
+            // send back a confirm
+            let mut msg = self.new_msg(ConversationData {
+                participants: vec![loaded.sender.clone()],
+                cv_name: None,
+                sender_guid: Some(Uuid::new_v4().to_string())
+            }, &loaded.target, Message::MessageReadOnDevice).await;
+            let _ = self.send(&mut msg).await; // maybe find a better way to handle this
+        }
+
+        let decrypted = self.decrypt(identity, &payload).await?;
         
-        IMessage::from_raw(&decrypted, &loaded)
+        match IMessage::from_raw(&decrypted, &loaded, &self.conn).await {
+            Err(err) => {
+                if matches!(err, PushError::BadMsg) {
+                    Ok(None) // ignore for now
+                } else {
+                    Err(err)
+                }
+            },
+            Ok(msg) => Ok(Some(msg))
+        }
     }
 
     async fn reregister(&self) {
@@ -443,7 +465,7 @@ impl IMClient {
         }
         drop(key_cache);
         let users = self.users.read().await;
-        let results = match Self::user_by_handle(&users, handle).lookup(&self.conn, fetch).await {
+        let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), fetch).await {
             Ok(results) => results,
             Err(err) => {
                 if let PushError::LookupFailed(6005) = err {
@@ -456,6 +478,8 @@ impl IMClient {
                 }
             }
         };
+        debug!("Got keys for {:?}", participants);
+
         let mut key_cache = self.key_cache.lock().await;
         if results.len() == 0 {
             warn!("warn IDS returned zero keys for query {:?}", participants);
@@ -467,13 +491,14 @@ impl IMClient {
             }
             key_cache.put_keys(handle, &id, results);
         }
+        debug!("Cached keys for {:?}", participants);
         Ok(())
     }
 
     pub async fn validate_targets(&self, targets: &[String], handle: &str) -> Result<Vec<String>, PushError> {
         self.cache_keys(targets, handle, false).await?;
         let key_cache = self.key_cache.lock().await;
-        Ok(targets.iter().filter(|target| key_cache.get_keys(handle, *target).unwrap().len() > 0).map(|i| i.clone()).collect())
+        Ok(targets.iter().filter(|target| key_cache.get_keys(handle, *target).is_some()).map(|i| i.clone()).collect())
     }
 
     pub async fn new_msg(&self, conversation: ConversationData, sender: &str, message: Message) -> IMessage {
@@ -512,7 +537,7 @@ impl IMClient {
 
         let payload = [
             aes_key,
-            encrypted_sym[..100].to_vec()
+            encrypted_sym[..encrypted_sym.len().min(100)].to_vec()
         ].concat();
         let mut encrypter = Encrypter::new(&encryption_key)?;
         encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
@@ -525,7 +550,7 @@ impl IMClient {
 
         let payload = [
             encrypted,
-            encrypted_sym[100..].to_vec()
+            encrypted_sym[encrypted_sym.len().min(100)..].to_vec()
         ].concat();
 
         let sig = user.identity.as_ref().unwrap().sign(&payload)?;
@@ -557,6 +582,9 @@ impl IMClient {
                 !handles.contains(p)
             });
         }
+        if message.message.is_sms() {
+            target_participants = vec![message.sender.as_ref().unwrap().clone()];
+        }
 
         self.send_payloads(&message, &target_participants, 0).await
     }
@@ -564,8 +592,9 @@ impl IMClient {
     #[async_recursion]
     async fn send_payloads(&self, message: &IMessage, with_participants: &[String], retry_count: u8) -> Result<(), PushError> {
         let sender = message.sender.as_ref().unwrap().to_string();
-        self.cache_keys(message.conversation.as_ref().unwrap().participants.as_ref(), &sender, false).await?;
-        let raw = if message.has_payload() { message.to_raw() } else { vec![] };
+        self.cache_keys(with_participants, &sender, false).await?;
+        let handles = self.get_handles().await;
+        let raw = if message.has_payload() { message.to_raw(&handles) } else { vec![] };
 
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
@@ -676,7 +705,7 @@ impl IMClient {
                 };
         
                 let binary = plist_to_bin(&complete)?;
-                Ok::<(), PushError>(self.conn.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?)
+                Ok::<(), PushError>(self.conn.send_message(if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" }, &binary, Some(&msg_id)).await?)
             }
         };
 

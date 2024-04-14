@@ -46,4 +46,6 @@ pub enum PushError {
     SendTimedOut,
     #[error("Send error {0}")]
     SendErr(i64),
+    #[error("Bad message")]
+    BadMsg,
 }

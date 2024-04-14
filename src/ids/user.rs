@@ -1,6 +1,6 @@
-use std::{io::Cursor, collections::HashMap};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
-use log::info;
+use log::{info, debug};
 use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
 use plist::{Value, Data, Dictionary};
 use rand::Rng;
@@ -239,7 +239,7 @@ impl IDSUser {
         get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &*conn.state.read().await).await
     }
 
-    pub async fn lookup(&self, conn: &APNSConnection, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
         println!("Performing an IDS Lookup for: {:?}", query);
         let body = plist_to_string(&LookupReq { uris: query })?;
 
@@ -267,15 +267,24 @@ impl IDSUser {
             ("v", 2.into()),
             ("b", Value::Data(encoded))
         ].into_iter()));
-        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await?;
 
-        let response = conn.reader.wait_find_msg(move |loaded| {
-            let Some(resp_id) = loaded.as_dictionary().unwrap().get("U") else {
-                return false
-            };
-            let resp_id = resp_id.as_data().unwrap();
-            resp_id == msg_id
-        }).await;
+        let conn_cpy = conn.clone();
+        let msg = tokio::spawn(async move {
+            conn_cpy.reader.wait_find_msg(move |loaded| {
+                let Some(resp_id) = loaded.as_dictionary().unwrap().get("U") else {
+                    return false
+                };
+                let resp_id = resp_id.as_data().unwrap();
+                resp_id == msg_id
+            }).await
+        });
+
+        debug!("Sending query");
+        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await?;
+        debug!("Sent");
+
+        let response = msg.await.unwrap();
+        debug!("Recieved");
 
         let data = response.get_field(3).unwrap();
         let loaded: Value = plist::from_bytes(data).unwrap();

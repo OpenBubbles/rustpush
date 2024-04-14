@@ -123,6 +123,122 @@ struct RawUnsendMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawSmsActivateMessage {
+    wc: bool,
+    ar: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsDeactivateMessage {
+    ue: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsParticipant {
+    #[serde(rename = "id")] // no clue what the difference is
+    phone_number: String,
+    #[serde(rename = "uID")]
+    user_phone_number: Option<String>,
+    #[serde(rename = "n")]
+    country: Option<String>, // i think?
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsOutgoingInnerMessage {
+    handle: Option<String>, // only for single SMS
+    service: String, // always SMS, even for MMS chats
+    #[serde(rename = "sV")]
+    version: String, // always 1
+    guid: String, // same as outside encryption
+    #[serde(rename = "replyToGuid")]
+    reply_to_guid: Option<String>,
+    #[serde(rename = "plain-body")]
+    plain_body: String,
+    xhtml: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsOutgoingMessage {
+    #[serde(rename = "re")]
+    participants: Vec<RawSmsParticipant>,
+    ic: u32, // always seems to be 1
+    #[serde(rename = "fR")]
+    already_sent: Option<bool>,
+    #[serde(rename = "chat-style")]
+    chat_style: String, // im for SMS, chat for group MMS
+    #[serde(rename = "rO")]
+    ro: Option<bool>, // true for group chats
+    #[serde(rename = "mD")]
+    message: RawSmsOutgoingInnerMessage,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsIncomingMessageData {
+    #[serde(rename = "type")]
+    mime_type: String,
+    data: Data,
+    #[serde(rename = "content-id")]
+    content_id: Option<String>,
+    #[serde(rename = "content-location")]
+    content_location: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsIncomingMessage {
+    #[serde(rename = "re")]
+    participants: Vec<String>, // empty for single sms chats
+    #[serde(rename = "h")]
+    sender: String,
+    fco: u32, // always seems to be 1
+    #[serde(rename = "co")]
+    recieved_number: String, // number that recieved the message
+    #[serde(rename = "w")]
+    recieved_date: plist::Date,
+    #[serde(rename = "fh")]
+    format: String,
+    #[serde(rename = "b")]
+    mime_type: Option<String>,
+    #[serde(rename = "cs")]
+    constant_uuid: String, // some uuid
+    r: bool, // always true
+    #[serde(rename = "k")]
+    content: Vec<RawSmsIncomingMessageData>,
+    #[serde(rename = "_ssc")]
+    ssc: u32, // always 0
+    l: u32, //always 0,
+    #[serde(rename = "sV")]
+    version: String,
+    #[serde(rename = "_sc")]
+    sc: u32, // always 0
+    #[serde(rename = "m")]
+    mode: String, // sms or mms
+    ic: u32, // always 1
+    n: String, // always 310
+    #[serde(rename = "g")]
+    guid: String
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawMmsIncomingMessage {
+    #[serde(rename = "sg")]
+    signature: Data,
+    #[serde(rename = "eK")]
+    key: Data,
+    #[serde(rename = "rUS")]
+    download_url: String,
+    #[serde(rename = "oID")]
+    object_id: String,
+    #[serde(rename = "oFS")]
+    ofs: u64, // ?
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsConfirmSent {
+    #[serde(rename = "g")]
+    msg_id: String
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: Option<String>,
@@ -200,5 +316,9 @@ pub(super) struct RecvMsg {
     #[serde(rename = "U")]
     pub(super) msg_guid: Data,
     #[serde(rename = "e")]
-    pub(super) sent_timestamp: u64
+    pub(super) sent_timestamp: u64,
+    #[serde(rename = "c")]
+    pub(super) command: u64,
+    #[serde(rename = "nr")]
+    pub(super) no_reply: Option<bool>,
 }

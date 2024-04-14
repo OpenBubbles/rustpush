@@ -1,6 +1,6 @@
 
 
-use std::{fmt, vec, io::{Cursor, Write, Read}, time::{SystemTime, UNIX_EPOCH}};
+use std::{fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, warn};
 use openssl::symm::{Cipher, Crypter};
@@ -10,6 +10,7 @@ use uuid::Uuid;
 use rand::Rng;
 use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
+use async_recursion::async_recursion;
 
 use crate::{apns::APNSConnection, error::PushError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
 
@@ -130,6 +131,76 @@ impl MessageParts {
         msg
     }
 
+    fn to_sms(&self, using_number: &str, mms: bool) -> (String, Vec<RawSmsIncomingMessageData>) {
+        let mut parts = vec![format!("s:{}", using_number)];
+        let mut out = vec![];
+        if !mms {
+            parts.push("(null)(0)".to_string());
+            let data = self.0.iter().map(|p| {
+                if let MessagePart::Text(text) = &p.0 {
+                    text.to_string()
+                } else { panic!("bad type!") }
+            }).collect::<Vec<String>>().join("|");
+            out.push(RawSmsIncomingMessageData {
+                mime_type: "text/plain".to_string(),
+                data: data.as_bytes().to_vec().into(),
+                content_id: None,
+                content_location: None,
+            })
+        } else {
+            for (idx, part) in self.0.iter().enumerate() {
+                out.push(match &part.0 {
+                    MessagePart::Text(text) => {
+                        let content_id = format!("text{:0>6}", idx + 1);
+                        parts.push(format!("{}.txt(0)", content_id));
+                        RawSmsIncomingMessageData {
+                            mime_type: "text/plain".to_string(),
+                            data: text.as_bytes().to_vec().into(),
+                            content_id: Some(format!("<{}>", content_id)),
+                            content_location: Some(format!("{content_id}.txt")),
+                        }
+                    },
+                    MessagePart::Attachment(attachment) => {
+                        let content_id = format!("file{:0>6}", idx + 1);
+                        parts.push(format!("{}({})", content_id, attachment.get_size() / 1000000));
+                        let AttachmentType::Inline(amount) = &attachment.a_type else { panic!("bad attachment type for mms!") };
+                        RawSmsIncomingMessageData {
+                            mime_type: attachment.mime.clone(),
+                            data: amount.clone().into(),
+                            content_id: Some(format!("<{}>", content_id)),
+                            content_location: Some(format!("{content_id}")),
+                        }
+                    }
+                })
+            }
+        }
+        panic!()
+    }
+
+    fn parse_sms(raw: &RawSmsIncomingMessage) -> MessageParts {
+        MessageParts(raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
+            let corresponding = if part.starts_with("(null)") {
+                raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
+            } else {
+                let filename = part.split("(").next().unwrap();
+                raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
+            };
+            let typ = if corresponding.mime_type == "text/plain" {
+                MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap())
+            } else {
+                MessagePart::Attachment(Attachment {
+                    a_type: AttachmentType::Inline(corresponding.data.clone().into()),
+                    part: idx as u64,
+                    uti_type: "".to_string(),
+                    mime: corresponding.mime_type.clone(),
+                    name: corresponding.content_location.clone().unwrap_or("file".to_string()),
+                    iris: false, // imagine not having an iPhone
+                })
+            };
+            IndexedMessagePart(typ, None)
+        }).collect())
+    }
+
     // parse XML parts
     fn parse_parts(xml: &str, raw: Option<&RawIMessage>) -> MessageParts {
         let mut data: Vec<IndexedMessagePart> = vec![];
@@ -200,6 +271,16 @@ impl MessageParts {
     }
 }
 
+#[repr(C)]
+#[derive(PartialEq, Clone)]
+pub enum MessageType {
+    IMessage,
+    SMS {
+        is_phone: bool,
+        using_number: String, // prefixed with tel:
+    }
+}
+
 // a "normal" imessage, containing multiple parts and text
 #[repr(C)]
 pub struct NormalMessage {
@@ -207,17 +288,19 @@ pub struct NormalMessage {
     pub body: Option<BalloonBody>,
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
-    pub reply_part: Option<String>
+    pub reply_part: Option<String>,
+    pub service: MessageType
 }
 
 impl NormalMessage {
-    pub fn new(text: String) -> NormalMessage {
+    pub fn new(text: String, service: MessageType) -> NormalMessage {
         NormalMessage {
             parts: MessageParts(vec![IndexedMessagePart(MessagePart::Text(text), None)]),
             body: None,
             effect: None,
             reply_guid: None,
-            reply_part: None
+            reply_part: None,
+            service
         }
     }
 }
@@ -549,14 +632,28 @@ pub enum Message {
     Unsend(UnsendMessage),
     Edit(EditMessage),
     IconChange(IconChangeMessage),
-    StopTyping
+    StopTyping,
+    EnableSmsActivation(bool),
+    MessageReadOnDevice,
+    SmsConfirmSent
 }
 
 impl Message {
     // also add new C values to client.rs raw_inbound
     pub(super) fn get_c(&self) -> u8 {
         match self {
-            Self::Message(_) => 100,
+            Self::Message(msg) => {
+                match msg.service {
+                    MessageType::IMessage => 100,
+                    MessageType::SMS { is_phone: _, using_number: _ } => {
+                        if msg.parts.has_attachments() {
+                            144
+                        } else {
+                            143
+                        }
+                    }
+                }
+            },
             Self::React(_) => 100,
             Self::RenameMessage(_) => 190,
             Self::ChangeParticipants(_) => 190,
@@ -566,16 +663,32 @@ impl Message {
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
             Self::IconChange(_) => 190,
-            Self::StopTyping => 100
+            Self::StopTyping => 100,
+            Self::EnableSmsActivation(_) => 145,
+            Self::MessageReadOnDevice => 147,
+            Self::SmsConfirmSent => 146,
+        }
+    }
+
+    pub(super) fn is_sms(&self) -> bool {
+        match &self {
+            Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _ }),
+            _ => false
         }
     }
 
     pub(super) fn get_nr(&self) -> Option<bool> {
+        if self.is_sms() {
+            return Some(true)
+        }
         match self {
             Self::Typing => Some(true),
             Self::Delivered => Some(true),
             Self::Edit(_) => Some(true),
             Self::Unsend(_) => Some(true),
+            Self::EnableSmsActivation(_) => Some(true),
+            Self::MessageReadOnDevice => Some(true),
+            Self::SmsConfirmSent => Some(true),
             _ => None
         }
     }
@@ -616,6 +729,15 @@ impl fmt::Display for Message {
             },
             Message::StopTyping => {
                 write!(f, "stopped typing")
+            },
+            Message::EnableSmsActivation(enabled) => {
+                write!(f, "{} sms activation", if *enabled { "enabled" } else { "disabled" })
+            },
+            Message::MessageReadOnDevice => {
+                write!(f, "confirmed sms activation")
+            },
+            Message::SmsConfirmSent => {
+                write!(f, "confirmed sms send")
             }
         }
     }
@@ -663,6 +785,7 @@ impl IMessage {
             Message::Delivered => false,
             Message::Typing => false,
             Message::StopTyping => false,
+            Message::MessageReadOnDevice => false,
             _ => true
         }
     }
@@ -675,7 +798,7 @@ impl IMessage {
         }
     }
 
-    pub(super) fn to_raw(&self) -> Vec<u8> {
+    pub(super) fn to_raw(&self, my_handles: &[String]) -> Vec<u8> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -691,6 +814,26 @@ impl IMessage {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::EnableSmsActivation(enabled) => {
+                if *enabled {
+                    let raw = RawSmsActivateMessage {
+                        wc: false,
+                        ar: true
+                    };
+                    plist_to_bin(&raw).unwrap()
+                } else {
+                    let raw = RawSmsDeactivateMessage {
+                        ue: true
+                    };
+                    plist_to_bin(&raw).unwrap()
+                }
+            },
+            Message::SmsConfirmSent => {
+                let raw = RawSmsConfirmSent {
+                    msg_id: self.id.clone()
+                };
+                plist_to_bin(&raw).unwrap()
+            }
             Message::StopTyping => {
                 let raw = RawIMessage {
                     text: None,
@@ -754,36 +897,103 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             },
             Message::Message (normal) => {
-                let mut raw = RawIMessage {
-                    text: Some(normal.parts.raw_text()),
-                    xml: None,
-                    participants: conversation.participants.clone(),
-                    after_guid: self.after_guid.clone(),
-                    sender_guid: conversation.sender_guid.clone(),
-                    pv: 0,
-                    gv: "8".to_string(),
-                    v: "1".to_string(),
-                    bid: None,
-                    b: None,
-                    effect: normal.effect.clone(),
-                    cv_name: conversation.cv_name.clone(),
-                    reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
-                    inline0: None,
-                    inline1: None,
-                    live_xml: None
-                };
-
-                if normal.parts.has_attachments() {
-                    raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
-                }
-                
-                should_gzip = !raw.xml.is_some();
+                match &normal.service {
+                    MessageType::IMessage => {
+                        let mut raw = RawIMessage {
+                            text: Some(normal.parts.raw_text()),
+                            xml: None,
+                            participants: conversation.participants.clone(),
+                            after_guid: self.after_guid.clone(),
+                            sender_guid: conversation.sender_guid.clone(),
+                            pv: 0,
+                            gv: "8".to_string(),
+                            v: "1".to_string(),
+                            bid: None,
+                            b: None,
+                            effect: normal.effect.clone(),
+                            cv_name: conversation.cv_name.clone(),
+                            reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
+                            inline0: None,
+                            inline1: None,
+                            live_xml: None
+                        };
         
-                plist_to_bin(&raw).unwrap()
+                        if normal.parts.has_attachments() {
+                            raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
+                        }
+                        
+                        should_gzip = !raw.xml.is_some();
+                
+                        plist_to_bin(&raw).unwrap()
+                    },
+                    MessageType::SMS { is_phone, using_number } => {
+                        if my_handles.contains(self.sender.as_ref().unwrap()) {
+                            let raw = RawSmsOutgoingMessage {
+                                participants: conversation.participants.iter().filter(|i| !my_handles.contains(*i)).map(|i| RawSmsParticipant {
+                                    phone_number: i.replace("tel:", ""),
+                                    user_phone_number: None,
+                                    country: None,
+                                }).collect(),
+                                ic: if *is_phone { 1 } else { 0 },
+                                already_sent: if *is_phone { Some(true) } else { None },
+                                chat_style: if conversation.participants.len() == 1 { "im".to_string() } else { "chat".to_string() },
+                                ro: if conversation.participants.len() == 1 { None } else { Some(true) },
+                                message: RawSmsOutgoingInnerMessage {
+                                    handle: if conversation.participants.len() == 1 {
+                                        Some(conversation.participants.first().unwrap().replace("tel:", ""))
+                                    } else { None },
+                                    service: "SMS".to_string(),
+                                    version: "1".to_string(),
+                                    guid: self.id.to_uppercase(),
+                                    reply_to_guid: self.after_guid.clone(),
+                                    plain_body: normal.parts.raw_text(),
+                                    xhtml: if normal.parts.has_attachments() {
+                                        Some(normal.parts.to_xml(None))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            
+                            should_gzip = true;
+                    
+                            plist_to_bin(&raw).unwrap()
+                        } else {
+                            let my_participants: Vec<_> = conversation.participants.iter()
+                                .filter(|p| *p != self.sender.as_ref().unwrap())
+                                .map(|p| p.replace("tel:", "")).collect();
+                            let is_mms = my_participants.len() > 1 || normal.parts.has_attachments();
+                            let (format, content) = normal.parts.to_sms(&using_number, is_mms);
+                            let raw = RawSmsIncomingMessage {
+                                participants: if is_mms { my_participants } else { vec![] },
+                                sender: self.sender.clone().unwrap(),
+                                fco: 1,
+                                recieved_date: (UNIX_EPOCH + Duration::from_millis(self.sent_timestamp)).into(),
+                                recieved_number: using_number.replace("tel:", ""),
+                                format,
+                                mime_type: None,
+                                constant_uuid: Uuid::new_v4().to_string().to_uppercase(),
+                                r: true,
+                                content,
+                                ssc: 0,
+                                l: 0,
+                                version: "1".to_string(),
+                                sc: 0,
+                                mode: if is_mms { "mms".to_string() } else { "sms".to_string() },
+                                ic: 1,
+                                n: "310".to_string(),
+                                guid: self.id.clone(),
+                            };
+
+                            plist_to_bin(&raw).unwrap()
+                        }
+                    }
+                }
             },
             Message::Delivered => panic!("no enc body!"),
             Message::Read => panic!("no enc body!"),
             Message::Typing => panic!("no enc body!"),
+            Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {
                     rs: true,
@@ -844,12 +1054,52 @@ impl IMessage {
         final_msg
     }
 
-    pub(super) fn from_raw(bytes: &[u8], wrapper: &RecvMsg) -> Option<IMessage> {
+    #[async_recursion]
+    pub(super) async fn from_raw(bytes: &[u8], wrapper: &RecvMsg, apns: &APNSConnection) -> Result<IMessage, PushError> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
+        if let Ok(loaded) = plist::from_bytes::<RawSmsActivateMessage>(&decompressed) {
+            if !loaded.wc && loaded.ar {
+                let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+                return Ok(IMessage {
+                    sender: Some(wrapper.sender.clone()),
+                    id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                    after_guid: None,
+                    sent_timestamp: wrapper.sent_timestamp / 1000000,
+                    conversation: None,
+                    message: Message::EnableSmsActivation(true),
+                })
+            }
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawSmsDeactivateMessage>(&decompressed) {
+            if loaded.ue {
+                let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+                return Ok(IMessage {
+                    sender: Some(wrapper.sender.clone()),
+                    id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                    after_guid: None,
+                    sent_timestamp: wrapper.sent_timestamp / 1000000,
+                    conversation: None,
+                    message: Message::EnableSmsActivation(false),
+                })
+            }
+        }
+        if let Ok(_loaded) = plist::from_bytes::<RawSmsConfirmSent>(&decompressed) {
+            if wrapper.command == 146 {
+                let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+                return Ok(IMessage {
+                    sender: Some(wrapper.sender.clone()),
+                    id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                    after_guid: None,
+                    sent_timestamp: wrapper.sent_timestamp / 1000000,
+                    conversation: None,
+                    message: Message::SmsConfirmSent
+                })
+            }
+        }
         if let Ok(loaded) = plist::from_bytes::<RawUnsendMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
@@ -860,7 +1110,7 @@ impl IMessage {
         }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
@@ -875,7 +1125,7 @@ impl IMessage {
         }
         if let Ok(loaded) = plist::from_bytes::<RawChangeMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
@@ -891,7 +1141,7 @@ impl IMessage {
         if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
             warn!("recieved {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
@@ -909,7 +1159,7 @@ impl IMessage {
         }
         if let Ok(loaded) = plist::from_bytes::<RawRenameMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
@@ -932,7 +1182,7 @@ impl IMessage {
             } else {
                 loaded.amt - 3000
             };
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: loaded.after_guid.clone(),
@@ -947,7 +1197,82 @@ impl IMessage {
                     to_part: target_msg_data.get(1).unwrap().as_str().parse().unwrap(),
                     to_text: "".to_string(),
                     enable: enabled,
-                    reaction: ReactMessage::from_idx(id)?
+                    reaction: ReactMessage::from_idx(id).ok_or(PushError::BadMsg)?
+                }),
+            })
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawMmsIncomingMessage>(&decompressed) {
+            let data: Vec<u8> = loaded.key.into();
+            let file = MMCSFile {
+                signature: loaded.signature.into(),
+                object: loaded.object_id,
+                url: loaded.download_url,
+                key: data[1..].to_vec(),
+                size: 0
+            };
+            let mut output: Vec<u8> = vec![];
+            let mut cursor = Cursor::new(&mut output);
+            file.get_attachment(apns, &mut cursor, &mut |_,_| {}).await?;
+            return Self::from_raw(&output, wrapper, apns).await
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawSmsIncomingMessage>(&decompressed) {
+            let system_recv: SystemTime = loaded.recieved_date.clone().into();
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            let parts = MessageParts::parse_sms(&loaded);
+            return Ok(IMessage {
+                sender: Some(loaded.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                conversation: Some(ConversationData {
+                    participants: if loaded.participants.len() > 0 {
+                        loaded.participants.iter().chain(std::iter::once(&loaded.sender)).map(|p| format!("tel:{p}")).collect()
+                    } else {
+                        vec![format!("tel:{}", loaded.sender), format!("tel:{}", loaded.recieved_number)]
+                    },
+                    cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
+                    sender_guid: None,
+                }),
+                message: Message::Message(NormalMessage {
+                    parts,
+                    body: None,
+                    effect: None, // losers
+                    reply_guid: None, // losers
+                    reply_part: None, // losers
+                    service: MessageType::SMS { // shame
+                        is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
+                        using_number: format!("tel:{}", loaded.recieved_number)
+                    }
+                }),
+            })
+        }
+        if let Ok(loaded) = plist::from_bytes::<RawSmsOutgoingMessage>(&decompressed) {
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            let parts = loaded.message.xhtml.as_ref().map_or_else(|| {
+                MessageParts::from_raw(&loaded.message.plain_body)
+            }, |xml| {
+                MessageParts::parse_parts(xml, None)
+            });
+            return Ok(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: loaded.message.reply_to_guid,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: Some(ConversationData {
+                    participants: loaded.participants.iter().map(|p| format!("tel:{}", p.phone_number)).collect(),
+                    cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
+                    sender_guid: None,
+                }),
+                message: Message::Message(NormalMessage {
+                    parts,
+                    body: None,
+                    effect: None, // losers
+                    reply_guid: None, // losers
+                    reply_part: None, // losers
+                    service: MessageType::SMS { // shame
+                        is_phone: false, // if we are recieving a outgoing message, we must not be the phone
+                        using_number: wrapper.sender.clone()
+                    }
                 }),
             })
         }
@@ -966,7 +1291,7 @@ impl IMessage {
             }, |xml| {
                 MessageParts::parse_parts(xml, Some(&loaded))
             });
-            return Some(IMessage {
+            return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: loaded.after_guid.clone(),
@@ -986,10 +1311,11 @@ impl IMessage {
                     effect: loaded.effect.clone(),
                     reply_guid: replies.as_ref().map(|r| r.0.clone()),
                     reply_part: replies.as_ref().map(|r| r.1.clone()),
+                    service: MessageType::IMessage
                 }),
             })
         }
-        None
+        Err(PushError::BadMsg)
     }
 }
 
