@@ -311,10 +311,11 @@ impl IMClient {
         decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
         let buffer_len = decrypter.decrypt_len(&payload).unwrap();
         let mut decrypted_asym = vec![0; buffer_len];
-        decrypter.decrypt(&body[..160], &mut decrypted_asym[..])?;
+        let decrypted_len = decrypter.decrypt(&body[..160], &mut decrypted_asym[..])?;
+        decrypted_asym.truncate(decrypted_len);
 
         let decrypted_sym = decrypt(Cipher::aes_128_ctr(), &decrypted_asym[..16], Some(&NORMAL_NONCE), &[
-            decrypted_asym[16..116].to_vec(),
+            decrypted_asym[16..decrypted_asym.len().min(116)].to_vec(),
             body[160..].to_vec()
         ].concat()).unwrap();
 
