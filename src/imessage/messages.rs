@@ -673,6 +673,7 @@ impl Message {
     pub(super) fn is_sms(&self) -> bool {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _ }),
+            Message::SmsConfirmSent => true,
             _ => false
         }
     }
@@ -928,19 +929,20 @@ impl IMessage {
                     },
                     MessageType::SMS { is_phone, using_number } => {
                         if my_handles.contains(self.sender.as_ref().unwrap()) {
+                            let other_participants: Vec<_> = conversation.participants.iter().filter(|i| !my_handles.contains(*i)).collect();
                             let raw = RawSmsOutgoingMessage {
-                                participants: conversation.participants.iter().filter(|i| !my_handles.contains(*i)).map(|i| RawSmsParticipant {
+                                participants: other_participants.iter().map(|i| RawSmsParticipant {
                                     phone_number: i.replace("tel:", ""),
                                     user_phone_number: None,
                                     country: None,
                                 }).collect(),
                                 ic: if *is_phone { 1 } else { 0 },
                                 already_sent: if *is_phone { Some(true) } else { None },
-                                chat_style: if conversation.participants.len() == 1 { "im".to_string() } else { "chat".to_string() },
-                                ro: if conversation.participants.len() == 1 { None } else { Some(true) },
+                                chat_style: if other_participants.len() == 1 { "im".to_string() } else { "chat".to_string() },
+                                ro: if other_participants.len() == 1 { None } else { Some(true) },
                                 message: RawSmsOutgoingInnerMessage {
-                                    handle: if conversation.participants.len() == 1 {
-                                        Some(conversation.participants.first().unwrap().replace("tel:", ""))
+                                    handle: if other_participants.len() == 1 {
+                                        Some(other_participants.first().unwrap().replace("tel:", ""))
                                     } else { None },
                                     service: "SMS".to_string(),
                                     version: "1".to_string(),
@@ -1259,7 +1261,7 @@ impl IMessage {
                 after_guid: loaded.message.reply_to_guid,
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: Some(ConversationData {
-                    participants: loaded.participants.iter().map(|p| format!("tel:{}", p.phone_number)).collect(),
+                    participants: loaded.participants.iter().map(|p| format!("tel:{}", p.phone_number)).chain(std::iter::once(wrapper.sender.clone())).collect(),
                     cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
                     sender_guid: None,
                 }),
