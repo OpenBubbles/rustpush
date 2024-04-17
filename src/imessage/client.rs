@@ -663,7 +663,11 @@ impl IMClient {
                 info!("payload {payloads_cnt}");
                 for _i in 0..payloads_cnt {
                     let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(15), confirm_reciever.recv()).await else {
-                        error!("timeout with {_i}");
+                        if (_i as f32) / (payloads_cnt as f32) > 0.95f32 {
+                            warn!("Greater than 95% submission rate, ignoring undeliverable messages!");
+                            return Ok(refresh_tokens);
+                        }
+                        error!("timeout with {_i}/{payloads_cnt}");
                         return Err(PushError::SendTimedOut)
                     };
                     debug!("taken {:?}", msg);
