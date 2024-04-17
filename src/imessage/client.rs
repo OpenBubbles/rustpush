@@ -586,6 +586,15 @@ impl IMClient {
         if message.message.is_sms() {
             target_participants = vec![message.sender.as_ref().unwrap().clone()];
         }
+        
+        if let Message::ChangeParticipants(change) = &message.message {
+            // notify the all participants that they were added
+            for participant in &change.new_participants {
+                if !target_participants.contains(participant) {
+                    target_participants.push(participant.clone());
+                }
+            }
+        }
 
         self.send_payloads(&message, &target_participants, 0).await
     }
