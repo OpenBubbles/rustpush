@@ -2,7 +2,7 @@
 
 use std::{fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
-use log::{debug, warn};
+use log::{debug, info, warn};
 use openssl::symm::{Cipher, Crypter};
 use plist::Data;
 use regex::Regex;
@@ -11,6 +11,7 @@ use rand::Rng;
 use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
+use std::io::Seek;
 
 use crate::{apns::APNSConnection, error::PushError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
 
@@ -174,7 +175,7 @@ impl MessageParts {
                 })
             }
         }
-        panic!()
+        (parts.join("|"), out)
     }
 
     fn parse_sms(raw: &RawSmsIncomingMessage) -> MessageParts {
@@ -278,6 +279,7 @@ pub enum MessageType {
     SMS {
         is_phone: bool,
         using_number: String, // prefixed with tel:
+        from_handle: Option<String>,
     }
 }
 
@@ -645,7 +647,7 @@ impl Message {
             Self::Message(msg) => {
                 match msg.service {
                     MessageType::IMessage => 100,
-                    MessageType::SMS { is_phone: _, using_number: _ } => {
+                    MessageType::SMS { is_phone: _, using_number: _, from_handle: _ } => {
                         if msg.parts.has_attachments() {
                             144
                         } else {
@@ -672,7 +674,7 @@ impl Message {
 
     pub(super) fn is_sms(&self) -> bool {
         match &self {
-            Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _ }),
+            Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _, from_handle: _ }),
             Message::SmsConfirmSent => true,
             _ => false
         }
@@ -799,7 +801,7 @@ impl IMessage {
         }
     }
 
-    pub(super) fn to_raw(&self, my_handles: &[String]) -> Vec<u8> {
+    pub(super) async fn to_raw(&self, my_handles: &[String], apns: &APNSConnection) -> Result<Vec<u8>, PushError> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -927,8 +929,58 @@ impl IMessage {
                 
                         plist_to_bin(&raw).unwrap()
                     },
-                    MessageType::SMS { is_phone, using_number } => {
-                        if my_handles.contains(self.sender.as_ref().unwrap()) {
+                    MessageType::SMS { is_phone, using_number, from_handle } => {
+                        if let Some(from_handle) = from_handle { 
+                            let my_participants: Vec<_> = conversation.participants.iter()
+                                .filter(|p| *p != self.sender.as_ref().unwrap() && *p != from_handle)
+                                .map(|p| p.replace("tel:", "")).collect();
+                            let is_mms = my_participants.len() > 1 || normal.parts.has_attachments();
+                            let (format, content) = normal.parts.to_sms(&using_number, is_mms);
+                            let raw = RawSmsIncomingMessage {
+                                participants: if is_mms { my_participants } else { vec![] },
+                                sender: from_handle.replace("tel:", ""),
+                                fco: 1,
+                                recieved_date: (UNIX_EPOCH + Duration::from_millis(self.sent_timestamp)).into(),
+                                recieved_number: using_number.replace("tel:", ""),
+                                format,
+                                mime_type: None,
+                                constant_uuid: Uuid::new_v4().to_string().to_uppercase(),
+                                r: true,
+                                content,
+                                ssc: 0,
+                                l: 0,
+                                version: "1".to_string(),
+                                sc: 0,
+                                mode: if is_mms { "mms".to_string() } else { "sms".to_string() },
+                                ic: 1,
+                                n: "310".to_string(),
+                                guid: self.id.clone(),
+                            };
+
+                            let payload = plist_to_bin(&raw).unwrap();
+
+                            if normal.parts.has_attachments() {
+                                info!("uploading MMS to MMCS!");
+                                let mut file = Cursor::new(payload);
+                                let prepared = MMCSFile::prepare_put(&mut file).await?;
+                                file.rewind()?;
+                                let attachment = MMCSFile::new(apns, &prepared, &mut file, &mut |_prog, _total| { }).await?;
+                                let message = RawMmsIncomingMessage {
+                                    signature: attachment.signature.into(),
+                                    key: [
+                                        vec![0x0],
+                                        attachment.key
+                                    ].concat().into(),
+                                    download_url: attachment.url,
+                                    object_id: attachment.object,
+                                    ofs: 0
+                                };
+                                info!("finished!");
+                                plist_to_bin(&message).unwrap()
+                            } else {
+                                payload
+                            }
+                        } else {
                             let other_participants: Vec<_> = conversation.participants.iter().filter(|i| !my_handles.contains(*i)).collect();
                             let raw = RawSmsOutgoingMessage {
                                 participants: other_participants.iter().map(|i| RawSmsParticipant {
@@ -959,34 +1011,6 @@ impl IMessage {
                             
                             should_gzip = true;
                     
-                            plist_to_bin(&raw).unwrap()
-                        } else {
-                            let my_participants: Vec<_> = conversation.participants.iter()
-                                .filter(|p| *p != self.sender.as_ref().unwrap())
-                                .map(|p| p.replace("tel:", "")).collect();
-                            let is_mms = my_participants.len() > 1 || normal.parts.has_attachments();
-                            let (format, content) = normal.parts.to_sms(&using_number, is_mms);
-                            let raw = RawSmsIncomingMessage {
-                                participants: if is_mms { my_participants } else { vec![] },
-                                sender: self.sender.clone().unwrap(),
-                                fco: 1,
-                                recieved_date: (UNIX_EPOCH + Duration::from_millis(self.sent_timestamp)).into(),
-                                recieved_number: using_number.replace("tel:", ""),
-                                format,
-                                mime_type: None,
-                                constant_uuid: Uuid::new_v4().to_string().to_uppercase(),
-                                r: true,
-                                content,
-                                ssc: 0,
-                                l: 0,
-                                version: "1".to_string(),
-                                sc: 0,
-                                mode: if is_mms { "mms".to_string() } else { "sms".to_string() },
-                                ic: 1,
-                                n: "310".to_string(),
-                                guid: self.id.clone(),
-                            };
-
                             plist_to_bin(&raw).unwrap()
                         }
                     }
@@ -1053,7 +1077,7 @@ impl IMessage {
             gzip(&binary).unwrap()
         };
 
-        final_msg
+        Ok(final_msg)
     }
 
     #[async_recursion]
@@ -1243,7 +1267,8 @@ impl IMessage {
                     reply_part: None, // losers
                     service: MessageType::SMS { // shame
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
-                        using_number: format!("tel:{}", loaded.recieved_number)
+                        using_number: format!("tel:{}", loaded.recieved_number),
+                        from_handle: Some(loaded.sender.clone()),
                     }
                 }),
             })
@@ -1273,7 +1298,8 @@ impl IMessage {
                     reply_part: None, // losers
                     service: MessageType::SMS { // shame
                         is_phone: false, // if we are recieving a outgoing message, we must not be the phone
-                        using_number: wrapper.sender.clone()
+                        using_number: wrapper.sender.clone(),
+                        from_handle: None,
                     }
                 }),
             })

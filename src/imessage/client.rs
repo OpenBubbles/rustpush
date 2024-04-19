@@ -604,7 +604,7 @@ impl IMClient {
         let sender = message.sender.as_ref().unwrap().to_string();
         self.cache_keys(with_participants, &sender, false).await?;
         let handles = self.get_handles().await;
-        let raw = if message.has_payload() { message.to_raw(&handles) } else { vec![] };
+        let raw = if message.has_payload() { message.to_raw(&handles, &self.conn).await? } else { vec![] };
 
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
