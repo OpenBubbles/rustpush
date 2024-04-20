@@ -4,9 +4,6 @@ use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, str::F
 use flume::RecvError;
 use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
-use plist::Data;
-use regex::bytes;
-use rustls::internal::msgs::message;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
@@ -170,7 +167,7 @@ impl IMClient {
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
                 debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || 
+                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || get_c == 111 || 
                     get_c == 145 || get_c == 143 || get_c == 146 || get_c == 144 || get_c == 140 || get_c == 141
             }).await),
             conn,

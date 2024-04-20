@@ -1,5 +1,5 @@
 
-use std::{io::Cursor, path::PathBuf, sync::Arc, thread::sleep, time::Duration};
+use std::{io::Cursor, path::PathBuf, sync::Arc};
 
 use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};

@@ -239,6 +239,12 @@ struct RawSmsConfirmSent {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawMarkUnread {
+    #[serde(rename = "uG")]
+    msg_id: String
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: Option<String>,

@@ -1,4 +1,4 @@
-use std::{io, fmt::Display};
+use std::io;
 
 #[cfg(feature = "macOS")]
 use open_absinthe::AbsintheError;

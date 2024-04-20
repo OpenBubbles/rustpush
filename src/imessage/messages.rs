@@ -1,6 +1,6 @@
 
 
-use std::{fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{fmt, io::{Cursor, Read, Write}, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, info, warn};
 use openssl::symm::{Cipher, Crypter};
@@ -637,7 +637,8 @@ pub enum Message {
     StopTyping,
     EnableSmsActivation(bool),
     MessageReadOnDevice,
-    SmsConfirmSent
+    SmsConfirmSent,
+    MarkUnread, // send for last message from other participant
 }
 
 impl Message {
@@ -669,6 +670,7 @@ impl Message {
             Self::EnableSmsActivation(_) => 145,
             Self::MessageReadOnDevice => 147,
             Self::SmsConfirmSent => 146,
+            Self::MarkUnread => 111,
         }
     }
 
@@ -692,6 +694,7 @@ impl Message {
             Self::EnableSmsActivation(_) => Some(true),
             Self::MessageReadOnDevice => Some(true),
             Self::SmsConfirmSent => Some(true),
+            Self::MarkUnread => Some(true),
             _ => None
         }
     }
@@ -741,6 +744,9 @@ impl fmt::Display for Message {
             },
             Message::SmsConfirmSent => {
                 write!(f, "confirmed sms send")
+            },
+            Message::MarkUnread => {
+                write!(f, "marked unread")
             }
         }
     }
@@ -836,7 +842,13 @@ impl IMessage {
                     msg_id: self.id.clone()
                 };
                 plist_to_bin(&raw).unwrap()
-            }
+            },
+            Message::MarkUnread => {
+                let raw = RawMarkUnread {
+                    msg_id: self.id.clone()
+                };
+                plist_to_bin(&raw).unwrap()
+            },
             Message::StopTyping => {
                 let raw = RawIMessage {
                     text: None,
@@ -1120,6 +1132,19 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::SmsConfirmSent
+                })
+            }
+        }
+        if let Ok(_loaded) = plist::from_bytes::<RawMarkUnread>(&decompressed) {
+            if wrapper.command == 111 {
+                let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+                return Ok(IMessage {
+                    sender: Some(wrapper.sender.clone()),
+                    id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                    after_guid: None,
+                    sent_timestamp: wrapper.sent_timestamp / 1000000,
+                    conversation: None,
+                    message: Message::MarkUnread
                 })
             }
         }

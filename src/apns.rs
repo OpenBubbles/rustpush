@@ -424,7 +424,7 @@ impl APNSConnection {
 
     pub async fn new(
         os_config: &dyn OSConfig, state: Option<APNSState>) -> Result<APNSConnection, PushError> {
-        let mut state = Arc::new(RwLock::new(match state {
+        let state = Arc::new(RwLock::new(match state {
             Some(state) => state,
             None => {
                 let keypair = generate_push_cert(os_config).await?;
