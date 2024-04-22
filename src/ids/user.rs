@@ -283,7 +283,7 @@ impl IDSUser {
         conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await?;
         debug!("Sent");
 
-        let response = msg.await.unwrap();
+        let response = msg.await.unwrap()?;
         debug!("Recieved");
 
         let data = response.get_field(3).unwrap();

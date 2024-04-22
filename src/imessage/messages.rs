@@ -40,7 +40,8 @@ pub struct ConversationData {
 #[repr(C)]
 pub enum MessagePart {
     Text(String),
-    Attachment(Attachment)
+    Attachment(Attachment),
+    Mention(String, String),
 }
 
 #[repr(C)]
@@ -52,6 +53,10 @@ pub struct MessageParts(pub Vec<IndexedMessagePart>);
 impl MessageParts {
     fn has_attachments(&self) -> bool {
         self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)))
+    }
+
+    fn is_multipart(&self) -> bool {
+        self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)) || matches!(p.0, MessagePart::Mention(_, _)))
     }
 
     fn from_raw(raw: &str) -> MessageParts {
@@ -68,10 +73,12 @@ impl MessageParts {
         writer.write(XmlEvent::start_element("html")).unwrap();
         writer.write(XmlEvent::start_element("body")).unwrap();
         let mut inline_attachment_num = 0;
-        for (idx, part) in self.0.iter().enumerate() {
-            let part_idx = part.1.unwrap_or(idx).to_string();
+        let mut my_part_idx = 0;
+        for part in self.0.iter() {
+            let part_idx = part.1.unwrap_or(my_part_idx).to_string();
             match &part.0 {
                 MessagePart::Attachment(attachment) => {
+                    my_part_idx += 1;
                     let filesize = attachment.get_size().to_string();
                     let element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
@@ -121,6 +128,12 @@ impl MessageParts {
                 MessagePart::Text(text) => {
                     writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
                     writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
+                },
+                MessagePart::Mention(uri, text) => {
+                    writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
+                    writer.write(XmlEvent::start_element("mention").attr("uri", uri)).unwrap();
+                    writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
+                    writer.write(XmlEvent::end_element()).unwrap();
                 }
             }
             writer.write(XmlEvent::end_element()).unwrap();
@@ -171,6 +184,9 @@ impl MessageParts {
                             content_id: Some(format!("<{}>", content_id)),
                             content_location: Some(format!("{content_id}")),
                         }
+                    },
+                    MessagePart::Mention(_uri, _text) => {
+                        panic!("SMS doesn't support mentions!")
                     }
                 })
             }
@@ -207,7 +223,22 @@ impl MessageParts {
         let mut data: Vec<IndexedMessagePart> = vec![];
         let reader: EventReader<Cursor<&str>> = EventReader::new(Cursor::new(xml));
         let mut string_buf = String::new();
+
+        enum StagingElement {
+            Text,
+            Mention(String /* uri */),
+        }
+        impl StagingElement {
+            fn complete(self, buf: String) -> MessagePart {
+                match self {
+                    Self::Mention(user) => MessagePart::Mention(user, buf),
+                    Self::Text => MessagePart::Text(buf)
+                }
+            }
+        }
+
         let mut text_part_idx: Option<usize> = None;
+        let mut staging_item: Option<StagingElement> = None;
         for e in reader {
             match e {
                 Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
@@ -217,10 +248,9 @@ impl MessageParts {
                     };
                     let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
                     if name.local_name == "FILE" {
-                        if string_buf.trim().len() > 0 {
-                            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
-                            string_buf = String::new();
-                            text_part_idx = None;
+                        if staging_item.is_some() {
+                            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
+                            text_part_idx = None; // FILEs are always top-level, so reset the thing
                         }
                         data.push(IndexedMessagePart(MessagePart::Attachment(Attachment {
                             a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
@@ -250,16 +280,24 @@ impl MessageParts {
                         }), part_idx))
                     } else if name.local_name == "span" {
                         text_part_idx = part_idx;
+                    } else if name.local_name == "mention" {
+                        if staging_item.is_some() {
+                            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
+                        }
+                        staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
                     }
                 },
                 Ok(reader::XmlEvent::Characters(data)) => {
+                    if staging_item.is_none() {
+                        staging_item = Some(StagingElement::Text)
+                    }
                     string_buf += &data;
                 }
                 _ => {}
             }
         }
-        if string_buf.trim().len() > 0 {
-            data.push(IndexedMessagePart(MessagePart::Text(string_buf), text_part_idx));
+        if staging_item.is_some() {
+            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
         }
         MessageParts(data)
     }
@@ -267,8 +305,9 @@ impl MessageParts {
     pub fn raw_text(&self) -> String {
         self.0.iter().filter_map(|m| match &m.0 {
             MessagePart::Text(text) => Some(text.clone()),
-            MessagePart::Attachment(_) => None
-        }).collect::<Vec<String>>().join("\n")
+            MessagePart::Attachment(_) => None,
+            MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
+        }).collect::<Vec<String>>().join("")
     }
 }
 
@@ -637,7 +676,7 @@ pub enum Message {
     StopTyping,
     EnableSmsActivation(bool),
     MessageReadOnDevice,
-    SmsConfirmSent,
+    SmsConfirmSent(bool /* status */),
     MarkUnread, // send for last message from other participant
 }
 
@@ -669,7 +708,7 @@ impl Message {
             Self::StopTyping => 100,
             Self::EnableSmsActivation(_) => 145,
             Self::MessageReadOnDevice => 147,
-            Self::SmsConfirmSent => 146,
+            Self::SmsConfirmSent(status) => if *status { 146 } else { 149 },
             Self::MarkUnread => 111,
         }
     }
@@ -677,7 +716,7 @@ impl Message {
     pub(super) fn is_sms(&self) -> bool {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _, from_handle: _ }),
-            Message::SmsConfirmSent => true,
+            Message::SmsConfirmSent(_) => true,
             _ => false
         }
     }
@@ -693,7 +732,7 @@ impl Message {
             Self::Unsend(_) => Some(true),
             Self::EnableSmsActivation(_) => Some(true),
             Self::MessageReadOnDevice => Some(true),
-            Self::SmsConfirmSent => Some(true),
+            Self::SmsConfirmSent(_) => Some(true),
             Self::MarkUnread => Some(true),
             _ => None
         }
@@ -742,8 +781,8 @@ impl fmt::Display for Message {
             Message::MessageReadOnDevice => {
                 write!(f, "confirmed sms activation")
             },
-            Message::SmsConfirmSent => {
-                write!(f, "confirmed sms send")
+            Message::SmsConfirmSent(status) => {
+                write!(f, "confirmed sms send as {}", if *status { "success" } else { "failure" })
             },
             Message::MarkUnread => {
                 write!(f, "marked unread")
@@ -837,7 +876,7 @@ impl IMessage {
                     plist_to_bin(&raw).unwrap()
                 }
             },
-            Message::SmsConfirmSent => {
+            Message::SmsConfirmSent(_success /* handled as c */) => {
                 let raw = RawSmsConfirmSent {
                     msg_id: self.id.clone()
                 };
@@ -933,7 +972,7 @@ impl IMessage {
                             live_xml: None
                         };
         
-                        if normal.parts.has_attachments() {
+                        if normal.parts.is_multipart() {
                             raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
                         }
                         
@@ -1123,7 +1162,7 @@ impl IMessage {
             }
         }
         if let Ok(_loaded) = plist::from_bytes::<RawSmsConfirmSent>(&decompressed) {
-            if wrapper.command == 146 {
+            if wrapper.command == 146 || wrapper.command == 149 {
                 let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
                 return Ok(IMessage {
                     sender: Some(wrapper.sender.clone()),
@@ -1131,7 +1170,7 @@ impl IMessage {
                     after_guid: None,
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
-                    message: Message::SmsConfirmSent
+                    message: Message::SmsConfirmSent(wrapper.command == 146)
                 })
             }
         }

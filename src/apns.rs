@@ -259,7 +259,7 @@ impl APNSReader {
         rx
     }
 
-    pub async fn wait_find_msg<F>(&self, p: F) -> APNSPayload
+    pub async fn wait_find_msg<F>(&self, p: F) -> Result<APNSPayload, PushError>
     where
         F: Fn(&Value) -> bool + Send + Sync + 'static,
     {
@@ -275,7 +275,7 @@ impl APNSReader {
         }).await
     }
 
-    pub async fn wait_find_pred<F>(&self, p: F) -> APNSPayload
+    pub async fn wait_find_pred<F>(&self, p: F) -> Result<APNSPayload, PushError>
     where
         F: Fn(&APNSPayload) -> bool + Send + Sync + 'static,
     {
@@ -283,10 +283,11 @@ impl APNSReader {
         let (tx, rx) = oneshot::channel();
         locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
         drop(locked);
-        rx.await.unwrap()
+        Ok(tokio::time::timeout(Duration::from_secs(15), rx).await
+            .map_err(|_e| PushError::SendTimedOut)?.map_err(|_e| PushError::SendTimedOut)?)
     }
 
-    pub async fn wait_find(&self, id: u8) -> APNSPayload {
+    pub async fn wait_find(&self, id: u8) -> Result<APNSPayload, PushError> {
         self.wait_find_pred(move |item| item.id == id).await
     }
 }
@@ -351,7 +352,7 @@ impl APNSConnection {
     pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
         self.submitter.send_message(topic, payload, id).await?;
         // wait for ack
-        let msg = self.reader.wait_find(0x0B).await;
+        let msg = self.reader.wait_find(0x0B).await?;
         if msg.get_field(8).unwrap()[0] != 0x0 {
             panic!("Failed to send message");
         }
@@ -389,7 +390,7 @@ impl APNSConnection {
         
         submitter.send_payload(7, fields).await?;
 
-        let response = reader.wait_find(8).await;
+        let response = reader.wait_find(8).await?;
         if u8::from_be_bytes(response.get_field(1).unwrap().clone().try_into().unwrap()) != 0x00 {
             return Err(PushError::APNSConnectError)
         }
