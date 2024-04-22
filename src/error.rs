@@ -48,4 +48,6 @@ pub enum PushError {
     SendErr(i64),
     #[error("Bad message")]
     BadMsg,
+    #[error("MMCS Upload failed {0}")]
+    MMCSUploadFailed(u16),
 }

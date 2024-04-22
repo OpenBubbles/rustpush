@@ -32,12 +32,14 @@ message ConfirmResponse {
         string url = 1;
         uint32 status = 2;
         repeated Metric edgeInfo = 4;
+        optional bytes uploadMd5 = 7;
         repeated Metric metrics = 8;
         repeated Metric metrics2 = 9;
         string token = 10;
         uint32 f13 = 13;
     }
     repeated Request inner = 1;
+    optional bytes confirmData = 2;
 }
 
 message HTTPRequest {

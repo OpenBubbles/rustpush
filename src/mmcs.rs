@@ -1,7 +1,7 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APNSConnection};
-use log::{warn, info};
+use crate::{error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{encode_hex, make_reqwest, make_reqwest_system, plist_to_bin}, APNSConnection};
+use log::{debug, info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
 use prost::Message;
@@ -44,18 +44,34 @@ async fn send_mmcs_req(client: &Client, url: &str, method: &str, auth: &str, dsi
 }
 
 // build confirm request, mostly a bunch of analytics I don't care to track accurately
-fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str) -> mmcsp::confirm_response::Request {
-    let edge_info = resp.headers().get("x-apple-edge-info").clone().unwrap().to_str().unwrap().to_string();
+fn confirm_for_resp(resp: &Response, url: &str, conf_token: &str, up_md5: Option<&[u8]>) -> mmcsp::confirm_response::Request {
+    let edge_info = resp.headers().get("x-apple-edge-info").clone().map(|i| i.to_str().unwrap().to_string());
     let status = resp.status();
+    let etag = resp.headers().get("ETag").clone().map(|i| i.to_str().unwrap().to_string());
     mmcsp::confirm_response::Request {
         url: url.to_string(),
         status: status.as_u16() as u32,
         edge_info: [
-            vec![mmcsp::confirm_response::request::Metric {
-                n: "x-apple-edge-info".to_string(),
-                v: edge_info
-            }]
+            if up_md5.is_some() {
+                vec![
+                    mmcsp::confirm_response::request::Metric {
+                        n: "Etag".to_string(),
+                        v: etag.unwrap()
+                    }
+                ]
+            } else {
+                vec![]
+            },
+            if let Some(info) = edge_info {
+                vec![
+                    mmcsp::confirm_response::request::Metric {
+                        n: "x-apple-edge-info".to_string(),
+                        v: info
+                    }
+                ]
+            } else { vec![] }
         ].concat(),
+        upload_md5: up_md5.map(|md5| md5.to_vec()),
         metrics: vec![],
         metrics2: vec![],
         token: conf_token.to_string(),
@@ -108,14 +124,16 @@ struct MMCSPutContainer {
     target: UploadTarget,
     hasher: Hasher,
     sender: Option<flume::Sender<Result<Vec<u8>, PushError>>>,
-    finalize: Option<JoinHandle<Result<(), PushError>>>,
+    finalize: Option<JoinHandle<Result<Response, PushError>>>,
     length: usize,
     transfer_progress: usize,
-    finish_binary: Option<Vec<u8>>
+    finish_binary: Option<Vec<u8>>,
+    for_object: String,
+    confirm_url: String,
 }
 
 impl MMCSPutContainer {
-    fn new(target: UploadTarget, length: usize, finish_binary: Option<Vec<u8>>) -> MMCSPutContainer {
+    fn new(target: UploadTarget, length: usize, finish_binary: Option<Vec<u8>>, for_object: String, confirm_url: String) -> MMCSPutContainer {
         MMCSPutContainer {
             target,
             hasher: Hasher::new(MessageDigest::md5()).unwrap(),
@@ -123,7 +141,9 @@ impl MMCSPutContainer {
             finalize: None,
             length,
             transfer_progress: 0,
-            finish_binary
+            finish_binary,
+            for_object,
+            confirm_url,
         }
     }
     
@@ -141,14 +161,13 @@ impl MMCSPutContainer {
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) {
         if self.sender.is_none() {
-            let (sender, reciever) = flume::bounded(0);
+            let (sender, receiver) = flume::bounded(0);
             self.sender = Some(sender);
-            let body: Body = Body::wrap_stream(reciever.into_stream());
+            let body: Body = Body::wrap_stream(receiver.into_stream());
             let request = self.target.request.clone().unwrap();
             let task = tokio::spawn(async move {
                 let response = transfer_mmcs_container(&make_reqwest_system(), &request, Some(body)).await?;
-                response.bytes().await?;
-                Ok::<(), PushError>(())
+                Ok::<_, PushError>(response)
             });
             self.finalize = Some(task);
 
@@ -179,26 +198,49 @@ impl Container for MMCSPutContainer {
     // finalize the http stream
     async fn finalize(&mut self) -> Result<Option<mmcsp::confirm_response::Request>, PushError> {
         let result = self.hasher.finish()?;
-        let footer = mmcsp::PutFooter {
-            md5_sum: result.to_vec(),
-            confirm_data: self.finish_binary.clone()
-        };
+        
+        return Ok(if complete_req_at_edge(self.target.request.as_ref().unwrap()) {
+            let footer = mmcsp::PutFooter {
+                md5_sum: result.to_vec(),
+                confirm_data: self.finish_binary.clone()
+            };
 
-        let mut buf: Vec<u8> = Vec::new();
-        buf.reserve(footer.encoded_len());
-        footer.encode(&mut buf).unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            buf.reserve(footer.encoded_len());
+            footer.encode(&mut buf).unwrap();
 
-        let result = self.sender.as_ref().unwrap().send_async(Ok([
-            (buf.len() as u32).to_be_bytes().to_vec(),
-            buf
-        ].concat())).await;
-        if let Err(err) = result {
-            err.into_inner()?;
-        }
+            let result = self.sender.as_ref().unwrap().send_async(Ok([
+                (buf.len() as u32).to_be_bytes().to_vec(),
+                buf
+            ].concat())).await;
+            if let Err(err) = result {
+                err.into_inner()?;
+            }
+            self.sender = None;
+            let reader = self.finalize.take().unwrap().await.unwrap()?;
+            reader.bytes().await?;
 
-        self.sender = None;
-        self.finalize.take().unwrap().await.unwrap()?;
-        Ok(None)
+            None
+        } else {
+            self.sender = None;
+            let reader = self.finalize.take().unwrap().await.unwrap()?;
+            let confirmed = confirm_for_resp(&reader, &get_container_url(&self.target.request.as_ref().unwrap()), &self.target.cl_auth_p2, Some(&result));
+            reader.bytes().await?;
+
+            let confirmation = mmcsp::ConfirmResponse {
+                inner: vec![confirmed],
+                confirm_data: self.finish_binary.clone(),
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            buf.reserve(confirmation.encoded_len());
+            confirmation.encode(&mut buf).unwrap();
+            let resp = send_mmcs_req(&make_reqwest(), &self.confirm_url, "putComplete", &format!("{} {} {}", self.target.cl_auth_p1, self.length, self.target.cl_auth_p2), &self.for_object, &buf).await?;
+            if !resp.status().is_success() {
+                return Err(PushError::MMCSUploadFailed(resp.status().as_u16()));
+            }
+
+            None
+        })
     }
 }
 
@@ -281,18 +323,20 @@ pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &Pre
             return false
         };
         c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
-    }).await;
+    }).await?;
     let apns_response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(apns_response.response)).unwrap();
     let sources = vec![ChunkedContainer::new(prepared.chunk_sigs.clone(), source)];
+
+    let confirm_url = format!("{}/{}", apns_response.domain, apns_response.object);
 
     let mut put_containers: Vec<Box<MMCSPutContainer>> = response.targets.iter().map(|target| {
         let len = target.chunks.iter().fold(0, |acc, chunk| {
             let wanted_chunk = prepared.chunk_sigs.iter().find(|test| &test.0[..] == &chunk.chunk_id[..]).unwrap();
             wanted_chunk.1 + acc
         });
-        Box::new(MMCSPutContainer::new(target.clone(), len, response.confirm_data.clone()))
+        Box::new(MMCSPutContainer::new(target.clone(), len, response.confirm_data.clone(), apns_response.object.clone(), confirm_url.clone()))
     }).collect();
     let targets = put_containers.iter_mut().map(|target| {
         ChunkedContainer::new(target.get_chunks(), target.as_mut())
@@ -314,6 +358,10 @@ fn get_container_url(req: &HttpRequest) -> String {
     format!("{}://{}:{}{}", req.scheme, req.domain, req.port, req.path)
 }
 
+fn complete_req_at_edge(req: &HttpRequest) -> bool {
+    req.headers.iter().find_map(|header| if header.name == "x-apple-put-complete-at-edge-version" { Some(header.value.as_str()) } else { None }) == Some("2")
+}
+
 pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: Option<Body>) -> Result<Response, PushError> {
     let data_url = get_container_url(req);
     let mut upload_resp = match req.method.as_str() {
@@ -323,8 +371,9 @@ pub async fn transfer_mmcs_container(client: &Client, req: &HttpRequest, body: O
     }
         .header("x-apple-request-uuid", Uuid::new_v4().to_string().to_uppercase())
         .header("user-agent", "IMTransferAgent/1000 CFNetwork/1335.0.3.4 Darwin/21.6.0");
+    let completing_at_edge = complete_req_at_edge(req);
     for header in &req.headers {
-        if header.name == "Content-Length" || header.name == "Host" {
+        if (header.name == "Content-Length" && completing_at_edge) || header.name == "Host" {
             continue // this isn't a rustpush hack, this is how you *think different*
         }
         upload_resp = upload_resp.header(header.name.clone(), header.value.clone());
@@ -520,7 +569,7 @@ impl MMCSGetContainer {
     async fn ensure_stream(&mut self) {
         if self.response.is_none() {
             let response = transfer_mmcs_container(&make_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await.unwrap();
-            self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2));
+            self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None));
             self.response = Some(response);
         }
     }
@@ -531,16 +580,16 @@ impl Container for MMCSGetContainer {
     async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
         self.ensure_stream().await;
 
-        let mut recieved = self.cacher.read_exact(len);
-        while recieved.is_none() {
+        let mut received = self.cacher.read_exact(len);
+        while received.is_none() {
             let Some(bytes) = self.response.as_mut().unwrap().chunk().await? else {
                 return Ok(self.cacher.read_all())
             };
             self.cacher.data_avail(&bytes);
-            recieved = self.cacher.read_exact(len);
+            received = self.cacher.read_exact(len);
         }
         
-        let read = recieved.unwrap();
+        let read = received.unwrap();
         self.transfer_progress += read.len();
         Ok(read)
     }
@@ -616,7 +665,7 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection
             return false
         };
         c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
-    }).await;
+    }).await?;
     let apns_response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
 
     let data: Vec<u8> = apns_response.response.clone().into();
@@ -648,7 +697,8 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection
     matcher.transfer_chunks(progress).await?;
 
     let confirmation = mmcsp::ConfirmResponse {
-        inner: matcher.get_confirm_reciepts().to_vec()
+        inner: matcher.get_confirm_reciepts().to_vec(),
+        confirm_data: None,
     };
     let mut buf: Vec<u8> = Vec::new();
     buf.reserve(confirmation.encoded_len());
