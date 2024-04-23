@@ -162,6 +162,12 @@ impl APNSReader {
     async fn reload_connection(self, write: APNSSubmitter, state: Arc<RwLock<APNSState>>, retry: u64, mut reload: tokio::sync::mpsc::Receiver<()>) {
         info!("attempting to reconnect to APNs!");
         tokio::time::sleep(Duration::from_secs(std::cmp::min(10 * retry, 30))).await;
+
+        // notify all oneshot listeners that what they're waiting for won't be coming
+        let mut waiting = self.0.lock().await;
+        waiting.retain(|i| matches!(i.when, WaitingCb::Cont(_)));
+        drop(waiting);
+
         let stream = match APNSConnection::connect().await {
             Ok(stream) => stream,
             Err(err) => {
