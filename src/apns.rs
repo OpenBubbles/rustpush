@@ -1,10 +1,10 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::{Duration, SystemTime}};
 
 use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
 use plist::Value;
 use rustls::Certificate;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, sync::{mpsc::{self, Receiver}, oneshot, Mutex, RwLock}};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, select, sync::{mpsc::{self, Receiver, Sender}, oneshot, Mutex, RwLock}};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rand::Rng;
 use std::net::ToSocketAddrs;
@@ -155,18 +155,18 @@ struct WaitingTask {
 }
 
 #[derive(Clone)]
-pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>);
+pub struct APNSReader(Arc<Mutex<Vec<WaitingTask>>>, Sender<()>);
 
 impl APNSReader {
     #[async_recursion]
-    async fn reload_connection(self, write: APNSSubmitter, state: Arc<RwLock<APNSState>>, retry: u64) {
+    async fn reload_connection(self, write: APNSSubmitter, state: Arc<RwLock<APNSState>>, retry: u64, mut reload: tokio::sync::mpsc::Receiver<()>) {
         info!("attempting to reconnect to APNs!");
         tokio::time::sleep(Duration::from_secs(std::cmp::min(10 * retry, 30))).await;
         let stream = match APNSConnection::connect().await {
             Ok(stream) => stream,
             Err(err) => {
                 warn!("failed to reconnect to APNs! {:?}", err);
-                self.reload_connection(write, state, retry + 1).await;
+                self.reload_connection(write, state, retry + 1, reload).await;
                 return;
             }
         };
@@ -183,16 +183,38 @@ impl APNSReader {
                 warn!("failed to conenct to APNs: {:?}", err);
             }
         });
-        self.read_connection(read, write, state).await;
+        while let Ok(_) = reload.try_recv() { } // drain queue
+        self.read_connection(read, write, state, reload).await;
     }
 
-    async fn read_connection(self, mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: Arc<RwLock<APNSState>>) {
+    async fn read_connection(self, mut read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: Arc<RwLock<APNSState>>, mut reload: tokio::sync::mpsc::Receiver<()>) {
+        let connected_time = SystemTime::now();
         loop {
-            let result = APNSPayload::read(&mut read).await;
+            let result = select! {
+                read = APNSPayload::read(&mut read) => {
+                    read
+                },
+                _ = reload.recv() => {
+                    if let Ok(elapsed) = connected_time.elapsed() {
+                        if elapsed.as_secs() < 15 {
+                            info!("ignoring stray for reload!");
+                            // this was sent from *before* we reconnected, ignore it
+                            continue
+                        }
+                    }
+                    info!("reconnecting for reload!");
+                    let mut locked = write.0.lock().await;
+                    let _ = locked.stream.shutdown().await;
+                    drop(locked);
+                    drop(read);
+                    self.reload_connection(write, state, 0, reload).await;
+                    break
+                }
+            };
             let Ok(payload) = result else {
                 warn!("conn broken? {:?}", result);
                 drop(read);
-                self.reload_connection(write, state, 0).await;
+                self.reload_connection(write, state, 0, reload).await;
                 break // maybe conn broken?
             };
             let Some(payload) = payload else {
@@ -241,10 +263,11 @@ impl APNSReader {
     }
 
     fn new(read: ReadHalf<TlsStream<TcpStream>>, write: APNSSubmitter, state: Arc<RwLock<APNSState>>) -> APNSReader {
-        let reader = APNSReader(Arc::new(Mutex::new(vec![])));
+        let (send, recv) = tokio::sync::mpsc::channel(1);
+        let reader = APNSReader(Arc::new(Mutex::new(vec![])), send);
         let reader_clone = reader.clone();
         tokio::spawn(async move {
-            reader_clone.read_connection(read, write, state).await;
+            reader_clone.read_connection(read, write, state, recv).await;
         });
         reader
     }
@@ -283,8 +306,17 @@ impl APNSReader {
         let (tx, rx) = oneshot::channel();
         locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
         drop(locked);
-        Ok(tokio::time::timeout(Duration::from_secs(15), rx).await
-            .map_err(|_e| PushError::SendTimedOut)?.map_err(|_e| PushError::SendTimedOut)?)
+        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+            Ok(val) => {
+                Ok(val.map_err(|_e| PushError::SendTimedOut)?)
+            },
+            Err(_) => {
+                // notify of timeout
+                info!("timed out, notifying for reload!");
+                self.1.send(()).await.unwrap();
+                Err(PushError::SendTimedOut)
+            }
+        }
     }
 
     pub async fn wait_find(&self, id: u8) -> Result<APNSPayload, PushError> {
@@ -408,15 +440,6 @@ impl APNSConnection {
 
         debug!("Recieved connect response with token {:?}", token);
 
-        let write = submitter.clone();
-        tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(300));
-            loop {
-                interval.tick().await;
-                let _ = write.keep_alive().await;
-            }
-        });
-
         submitter.set_state(1).await.unwrap();
         submitter.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await.unwrap();
 
@@ -441,6 +464,18 @@ impl APNSConnection {
         let reader = APNSReader::new(read, writer.clone(), state.clone());
 
         APNSConnection::init_conn(&writer, &reader, &mut *state.write().await).await?;
+
+        let write = writer.clone();
+        let my_reader = reader.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let _ = write.keep_alive().await;
+                let _ = my_reader.wait_find(0xD).await;
+                info!("keep alive confirmed");
+            }
+        });
 
         let conn: APNSConnection = APNSConnection {
             reader,

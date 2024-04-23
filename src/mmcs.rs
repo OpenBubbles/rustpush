@@ -1,7 +1,7 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{encode_hex, make_reqwest, make_reqwest_system, plist_to_bin}, APNSConnection};
-use log::{debug, info, warn};
+use crate::{error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APNSConnection};
+use log::{info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
 use prost::Message;

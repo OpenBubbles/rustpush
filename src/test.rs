@@ -226,7 +226,9 @@ async fn main() {
                             cv_name: None,
                             sender_guid: Some(Uuid::new_v4().to_string())
                         }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage))).await;
-                        client.send(&mut msg).await.unwrap();
+                        if let Err(err) = client.send(&mut msg).await {
+                            error!("Error sending message {err}");
+                        }
                     }
                 }
                 print!(">> ");
