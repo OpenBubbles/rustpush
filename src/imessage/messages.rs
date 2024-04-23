@@ -942,8 +942,8 @@ impl IMessage {
                     gv: "8".to_string(),
                     v: "1".to_string(),
                     cv_name: conversation.cv_name.clone(),
-                    msi: plist_to_bin(&MsiData {
-                        ams: "test".to_string(),
+                    notification: plist_to_bin(&NotificationData {
+                        ams: react.to_text.clone(),
                         amc: 1
                     }).unwrap().into(),
                     amk: format!("p:{}/{}", react.to_part, react.to_uuid)

@@ -4,7 +4,7 @@ use crate::mmcs::MMCSTransferData;
 // raw messages used for communicating with APNs
 
 #[derive(Serialize, Deserialize)]
-struct MsiData {
+struct NotificationData {
     pub ams: String,
     pub amc: u64,
 }
@@ -94,7 +94,8 @@ struct RawReactMessage {
     v: String,
     #[serde(rename = "n")]
     cv_name: Option<String>,
-    msi: Data,
+    #[serde(rename = "msi")]
+    notification: Data,
     amk: String
 }
 
