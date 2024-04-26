@@ -177,17 +177,20 @@ async fn main() {
                                 if inner.service == MessageType::IMessage {
                                     let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                     msg2.id = msg.id;
+                                    msg2.target = msg.target;
                                     client.send(&mut msg2).await.unwrap();
                                 }
                             },
                             Message::React(_inner) => {
                                 let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                 msg2.id = msg.id;
+                                msg2.target = msg.target;
                                 client.send(&mut msg2).await.unwrap();
                             },
                             Message::Typing => {
                                 let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
                                 msg2.id = msg.id;
+                                msg2.target = msg.target;
                                 client.send(&mut msg2).await.unwrap();
                             },
                             _ => {}

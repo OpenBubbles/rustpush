@@ -10,7 +10,7 @@ use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, MessageTarget, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -25,6 +25,15 @@ const KEY_REFRESH_MS: u64 = 86400 * 1000; // one day
 struct CachedKeys {
     keys: Vec<IDSIdentityResult>,
     at_ms: u64
+}
+
+impl CachedKeys {
+    fn is_valid(&self) -> bool {
+        let ms_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards").as_millis() as u64; // make serde happy
+        ms_now <= self.at_ms + KEY_REFRESH_MS
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -94,22 +103,39 @@ impl KeyCache {
         handle_cache.keys.remove(keys_for);
         self.save();
     }
+
+    fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSIdentityResult)>, PushError> {
+        let Some(handle_cache) = self.cache.get(handle) else {
+            return Err(PushError::KeyNotFound(handle.to_string()))
+        };
+        let target_tokens: Vec<_> = keys_for.iter().map(|i| match i {
+            MessageTarget::Token(token) => token,
+            MessageTarget::Uuid(_) => panic!("no support")
+        }).collect();
+        if let Some(not_found) = participants.iter().find(|p| 
+                !handle_cache.keys.get(*p).map(|c| c.is_valid()).unwrap_or(false)) {
+            return Err(PushError::KeyNotFound(not_found.to_string())) // at least one of our caches isn't up-to-date
+        }
+        Ok(participants.iter().flat_map(|p| {
+            let Some(eval_keys) = handle_cache.keys.get(p) else {
+                return vec![]
+            };
+            eval_keys.keys.iter().filter(|cached| target_tokens.contains(&&cached.push_token)).map(|i| (p.as_str(), i)).collect()
+        }).collect())
+    }
     
-    fn get_keys(&self, handle: &str, keys_for: &str) -> Option<&Vec<IDSIdentityResult>> {
+    fn get_keys(&self, handle: &str, keys_for: &str) -> Option<Vec<&IDSIdentityResult>> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return None
         };
         let Some(cached) = handle_cache.keys.get(keys_for) else {
             return None
         };
-        let ms_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards").as_millis() as u64; // make serde happy
-        if ms_now > cached.at_ms + KEY_REFRESH_MS {
+        if !cached.is_valid() {
             // expired
             None
         } else {
-            Some(&cached.keys)
+            Some(cached.keys.iter().collect())
         }
     }
 
@@ -379,6 +405,7 @@ impl IMClient {
                 } else {
                     Message::Read
                 },
+                target: Some(vec![MessageTarget::Token(load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap().to_vec())]),
                 sent_timestamp: time_recv / 1000000
             }))
         }
@@ -506,7 +533,8 @@ impl IMClient {
             after_guid: None,
             sent_timestamp: 0,
             conversation: Some(conversation),
-            message
+            message,
+            target: None
         }
     }
 
@@ -606,30 +634,37 @@ impl IMClient {
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
         let key_cache = self.key_cache.lock().await;
-        for participant in with_participants {
-            debug!("sending to participant {}", participant);
-            for token in key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))? {
-                if &token.push_token == &self.conn.get_token().await {
-                    // don't send to ourself
-                    continue;
-                }
-                let encrypted = if message.has_payload() {
-                    let payload = self.encrypt_payload(&raw, &token.identity, &sender).await?;
-                    Some(payload)
-                } else {
-                    None
-                };
-
-                debug!("sending to token {}", base64_encode(&token.push_token));
-
-                payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
-                    participant: participant.clone(),
-                    not_me: participant != message.sender.as_ref().unwrap(),
-                    session_token: token.session_token.clone().into(),
-                    payload: encrypted.map(|e| e.into()),
-                    token: token.push_token.clone().into()
-                }));
+        let target_identities = if let Some(exact_targets) = &message.target {
+            key_cache.get_targets(&sender, &with_participants, &exact_targets)?
+        } else {
+            let mut result = vec![];
+            for participant in with_participants {
+                let keys = key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))?;
+                result.extend(keys.into_iter().map(|i| (participant.as_str(), i)))
             }
+            result
+        };
+        for (participant, token) in target_identities {
+            if &token.push_token == &self.conn.get_token().await {
+                // don't send to ourself
+                continue;
+            }
+            let encrypted = if message.has_payload() {
+                let payload = self.encrypt_payload(&raw, &token.identity, &sender).await?;
+                Some(payload)
+            } else {
+                None
+            };
+
+            debug!("sending to token {}", base64_encode(&token.push_token));
+
+            payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
+                participant: participant.to_string(),
+                not_me: participant != message.sender.as_ref().unwrap(),
+                session_token: token.session_token.clone().into(),
+                payload: encrypted.map(|e| e.into()),
+                token: token.push_token.clone().into()
+            }));
         }
         drop(key_cache);
 

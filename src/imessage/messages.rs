@@ -805,6 +805,12 @@ fn add_prefix(participants: &[String]) -> Vec<String> {
     }).collect()
 }
 
+#[repr(C)]
+pub enum MessageTarget {
+    Token(Vec<u8>),
+    Uuid(String),
+}
+
 // a message that can be sent to other iMessage users
 #[repr(C)]
 pub struct IMessage {
@@ -813,7 +819,8 @@ pub struct IMessage {
     pub after_guid: Option<String>,
     pub conversation: Option<ConversationData>,
     pub message: Message,
-    pub sent_timestamp: u64
+    pub sent_timestamp: u64,
+    pub target: Option<Vec<MessageTarget>>,
 }
 
 impl IMessage {
@@ -1145,6 +1152,7 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::EnableSmsActivation(true),
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
                 })
             }
         }
@@ -1158,6 +1166,7 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::EnableSmsActivation(false),
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
                 })
             }
         }
@@ -1170,7 +1179,8 @@ impl IMessage {
                     after_guid: None,
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
-                    message: Message::SmsConfirmSent(wrapper.command == 146)
+                    message: Message::SmsConfirmSent(wrapper.command == 146),
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
                 })
             }
         }
@@ -1183,7 +1193,8 @@ impl IMessage {
                     after_guid: None,
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
-                    message: Message::MarkUnread
+                    message: Message::MarkUnread,
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
                 })
             }
         }
@@ -1196,6 +1207,7 @@ impl IMessage {
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: None,
                 message: Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
@@ -1211,6 +1223,7 @@ impl IMessage {
                     edit_part: loaded.part_index,
                     new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawChangeMessage>(&decompressed) {
@@ -1226,6 +1239,7 @@ impl IMessage {
                     sender_guid: loaded.sender_guid.clone()
                 }),
                 message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
@@ -1245,6 +1259,7 @@ impl IMessage {
                     file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
                     group_version: loaded.group_version
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawRenameMessage>(&decompressed) {
@@ -1260,6 +1275,7 @@ impl IMessage {
                     sender_guid: loaded.sender_guid.clone(),
                 }),
                 message: Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawReactMessage>(&decompressed) {
@@ -1289,6 +1305,7 @@ impl IMessage {
                     enable: enabled,
                     reaction: ReactMessage::from_idx(id).ok_or(PushError::BadMsg)?
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawMmsIncomingMessage>(&decompressed) {
@@ -1335,6 +1352,7 @@ impl IMessage {
                         from_handle: Some(loaded.sender.clone()),
                     }
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawSmsOutgoingMessage>(&decompressed) {
@@ -1366,6 +1384,7 @@ impl IMessage {
                         from_handle: None,
                     }
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawIMessage>(&decompressed) {
@@ -1405,6 +1424,7 @@ impl IMessage {
                     reply_part: replies.as_ref().map(|r| r.1.clone()),
                     service: MessageType::IMessage
                 }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
         Err(PushError::BadMsg)

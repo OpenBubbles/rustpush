@@ -52,6 +52,14 @@ async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> 
     let result = attempt_auth(username, pet, os_config).await?;
     // attempt 2fa
     let result_dict = result.as_dictionary().unwrap();
+
+    if let Some(error) = result_dict.get("ErrorID") {
+        let error = error.as_string().unwrap();
+        if error == "UNAUTHORIZED" {
+            return Err(PushError::LoginUnauthorized)
+        }
+    }
+
     if result_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
         return Err(PushError::AuthError(result.clone()));
     }
