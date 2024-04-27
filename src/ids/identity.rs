@@ -265,7 +265,7 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
         ("os-version", Value::String(meta.os_version)),
         ("software-version", Value::String(meta.software_version)),
         ("private-device-data", Value::Dictionary(Dictionary::from_iter([
-            ("u", Value::String(Uuid::new_v4().to_string().to_uppercase())),
+            ("u", Value::String(os_config.get_device_uuid().to_uppercase())),
         ]))),
         ("services", Value::Array(vec![
             Value::Dictionary(Dictionary::from_iter([

@@ -69,6 +69,10 @@ impl OSConfig for MacOSConfig {
         "MacOS".to_string()
     }
 
+    fn get_device_uuid(&self) -> String {
+        self.device_id.clone()
+    }
+
     fn get_device_name(&self) -> String {
         format!("Mac-{}", self.inner.platform_serial_number)
     }
