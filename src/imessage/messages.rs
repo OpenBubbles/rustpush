@@ -678,6 +678,7 @@ pub enum Message {
     MessageReadOnDevice,
     SmsConfirmSent(bool /* status */),
     MarkUnread, // send for last message from other participant
+    PeerCacheInvalidate,
 }
 
 impl Message {
@@ -710,6 +711,7 @@ impl Message {
             Self::MessageReadOnDevice => 147,
             Self::SmsConfirmSent(status) => if *status { 146 } else { 149 },
             Self::MarkUnread => 111,
+            Self::PeerCacheInvalidate => 130,
         }
     }
 
@@ -734,6 +736,7 @@ impl Message {
             Self::MessageReadOnDevice => Some(true),
             Self::SmsConfirmSent(_) => Some(true),
             Self::MarkUnread => Some(true),
+            Self::PeerCacheInvalidate => Some(true),
             _ => None
         }
     }
@@ -786,6 +789,9 @@ impl fmt::Display for Message {
             },
             Message::MarkUnread => {
                 write!(f, "marked unread")
+            },
+            Message::PeerCacheInvalidate => {
+                write!(f, "logged in on a new device")
             }
         }
     }
@@ -841,6 +847,7 @@ impl IMessage {
             Message::Typing => false,
             Message::StopTyping => false,
             Message::MessageReadOnDevice => false,
+            Message::PeerCacheInvalidate => false,
             _ => true
         }
     }
@@ -1078,6 +1085,7 @@ impl IMessage {
             Message::Read => panic!("no enc body!"),
             Message::Typing => panic!("no enc body!"),
             Message::MessageReadOnDevice => panic!("no enc body!"),
+            Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {
                     rs: true,

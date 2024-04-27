@@ -225,7 +225,6 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
                 ("supports-people-request-messages-v2", Value::Boolean(true)),
                 ("supports-people-request-messages-v3", Value::Boolean(true)),
                 ("supports-rem", Value::Boolean(true)),
-                ("kt-version", Value::Real(5.0)),
                 ("nicknames-version", Value::Real(1.0)),
                 ("ec-version", Value::Real(1.0)),
                 ("supports-cross-platform-sharing", Value::Boolean(true)),
@@ -241,7 +240,6 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
                 ("supports-dq-nr", Value::Boolean(true)),
                 ("supports-family-invite-message-bubble", Value::Boolean(true)),
                 ("supports-live-delivery", Value::Boolean(true)),
-                ("supports-uwb", Value::Boolean(true)),
 
             ].into_iter()))),
             ("uris", Value::Array(
@@ -261,7 +259,7 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
     let meta = os_config.get_register_meta();
 
     let body = Value::Dictionary(Dictionary::from_iter([
-        ("device-name", Value::String(format!("Mac-{}", os_config.get_device_name()))),
+        ("device-name", Value::String(os_config.get_device_name())),
         ("hardware-version", Value::String(meta.hardware_version)),
         ("language", Value::String("en-US".to_string())),
         ("os-version", Value::String(meta.os_version)),

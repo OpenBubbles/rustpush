@@ -241,10 +241,52 @@ pub struct IDSIdentityResult {
     pub session_token: Vec<u8>
 }
 
+#[repr(C)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PrivateDeviceInfo {
+    pub uuid: Option<String>,
+    pub device_name: Option<String>,
+    pub token: Vec<u8>,
+    pub is_hsa_trusted: bool,
+    pub identites: Vec<String>,
+}
+
 impl IDSUser {
     // possible handles, which may have changed since registration
     pub async fn possible_handles(&self, conn: &APNSConnection) -> Result<Vec<String>, PushError> {
         get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &*conn.state.read().await).await
+    }
+
+    pub async fn get_dependent_registrations(&self, conn: &APNSConnection) -> Result<Vec<PrivateDeviceInfo>, PushError> {
+        let ids_bag = get_bag(IDS_BAG).await?;
+        let client = make_reqwest();
+        let conn_state = conn.state.read().await;
+        let resp = auth_sign_req(
+                client.get(ids_bag.get("id-get-dependent-registrations").unwrap().as_string().unwrap())
+                .header("x-protocol-version", self.protocol_version.to_string())
+                .header("x-auth-user-id", &self.user_id),
+                &[],
+                "id-get-dependent-registrations",
+                &self.auth_keypair,
+                &*conn_state,
+                None)?
+                .send()
+                .await?;
+        
+        let data = resp.bytes().await?;
+        let parsed: Value = plist::from_bytes(&data)?;
+        let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
+
+        Ok(devices.iter().map(|dev| {
+            let dict = dev.as_dictionary().unwrap();
+            PrivateDeviceInfo {
+                is_hsa_trusted: dict.get("is-hsa-trusted-device").unwrap().as_boolean().unwrap(),
+                uuid: dict.get("private-device-data").and_then(|i| i.as_dictionary().unwrap().get("u").map(|i| i.as_string().unwrap().to_string())),
+                device_name: dict.get("device-name").map(|i| i.as_string().unwrap().to_string()),
+                token: dict.get("push-token").unwrap().as_data().unwrap().to_vec(),
+                identites: dict.get("identities").unwrap().as_array().unwrap().iter().map(|id| id.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap().to_string()).collect(),
+            }
+        }).collect())
     }
 
     pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {

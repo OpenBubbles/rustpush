@@ -10,7 +10,7 @@ use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser}}, imessage::messages::{BundledPayload, MessageTarget, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo}}, imessage::messages::{BundledPayload, MessageTarget, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -41,6 +41,7 @@ struct CachedHandle {
     keys: HashMap<String, CachedKeys>,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize_sha")]
     env_hash: [u8; 20],
+    private_data: Vec<PrivateDeviceInfo>,
 }
 
 impl CachedHandle {
@@ -108,10 +109,15 @@ impl KeyCache {
         let Some(handle_cache) = self.cache.get(handle) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
         };
-        let target_tokens: Vec<_> = keys_for.iter().map(|i| match i {
+        let target_tokens = keys_for.iter().map(|i| Ok(match i {
             MessageTarget::Token(token) => token,
-            MessageTarget::Uuid(_) => panic!("no support")
-        }).collect();
+            MessageTarget::Uuid(uuid) => {
+                let Some(saved) = handle_cache.private_data.iter().find(|p| p.uuid.as_ref() == Some(uuid)) else {
+                    return Err(PushError::KeyNotFound(uuid.to_string()))
+                };
+                &saved.token
+            }
+        })).collect::<Result<Vec<_>, PushError>>()?;
         if let Some(not_found) = participants.iter().find(|p| 
                 !handle_cache.keys.get(*p).map(|c| c.is_valid()).unwrap_or(false)) {
             return Err(PushError::KeyNotFound(not_found.to_string())) // at least one of our caches isn't up-to-date
@@ -193,7 +199,7 @@ impl IMClient {
                 let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
                 let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
                 debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || get_c == 111 || 
+                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || get_c == 111 || get_c == 130 ||
                     get_c == 145 || get_c == 143 || get_c == 146 || get_c == 144 || get_c == 140 || get_c == 141 || get_c == 149
             }).await),
             conn,
@@ -292,7 +298,15 @@ impl IMClient {
             tokio::time::sleep(Duration::from_millis((retry as u64 - 1) * 60000)).await;
         }
 
-        self.cache_keys(&[sender.to_string()], handle, retry > 0).await.unwrap();
+        if let Err(error) = self.cache_keys(&[sender.to_string()], handle, retry > 0).await {
+            warn!("Cannot verify; failed to query! {}", error);
+            if retry < 3 {
+                return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
+            } else {
+                warn!("giving up");
+            }
+            return false
+        }
 
         let cache = self.key_cache.lock().await;
 
@@ -367,6 +381,44 @@ impl IMClient {
         users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
+    pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
+        let mut cache_lock = self.key_cache.lock().await;
+        self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
+        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        Ok(private_self.clone())
+    }
+
+    pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
+        let mut cache_lock = self.key_cache.lock().await;
+        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        if let Some(found) = private_self.iter().find(|i| i.token == token) {
+            if let Some(uuid) = &found.uuid {
+                return Ok(uuid.clone())
+            }
+        }
+        self.ensure_private_self(&mut cache_lock, handle, true).await?;
+        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        Ok(private_self.iter().find(|i| i.token == token).ok_or(PushError::KeyNotFound(handle.to_string()))?.uuid.as_ref()
+            .ok_or(PushError::KeyNotFound(handle.to_string()))?.clone())
+    }
+
+    async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
+        let my_cache = cache_lock.cache.get_mut(handle).unwrap();
+        if my_cache.private_data.len() != 0 && !refresh {
+            return Ok(())
+        }
+        let user_lock = self.users.read().await;
+        let my_user = Self::user_by_handle(&user_lock, handle);
+        let regs = my_user.get_dependent_registrations(&self.conn).await?;
+        if my_cache.private_data.len() != 0 && regs.len() != my_cache.private_data.len() {
+            // something changed, requery IDS too
+            cache_lock.invalidate(handle, handle);
+        }
+        cache_lock.cache.get_mut(handle).unwrap().private_data = regs;
+        cache_lock.save();
+        Ok(())
+    }
+
     async fn recieve_payload(&self, payload: APNSPayload) -> Result<Option<IMessage>, PushError> {
         let body = payload.get_field(3).unwrap();
 
@@ -414,12 +466,37 @@ impl IMClient {
             let mut cache_lock = self.key_cache.lock().await;
             let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
             let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
-            if self.get_handles().await.contains(&source.to_string()) && source == target {
-                info!("Re-registering due to new handles");
-                self.reregister().await;
-            }
-            cache_lock.invalidate(source, target);
-            return Ok(None)
+            cache_lock.invalidate(target, source);
+            return Ok(if self.get_handles().await.contains(&source.to_string()) && source == target {
+                self.ensure_private_self(&mut cache_lock, target, true).await?;
+                let private_self = &cache_lock.cache.get(target).unwrap().private_data;
+
+                let sender_token = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap().to_vec();
+                let Some(new_device) = private_self.iter().find(|dev| dev.token == sender_token) else {
+                    error!("New device c:130 not listed in dependent registrations!");
+                    return Ok(None)
+                };
+
+                if new_device.identites.len() != self.get_handles().await.len() {
+                    info!("Re-registering due to new handles");
+                    self.reregister().await;
+                }
+
+                let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
+                let time_recv = load.as_dictionary().unwrap().get("e").unwrap().as_unsigned_integer().unwrap();
+                // we need to forward to our chats
+                Some(IMessage {
+                    id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
+                    sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
+                    after_guid: None,
+                    conversation: None,
+                    message: Message::PeerCacheInvalidate,
+                    target: Some(vec![MessageTarget::Token(sender_token)]),
+                    sent_timestamp: time_recv / 1000000
+                })
+            } else {
+                None
+            })
         }
 
         if !has_p {
@@ -608,6 +685,14 @@ impl IMClient {
                 !handles.contains(p)
             });
         }
+        if let Message::PeerCacheInvalidate = message.message {
+            if target_participants.len() > 1 {
+                // if we're sending to a chat, don't send to us again.
+                target_participants.retain(|p| {
+                    !handles.contains(p)
+                });
+            }
+        }
         if message.message.is_sms() {
             target_participants = vec![message.sender.as_ref().unwrap().clone()];
         }
@@ -644,6 +729,7 @@ impl IMClient {
             }
             result
         };
+        info!("sending with {} {}", target_identities.len(), message.target.as_ref().map(|i| i.len()).unwrap_or(99999));
         for (participant, token) in target_identities {
             if &token.push_token == &self.conn.get_token().await {
                 // don't send to ourself
