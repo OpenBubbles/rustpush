@@ -249,6 +249,7 @@ pub struct PrivateDeviceInfo {
     pub token: Vec<u8>,
     pub is_hsa_trusted: bool,
     pub identites: Vec<String>,
+    pub sub_services: Vec<String>,
 }
 
 impl IDSUser {
@@ -277,15 +278,19 @@ impl IDSUser {
         let parsed: Value = plist::from_bytes(&data)?;
         let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
 
-        Ok(devices.iter().map(|dev| {
+        Ok(devices.iter().filter_map(|dev| {
             let dict = dev.as_dictionary().unwrap();
-            PrivateDeviceInfo {
+            if dict.get("service").unwrap().as_string().unwrap() != "com.apple.madrid" {
+                return None
+            }
+            Some(PrivateDeviceInfo {
                 is_hsa_trusted: dict.get("is-hsa-trusted-device").unwrap().as_boolean().unwrap(),
                 uuid: dict.get("private-device-data").and_then(|i| i.as_dictionary().unwrap().get("u").map(|i| i.as_string().unwrap().to_string())),
                 device_name: dict.get("device-name").map(|i| i.as_string().unwrap().to_string()),
                 token: dict.get("push-token").unwrap().as_data().unwrap().to_vec(),
                 identites: dict.get("identities").unwrap().as_array().unwrap().iter().map(|id| id.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap().to_string()).collect(),
-            }
+                sub_services: dict.get("sub-services").unwrap().as_array().unwrap().iter().map(|id| id.as_string().unwrap().to_string()).collect(),
+            })
         }).collect())
     }
 
