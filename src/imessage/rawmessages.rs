@@ -95,8 +95,14 @@ struct RawReactMessage {
     #[serde(rename = "n")]
     cv_name: Option<String>,
     #[serde(rename = "msi")]
-    notification: Data,
-    amk: String
+    notification: Option<Data>,
+    amk: String,
+    #[serde(rename = "ati")]
+    type_spec: Option<Data>,
+    #[serde(rename = "x")]
+    xml: Option<String>,
+    #[serde(rename = "pRID")]
+    prid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,6 +116,16 @@ struct RawEditMessage {
     part_index: u64,
     #[serde(rename = "emg")]
     message: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawUpdateExtensionMessage {
+    #[serde(rename = "v")]
+    version: String,
+    #[serde(rename = "scig")]
+    target_id: String,
+    #[serde(rename = "srpi")]
+    new_info: Value,
 }
 
 #[derive(Serialize, Deserialize)]

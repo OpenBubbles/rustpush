@@ -1,10 +1,10 @@
 
 
-use std::{fmt, io::{Cursor, Read, Write}, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, info, warn};
 use openssl::symm::{Cipher, Crypter};
-use plist::Data;
+use plist::{Data, Value};
 use regex::Regex;
 use uuid::Uuid;
 use rand::Rng;
@@ -45,22 +45,30 @@ pub enum MessagePart {
 }
 
 #[repr(C)]
-pub struct IndexedMessagePart(pub MessagePart, pub Option<usize>);
+pub struct IndexedMessagePart {
+    pub part: MessagePart,
+    pub idx: Option<usize>,
+    pub ext: Option<PartExtension>,
+}
 
 #[repr(C)]
 pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
     fn has_attachments(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)))
+        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)))
     }
 
     fn is_multipart(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.0, MessagePart::Attachment(_)) || matches!(p.0, MessagePart::Mention(_, _)))
+        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)) || matches!(p.part, MessagePart::Mention(_, _)))
     }
 
     fn from_raw(raw: &str) -> MessageParts {
-        MessageParts(vec![IndexedMessagePart(MessagePart::Text(raw.to_string()), None)])
+        MessageParts(vec![IndexedMessagePart {
+            part: MessagePart::Text(raw.to_string()),
+            idx: None,
+            ext: None,
+        }])
     }
 
     // Convert parts into xml for a RawIMessage
@@ -75,12 +83,12 @@ impl MessageParts {
         let mut inline_attachment_num = 0;
         let mut my_part_idx = 0;
         for part in self.0.iter() {
-            let part_idx = part.1.unwrap_or(my_part_idx).to_string();
-            match &part.0 {
+            let part_idx = part.idx.unwrap_or(my_part_idx).to_string();
+            match &part.part {
                 MessagePart::Attachment(attachment) => {
                     my_part_idx += 1;
                     let filesize = attachment.get_size().to_string();
-                    let element = XmlEvent::start_element("FILE")
+                    let mut element = XmlEvent::start_element("FILE")
                         .attr("name", &attachment.name)
                         .attr("width", "0")
                         .attr("height", "0")
@@ -89,6 +97,10 @@ impl MessageParts {
                         .attr("uti-type", &attachment.uti_type)
                         .attr("file-size", &filesize)
                         .attr("message-part", &part_idx);
+                    let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                    for (key, val) in &ext {
+                        element = element.attr(key.as_str(), val);
+                    }
                     match &attachment.a_type {
                         AttachmentType::Inline(data) => {
                             let num = if inline_attachment_num == 0 {
@@ -126,11 +138,21 @@ impl MessageParts {
                     }
                 },
                 MessagePart::Text(text) => {
-                    writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
+                    let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
+                    let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                    for (key, val) in &ext {
+                        element = element.attr(key.as_str(), val);
+                    }
+                    writer.write(element).unwrap();
                     writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
                 },
                 MessagePart::Mention(uri, text) => {
-                    writer.write(XmlEvent::start_element("span").attr("message-part", &part_idx)).unwrap();
+                    let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
+                    let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
+                    for (key, val) in &ext {
+                        element = element.attr(key.as_str(), val);
+                    }
+                    writer.write(element).unwrap();
                     writer.write(XmlEvent::start_element("mention").attr("uri", uri)).unwrap();
                     writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
                     writer.write(XmlEvent::end_element()).unwrap();
@@ -151,7 +173,7 @@ impl MessageParts {
         if !mms {
             parts.push("(null)(0)".to_string());
             let data = self.0.iter().map(|p| {
-                if let MessagePart::Text(text) = &p.0 {
+                if let MessagePart::Text(text) = &p.part {
                     text.to_string()
                 } else { panic!("bad type!") }
             }).collect::<Vec<String>>().join("|");
@@ -163,7 +185,7 @@ impl MessageParts {
             })
         } else {
             for (idx, part) in self.0.iter().enumerate() {
-                out.push(match &part.0 {
+                out.push(match &part.part {
                     MessagePart::Text(text) => {
                         let content_id = format!("text{:0>6}", idx + 1);
                         parts.push(format!("{}.txt(0)", content_id));
@@ -214,7 +236,11 @@ impl MessageParts {
                     iris: false, // imagine not having an iPhone
                 })
             };
-            IndexedMessagePart(typ, None)
+            IndexedMessagePart {
+                part: typ,
+                idx: None,
+                ext: None
+            }
         }).collect())
     }
 
@@ -238,6 +264,7 @@ impl MessageParts {
         }
 
         let mut text_part_idx: Option<usize> = None;
+        let mut text_meta: Option<PartExtension> = None;
         let mut staging_item: Option<StagingElement> = None;
         for e in reader {
             match e {
@@ -247,42 +274,57 @@ impl MessageParts {
                             .map_or_else(|| def.expect(&format!("attribute {} doesn't exist!", name)).to_string(), |data| data.value.to_string())
                     };
                     let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
+                    let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
                     if name.local_name == "FILE" {
                         if staging_item.is_some() {
-                            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
+                            data.push(IndexedMessagePart {
+                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
+                                idx: text_part_idx,
+                                ext: text_meta.take(),
+                            });
                             text_part_idx = None; // FILEs are always top-level, so reset the thing
+                            text_meta = None;
                         }
-                        data.push(IndexedMessagePart(MessagePart::Attachment(Attachment {
-                            a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                AttachmentType::Inline(if inline.value == "ia-0" {
-                                    raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
-                                } else if inline.value == "ia-1" {
-                                    raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                        data.push(IndexedMessagePart {
+                            part: MessagePart::Attachment(Attachment {
+                                a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                    AttachmentType::Inline(if inline.value == "ia-0" {
+                                        raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
+                                    } else if inline.value == "ia-1" {
+                                        raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                    } else {
+                                        continue
+                                    })
                                 } else {
-                                    continue
-                                })
-                            } else {
-                                let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                AttachmentType::MMCS(MMCSFile {
-                                    signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                    object: get_attr("mmcs-owner", None),
-                                    url: get_attr("mmcs-url", None),
-                                    key: key[1..].to_vec(),
-                                    size: get_attr("file-size", None).parse().unwrap()
-                                })
-                            },
-                            part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
-                            uti_type: get_attr("uti-type", None),
-                            mime: get_attr("mime-type", Some("application/octet-stream")),
-                            name: get_attr("name", None),
-                            iris: get_attr("iris", Some("no")) == "yes"
-                        }), part_idx))
+                                    let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
+                                    let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                    AttachmentType::MMCS(MMCSFile {
+                                        signature: sig.clone(), // chop off first byte because it's not actually the signature
+                                        object: get_attr("mmcs-owner", None),
+                                        url: get_attr("mmcs-url", None),
+                                        key: key[1..].to_vec(),
+                                        size: get_attr("file-size", None).parse().unwrap()
+                                    })
+                                },
+                                part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                                uti_type: get_attr("uti-type", None),
+                                mime: get_attr("mime-type", Some("application/octet-stream")),
+                                name: get_attr("name", None),
+                                iris: get_attr("iris", Some("no")) == "yes"
+                            }),
+                            idx: part_idx,
+                            ext: PartExtension::from_dict(all_items),
+                        })
                     } else if name.local_name == "span" {
                         text_part_idx = part_idx;
+                        text_meta = PartExtension::from_dict(all_items);
                     } else if name.local_name == "mention" {
                         if staging_item.is_some() {
-                            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
+                            data.push(IndexedMessagePart {
+                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
+                                idx: text_part_idx,
+                                ext: text_meta.take(),
+                            });
                         }
                         staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
                     }
@@ -297,13 +339,17 @@ impl MessageParts {
             }
         }
         if staging_item.is_some() {
-            data.push(IndexedMessagePart(staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), text_part_idx));
+            data.push(IndexedMessagePart {
+                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)),
+                idx: text_part_idx,
+                ext: None,
+            });
         }
         MessageParts(data)
     }
 
     pub fn raw_text(&self) -> String {
-        self.0.iter().filter_map(|m| match &m.0 {
+        self.0.iter().filter_map(|m| match &m.part {
             MessagePart::Text(text) => Some(text.clone()),
             MessagePart::Attachment(_) => None,
             MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
@@ -336,7 +382,11 @@ pub struct NormalMessage {
 impl NormalMessage {
     pub fn new(text: String, service: MessageType) -> NormalMessage {
         NormalMessage {
-            parts: MessageParts(vec![IndexedMessagePart(MessagePart::Text(text), None)]),
+            parts: MessageParts(vec![IndexedMessagePart {
+                part: MessagePart::Text(text),
+                idx: None,
+                ext: None,
+            }]),
             body: None,
             effect: None,
             reply_guid: None,
@@ -367,52 +417,188 @@ pub enum Reaction {
     Question
 }
 
+impl Reaction {
+    fn get_idx(&self) -> u64 {
+        match self {
+            Self::Heart => 0,
+            Self::Like => 1,
+            Self::Dislike => 2,
+            Self::Laugh => 3,
+            Self::Emphsize => 4,
+            Self::Question => 5
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "pid")]
+pub enum PartExtension {
+    #[serde(rename = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension")]
+    Sticker {
+        #[serde(rename = "spw")]
+        msg_width: f64,
+        #[serde(rename = "sro")]
+        rotation: f64, // radians, -pi to +pi
+        sai: u64,
+        #[serde(rename = "ssa")]
+        scale: f64,
+        #[serde(rename = "sir")]
+        update: Option<bool>, // Some(false) for updates
+        sli: u64,
+        #[serde(rename = "sxs")]
+        normalized_x: f64,
+        #[serde(rename = "sys")]
+        normalized_y: f64,
+        #[serde(rename = "spv")]
+        version: u64,
+        #[serde(rename = "shash")]
+        hash: String,
+        safi: u64,
+        #[serde(rename = "stickerEffectType")]
+        effect_type: i64,
+        #[serde(rename = "sid")]
+        sticker_id: String,
+    }
+}
+
+impl PartExtension {
+    fn to_dict(&self) -> HashMap<String, String> {
+        plist::to_value(self).unwrap().into_dictionary().unwrap().into_iter()
+            .map(|(i, value)| {
+                (i, match value {
+                    Value::Boolean(v) => v.to_string(),
+                    Value::Real(r) => r.to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::String(s) => s,
+                    _ => panic!("unsupported in html value!")
+                })
+            }).collect()
+    }
+
+    fn from_dict(mut data: HashMap<String, String>) -> Option<Self> {
+        match data.get("pid")?.as_str() {
+            "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension" => Some(PartExtension::Sticker {
+                msg_width: data.get("spw")?.parse().ok()?,
+                rotation: data.get("sro")?.parse().ok()?,
+                sai: data.get("sai")?.parse().ok()?,
+                scale: data.get("ssa")?.parse().ok()?,
+                update: None, // updates aren't sent by dict
+                sli: data.get("sli")?.parse().ok()?,
+                normalized_x: data.get("sxs")?.parse().ok()?,
+                normalized_y: data.get("normalized_y")?.parse().ok()?,
+                version: data.get("spv")?.parse().ok()?,
+                hash: data.remove("shash")?,
+                safi: data.get("safi")?.parse().ok()?,
+                effect_type: data.get("stickerEffectType")?.parse().ok()?,
+                sticker_id: data.remove("sid")?,
+            }),
+            _ => None
+        }
+    }
+}
+
+#[repr(C)]
+pub enum ReactMessageType {
+    React {
+        reaction: Reaction,
+        enable: bool,
+    },
+    Extension {
+        spec: Value,
+        body: MessageParts
+    },
+}
+
+impl ReactMessageType {
+    fn get_text(&self, to_text: &str) -> String {
+        match self {
+            Self::React { reaction, enable } => {
+                if *enable {
+                    format!("{} “{}”",
+                        match reaction {
+                            Reaction::Heart => "Loved",
+                            Reaction::Like => "Liked",
+                            Reaction::Dislike => "Disliked",
+                            Reaction::Laugh => "Laughed at",
+                            Reaction::Emphsize => "Emphasized",
+                            Reaction::Question => "Questioned",
+                        },
+                        to_text
+                    )
+                } else {
+                    format!("Removed a{} from “{}”",
+                        match reaction {
+                            Reaction::Heart => " heart",
+                            Reaction::Like => " like",
+                            Reaction::Dislike => " dislike",
+                            Reaction::Laugh => " laugh",
+                            Reaction::Emphsize => "n exclamation",
+                            Reaction::Question => " question mark",
+                        },
+                        to_text
+                    )
+                }
+            },
+            Self::Extension { spec: _, body } => {
+                body.raw_text()
+            }
+        }
+    }
+
+    fn get_cmd(&self) -> u64 {
+        match self {
+            Self::React { reaction, enable } => if *enable {
+                reaction.get_idx() + 2000
+            } else {
+                reaction.get_idx() + 3000
+            },
+            Self::Extension { spec: _, body: _ } => 1000
+        }
+    }
+
+    fn notification(&self) -> bool {
+        match self {
+            Self::React { reaction: _, enable: _ } => true,
+            Self::Extension { spec: _, body: _ } => false,
+        }
+    }
+
+    fn prid(&self) -> Option<String> {
+        match self {
+            Self::React { reaction: _, enable: _ } => None,
+            Self::Extension { spec: _, body: _ } => Some("3cN".to_string()),
+        }
+    }
+
+    fn get_spec(&self) -> Option<Data> {
+        match self {
+            Self::React { reaction: _, enable: _ } => None,
+            Self::Extension { spec, body: _ } => Some(plist_to_bin(spec).unwrap().into()),
+        }
+    }
+
+    fn get_xml(&self) -> Option<String> {
+        match self {
+            Self::React { reaction: _, enable: _ } => None,
+            Self::Extension { spec: _, body } => {
+                Some(body.to_xml(None))
+            },
+        }
+    }
+}
+
 #[repr(C)]
 pub struct ReactMessage {
     pub to_uuid: String,
     pub to_part: u64,
-    pub enable: bool,
-    pub reaction: Reaction,
+    pub reaction: ReactMessageType,
     pub to_text: String,
 }
 
 impl ReactMessage {
     fn get_text(&self) -> String {
-        if self.enable {
-            format!("{} “{}”",
-                match self.reaction {
-                    Reaction::Heart => "Loved",
-                    Reaction::Like => "Liked",
-                    Reaction::Dislike => "Disliked",
-                    Reaction::Laugh => "Laughed at",
-                    Reaction::Emphsize => "Emphasized",
-                    Reaction::Question => "Questioned",
-                },
-                self.to_text
-            )
-        } else {
-            format!("Removed a{} from “{}”",
-                match self.reaction {
-                    Reaction::Heart => " heart",
-                    Reaction::Like => " like",
-                    Reaction::Dislike => " dislike",
-                    Reaction::Laugh => " laugh",
-                    Reaction::Emphsize => "n exclamation",
-                    Reaction::Question => " question mark",
-                },
-                self.to_text
-            )
-        }
-    }
-    fn get_idx(&self) -> u64 {
-        match self.reaction {
-            Reaction::Heart => 0,
-            Reaction::Like => 1,
-            Reaction::Dislike => 2,
-            Reaction::Laugh => 3,
-            Reaction::Emphsize => 4,
-            Reaction::Question => 5
-        }
+        self.reaction.get_text(&self.to_text)
     }
 
     fn from_idx(idx: u64) -> Option<Reaction> {
@@ -662,6 +848,12 @@ pub struct IconChangeMessage {
 }
 
 #[repr(C)]
+pub struct UpdateExtensionMessage {
+    pub for_uuid: String,
+    pub ext: PartExtension,
+}
+
+#[repr(C)]
 pub enum Message {
     Message(NormalMessage),
     RenameMessage(RenameMessage),
@@ -679,6 +871,7 @@ pub enum Message {
     SmsConfirmSent(bool /* status */),
     MarkUnread, // send for last message from other participant
     PeerCacheInvalidate,
+    UpdateExtension(UpdateExtensionMessage),
 }
 
 impl Message {
@@ -712,6 +905,7 @@ impl Message {
             Self::SmsConfirmSent(status) => if *status { 146 } else { 149 },
             Self::MarkUnread => 111,
             Self::PeerCacheInvalidate => 130,
+            Self::UpdateExtension(_) => 122,
         }
     }
 
@@ -737,6 +931,7 @@ impl Message {
             Self::SmsConfirmSent(_) => Some(true),
             Self::MarkUnread => Some(true),
             Self::PeerCacheInvalidate => Some(true),
+            Self::SmsConfirmSent(_) => Some(true),
             _ => None
         }
     }
@@ -792,6 +987,9 @@ impl fmt::Display for Message {
             },
             Message::PeerCacheInvalidate => {
                 write!(f, "logged in on a new device")
+            },
+            Message::UpdateExtension(_) => {
+                write!(f, "updated an extension")
             }
         }
     }
@@ -876,6 +1074,14 @@ impl IMessage {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::UpdateExtension(ext) => {
+                let raw = RawUpdateExtensionMessage {
+                    version: "1".to_string(),
+                    target_id: ext.for_uuid.clone(),
+                    new_info: plist::to_value(&ext.ext)?,
+                };
+                plist_to_bin(&raw).unwrap()
+            },
             Message::EnableSmsActivation(enabled) => {
                 if *enabled {
                     let raw = RawSmsActivateMessage {
@@ -938,17 +1144,12 @@ impl IMessage {
                 plist_to_bin(&raw).unwrap()
             },
             Message::React(react) => {
-                let amt = if react.enable {
-                    react.get_idx() + 2000
-                } else {
-                    react.get_idx() + 3000
-                };
                 let text = react.get_text();
                 let raw = RawReactMessage {
                     text: text,
                     amrln: react.to_text.len() as u64,
                     amrlc: 0,
-                    amt: amt,
+                    amt: react.reaction.get_cmd(),
                     participants: conversation.participants.clone(),
                     after_guid: self.after_guid.clone(),
                     sender_guid: conversation.sender_guid.clone(),
@@ -956,11 +1157,14 @@ impl IMessage {
                     gv: "8".to_string(),
                     v: "1".to_string(),
                     cv_name: conversation.cv_name.clone(),
-                    notification: plist_to_bin(&NotificationData {
+                    notification: if react.reaction.notification() { Some(plist_to_bin(&NotificationData {
                         ams: react.to_text.clone(),
                         amc: 1
-                    }).unwrap().into(),
-                    amk: format!("p:{}/{}", react.to_part, react.to_uuid)
+                    }).unwrap().into()) } else { None },
+                    amk: format!("p:{}/{}", react.to_part, react.to_uuid),
+                    type_spec: react.reaction.get_spec(),
+                    xml: react.reaction.get_xml(),
+                    prid: react.reaction.prid(),
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -1218,6 +1422,18 @@ impl IMessage {
                 target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
         }
+        if let Ok(loaded) = plist::from_bytes::<RawUpdateExtensionMessage>(&decompressed) {
+            let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
+            return Ok(IMessage {
+                sender: Some(wrapper.sender.clone()),
+                id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                after_guid: None,
+                sent_timestamp: wrapper.sent_timestamp / 1000000,
+                conversation: None,
+                message: Message::UpdateExtension(UpdateExtensionMessage { for_uuid: loaded.target_id, ext: plist::from_value(&loaded.new_info)? }),
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+            })
+        }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             return Ok(IMessage {
@@ -1290,11 +1506,27 @@ impl IMessage {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
                 .captures(&loaded.amk).unwrap();
-            let enabled = loaded.amt < 3000;
-            let id = if enabled {
-                loaded.amt - 2000
-            } else {
-                loaded.amt - 3000
+            
+            let msg = match loaded.amt {
+                1000 => {
+                    let (Some(xml), Some(spec)) = (&loaded.xml, &loaded.type_spec) else {
+                        return Err(PushError::BadMsg)
+                    };
+                    let data: Vec<u8> = spec.clone().into();
+                    ReactMessageType::Extension {
+                        spec: plist::from_bytes(&data)?,
+                        body: MessageParts::parse_parts(xml, None),
+                    }
+                },
+                2000..=2999 => ReactMessageType::React {
+                    reaction: ReactMessage::from_idx(loaded.amt - 3000).ok_or(PushError::BadMsg)?,
+                    enable: true
+                },
+                3000..=3999 => ReactMessageType::React {
+                    reaction: ReactMessage::from_idx(loaded.amt - 3000).ok_or(PushError::BadMsg)?,
+                    enable: false
+                },
+                _ => return Err(PushError::BadMsg)
             };
             return Ok(IMessage {
                 sender: Some(wrapper.sender.clone()),
@@ -1310,8 +1542,7 @@ impl IMessage {
                     to_uuid: target_msg_data.get(2).unwrap().as_str().to_string(),
                     to_part: target_msg_data.get(1).unwrap().as_str().parse().unwrap(),
                     to_text: "".to_string(),
-                    enable: enabled,
-                    reaction: ReactMessage::from_idx(id).ok_or(PushError::BadMsg)?
+                    reaction: msg,
                 }),
                 target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
             })
