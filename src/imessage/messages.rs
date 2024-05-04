@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{apns::APNSConnection, error::PushError, util::{plist_to_bin, gzip, ungzip, decode_hex, encode_hex}, mmcs::{get_mmcs, put_mmcs, Container, PreparedPut, DataCacher, prepare_put}, mmcsp};
+use crate::{apns::APNSConnection, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{base64_encode, decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
 
 include!("./rawmessages.rs");
@@ -486,7 +486,7 @@ impl PartExtension {
                 update: None, // updates aren't sent by dict
                 sli: data.get("sli")?.parse().ok()?,
                 normalized_x: data.get("sxs")?.parse().ok()?,
-                normalized_y: data.get("normalized_y")?.parse().ok()?,
+                normalized_y: data.get("sys")?.parse().ok()?,
                 version: data.get("spv")?.parse().ok()?,
                 hash: data.remove("shash")?,
                 safi: data.get("safi")?.parse().ok()?,
@@ -574,7 +574,7 @@ impl ReactMessageType {
     fn get_spec(&self) -> Option<Data> {
         match self {
             Self::React { reaction: _, enable: _ } => None,
-            Self::Extension { spec, body: _ } => Some(plist_to_bin(spec).unwrap().into()),
+            Self::Extension { spec, body: _ } => Some(gzip(&plist_to_bin(spec).unwrap()).unwrap().into()),
         }
     }
 
@@ -1514,7 +1514,7 @@ impl IMessage {
                     };
                     let data: Vec<u8> = spec.clone().into();
                     ReactMessageType::Extension {
-                        spec: plist::from_bytes(&data)?,
+                        spec: plist::from_bytes(&ungzip(&data)?)?,
                         body: MessageParts::parse_parts(xml, None),
                     }
                 },
