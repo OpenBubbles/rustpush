@@ -158,7 +158,8 @@ struct ResultHandle {
 }
 #[derive(Deserialize)]
 struct HandleResult {
-    handles: Vec<ResultHandle>
+    handles: Option<Vec<ResultHandle>>,
+    status: u64,
 }
 
 pub async fn get_handles(protocol_ver: u32, user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, PushError> {
@@ -178,7 +179,10 @@ pub async fn get_handles(protocol_ver: u32, user_id: &str, auth_keypair: &KeyPai
     
     let data = resp.bytes().await?;
     let parsed: HandleResult = plist::from_bytes(&data)?;
-    let handles: Vec<String> = parsed.handles.iter().map(|h| h.uri.clone()).collect();
+    let Some(handles) = parsed.handles else {
+        return Err(PushError::AuthInvalid(parsed.status))
+    };
+    let handles: Vec<String> = handles.iter().map(|h| h.uri.clone()).collect();
 
     info!("User {} has handles {:?}", user_id, handles);
     Ok(handles)

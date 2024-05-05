@@ -1,11 +1,11 @@
-use std::io;
+use std::{io, sync::Arc};
 
 #[cfg(feature = "macOS")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 
-use crate::ids::identity::SupportAlert;
+use crate::{ids::identity::SupportAlert, imessage::client::RegistrationFailure};
 
 #[derive(Error, Debug)]
 pub enum PushError {
@@ -51,5 +51,9 @@ pub enum PushError {
     #[error("MMCS Upload failed {0}")]
     MMCSUploadFailed(u16),
     #[error("Failed to authenticate. Try logging in to appleid.apple.com to fix your Apple ID or create a new one.")]
-    LoginUnauthorized
+    LoginUnauthorized,
+    #[error("Bad auth cert {0}")]
+    AuthInvalid(u64),
+    #[error("Reregistration failed {0}")]
+    ReRegistrationFailure(#[from] RegistrationFailure),
 }

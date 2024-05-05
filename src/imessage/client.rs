@@ -1,5 +1,5 @@
 
-use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::{HashMap, HashSet}, fmt::Display, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use flume::RecvError;
 use log::{debug, error, info, warn};
@@ -9,6 +9,7 @@ use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
 use rand::Rng;
 use async_recursion::async_recursion;
+use thiserror::Error;
 
 use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo}}, imessage::messages::{BundledPayload, MessageTarget, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
 
@@ -160,13 +161,23 @@ impl KeyCache {
     }
 }
 
+#[derive(Clone, Debug, Error)]
+pub struct RegistrationFailure {
+    pub retry_wait: Option<u64>,
+    pub error: Arc<PushError>,
+}
+
+impl Display for RegistrationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed to reregister {}; {}", self.error, 
+            if let Some(retry_in) = self.retry_wait { format!("retrying in {}s", retry_in) } else { "not retrying".to_string() })
+    }
+}
+
 pub enum RegisterState {
     Registered,
     Registering,
-    Failed {
-        retry_wait: u64,
-        error: PushError
-    }
+    Failed (RegistrationFailure)
 }
 
 pub struct IMClient {
@@ -175,7 +186,7 @@ pub struct IMClient {
     key_cache: Arc<Mutex<KeyCache>>,
     raw_inbound: Mutex<Receiver<APNSPayload>>,
     rereg_signal: Mutex<flume::Sender<()>>,
-    rereg_success: tokio::sync::broadcast::Receiver<()>,
+    rereg_success: tokio::sync::broadcast::Receiver<Result<(), RegistrationFailure>>,
     register_state: Arc<Mutex<RegisterState>>,
 }
 
@@ -227,7 +238,7 @@ impl IMClient {
             mut retry_count: u8,
             mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>,
             rereg_signal: flume::Receiver<()>,
-            rereg_finished: tokio::sync::broadcast::Sender<()>,
+            rereg_finished: tokio::sync::broadcast::Sender<Result<(), RegistrationFailure>>,
             register_state: Arc<Mutex<RegisterState>>) {
         let users_lock = users_ref.read().await;
         if users_lock.len() == 0 {
@@ -253,10 +264,29 @@ impl IMClient {
             let mut users_lock = users_ref.write().await;
             let user = users_lock.iter_mut().find(|user| user.handles == next_rereg).unwrap();
             if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), &conn_ref).await {
-                let retry_in = 2_u64.pow(retry_count as u32) * 300; // 5 minutes doubling
-                error!("Reregistering failed {:?}, retrying in {}s", err, retry_in);
-                *register_state.lock().await = RegisterState::Failed { retry_wait: retry_in, error: err };
-                sleep(Duration::from_secs(retry_in)).await;
+                drop(users_lock);
+                
+                let retry_in = if let PushError::AuthInvalid(6005) = err {
+                    error!("Auth cert invalid; re-login needed!");
+                    None
+                } else {
+                    Some(2_u64.pow(retry_count as u32) * 300) // 5 minutes doubling
+                };
+
+                let err_arc = RegistrationFailure {
+                    retry_wait: retry_in,
+                    error: Arc::new(err),
+                };
+                error!("{}", err_arc);
+                *register_state.lock().await = RegisterState::Failed(err_arc.clone());
+                rereg_finished.send(Err(err_arc)).unwrap();
+                
+                if let Some(retry_secs) = retry_in {
+                    sleep(Duration::from_secs(retry_secs)).await;
+                } else {
+                    return; // we're toast.
+                }
+                
                 if retry_count < 8 {
                     retry_count += 1; // max retry a day
                 }
@@ -264,11 +294,11 @@ impl IMClient {
                 retry_count = 0;
                 key_cache_ref.lock().await.verity(&conn_ref, &users_lock).await;
                 keys_updated(users_lock.clone());
-                rereg_finished.send(()).unwrap();
+                rereg_finished.send(Ok(())).unwrap();
                 *register_state.lock().await = RegisterState::Registered;
+                drop(users_lock);
                 info!("Successfully reregistered!");
             }
-            drop(users_lock);
             Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated, rereg_signal, rereg_finished, register_state).await;
         });
     }
@@ -479,7 +509,7 @@ impl IMClient {
 
                 if new_device.identites.len() != self.get_handles().await.len() {
                     info!("Re-registering due to new handles");
-                    self.reregister().await;
+                    self.reregister().await?;
                 }
 
                 let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
@@ -541,19 +571,31 @@ impl IMClient {
         }
     }
 
-    async fn reregister(&self) {
+    async fn ensure_not_failed(&self) -> Result<(), PushError> {
+        if let RegisterState::Failed(error) = &*self.register_state.lock().await {
+            return Err(error.clone().into())
+        }
+        Ok(())
+    }
+
+    async fn reregister(&self) -> Result<(), PushError> {
+        self.ensure_not_failed().await?;
         // first one who gets here drives the reregister process
         if let Ok(channel) = self.rereg_signal.try_lock() {
             channel.send_async(()).await.unwrap();
-            self.rereg_success.resubscribe().recv().await.unwrap();
+            self.rereg_success.resubscribe().recv().await.unwrap()?;
         } else {
-            self.rereg_success.resubscribe().recv().await.unwrap();
+            // techinally a race condition here, if above condition fails *right* as rereg_success is being sent,
+            // this might not subscribe in time and hang forever (until next reregistration, which may be never)
+            self.rereg_success.resubscribe().recv().await.unwrap()?;
         }
+        Ok(())
     }
 
     // keyCache and users must be unlocked
     #[async_recursion]
     pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool) -> Result<(), PushError> {
+        self.ensure_not_failed().await?;
         // find participants whose keys need to be fetched
         let key_cache = self.key_cache.lock().await;
         let fetch: Vec<String> = if refresh {
@@ -573,7 +615,7 @@ impl IMClient {
                 if let PushError::LookupFailed(6005) = err {
                     warn!("IDS returned 6005; attempting to re-register");
                     drop(users); // release mutex
-                    self.reregister().await;
+                    self.reregister().await?;
                     return self.cache_keys(participants, handle, refresh).await;
                 } else {
                     return Err(err)
