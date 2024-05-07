@@ -229,6 +229,8 @@ impl APNSReader {
             if payload.id == 0x0A {
                 debug!("Sending automatic ACK");
                 if let Err(_) = write.send_ack(payload.get_field(4).unwrap()).await {
+                    drop(read);
+                    self.reload_connection(write, state, 0, reload).await;
                     break // conn broken?
                 }
             }
@@ -308,7 +310,9 @@ impl APNSReader {
     where
         F: Fn(&APNSPayload) -> bool + Send + Sync + 'static,
     {
+        debug!("locking");
         let mut locked = self.0.lock().await;
+        debug!("locked");
         let (tx, rx) = oneshot::channel();
         locked.push(WaitingTask { waiting_for: Box::new(p), when: WaitingCb::OneShot(tx) });
         drop(locked);
@@ -389,6 +393,7 @@ impl APNSConnection {
 
     pub async fn send_message(&self, topic: &str, payload: &[u8], id: Option<&[u8]>) -> Result<(), PushError> {
         self.submitter.send_message(topic, payload, id).await?;
+        debug!("message sent, waiting for apn ack");
         // wait for ack
         let msg = self.reader.wait_find(0x0B).await?;
         if msg.get_field(8).unwrap()[0] != 0x0 {

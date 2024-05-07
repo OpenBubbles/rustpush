@@ -322,15 +322,10 @@ impl IMClient {
 
     #[async_recursion]
     async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], handle: &str, retry: u8) -> bool {
-        // first retry we force ids to refresh, second retry we back of longer and longer times,
-        // bidding for IDS to let us query
-        if retry > 0 {
-            tokio::time::sleep(Duration::from_millis((retry as u64 - 1) * 60000)).await;
-        }
 
         if let Err(error) = self.cache_keys(&[sender.to_string()], handle, retry > 0).await {
             warn!("Cannot verify; failed to query! {}", error);
-            if retry < 3 {
+            if retry < 1 {
                 return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
             } else {
                 warn!("giving up");
@@ -342,8 +337,8 @@ impl IMClient {
 
         let Some(keys) = cache.get_keys(handle, sender) else {
             drop(cache); // we're holding the damn mutex :(
-            warn!("Cannot verify; no public key");
-            if retry < 3 {
+            warn!("Cannot verify; no public key {retry}");
+            if retry < 1 {
                 return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
             } else {
                 warn!("giving up");
@@ -353,8 +348,8 @@ impl IMClient {
 
         let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
             drop(cache); // we're holding the damn mutex :(
-            warn!("Cannot verify; no public key");
-            if retry < 3 {
+            warn!("Cannot verify; no public key {retry}");
+            if retry < 1 {
                 return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
             } else {
                 warn!("giving up");
@@ -451,23 +446,23 @@ impl IMClient {
 
     async fn recieve_payload(&self, payload: APNSPayload) -> Result<Option<IMessage>, PushError> {
         let body = payload.get_field(3).unwrap();
+        info!("startasdf");
 
-        let load = plist::Value::from_reader(Cursor::new(body))?;
-        let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-        let ex = load.as_dictionary().unwrap().get("eX").map(|v| v.as_unsigned_integer().unwrap());
-        let has_p = load.as_dictionary().unwrap().contains_key("P");
+        let load = plist::Value::from_reader(Cursor::new(body))?.into_dictionary().unwrap();
+        let get_c = load.get("c").unwrap().as_unsigned_integer().unwrap();
+        let ex = load.get("eX").map(|v| v.as_unsigned_integer().unwrap());
+        let has_p = load.contains_key("P");
         if get_c == 101 || get_c == 102 || ex == Some(0) {
-            let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
-            let time_recv = load.as_dictionary().unwrap().get("e").unwrap().as_unsigned_integer().unwrap();
-            debug!("recv {load:?}");
+            let uuid = load.get("U").unwrap().as_data().unwrap();
+            let time_recv = load.get("e").unwrap().as_unsigned_integer().unwrap();
             return Ok(Some(IMessage {
                 id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
-                sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
+                sender: load.get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
                 after_guid: None,
                 conversation: if ex == Some(0) {
                     // typing
-                    let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
-                    let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+                    let source = load.get("sP").unwrap().as_string().unwrap();
+                    let target = load.get("tP").unwrap().as_string().unwrap();
                     Some(ConversationData {
                         participants: vec![source.to_string(), target.to_string()],
                         cv_name: None,
@@ -487,21 +482,21 @@ impl IMClient {
                 } else {
                     Message::Read
                 },
-                target: Some(vec![MessageTarget::Token(load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap().to_vec())]),
+                target: Some(load.get("t").map(|t| vec![MessageTarget::Token(t.as_data().unwrap().to_vec())]).unwrap_or(vec![])),
                 sent_timestamp: time_recv / 1000000
             }))
         }
 
         if get_c == 130 {
             let mut cache_lock = self.key_cache.lock().await;
-            let source = load.as_dictionary().unwrap().get("sP").unwrap().as_string().unwrap();
-            let target = load.as_dictionary().unwrap().get("tP").unwrap().as_string().unwrap();
+            let source = load.get("sP").unwrap().as_string().unwrap();
+            let target = load.get("tP").unwrap().as_string().unwrap();
             cache_lock.invalidate(target, source);
             return Ok(if self.get_handles().await.contains(&source.to_string()) && source == target {
                 self.ensure_private_self(&mut cache_lock, target, true).await?;
                 let private_self = &cache_lock.cache.get(target).unwrap().private_data;
 
-                let sender_token = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap().to_vec();
+                let sender_token = load.get("t").unwrap().as_data().unwrap().to_vec();
                 let Some(new_device) = private_self.iter().find(|dev| dev.token == sender_token) else {
                     error!("New device c:130 not listed in dependent registrations!");
                     return Ok(None)
@@ -512,12 +507,12 @@ impl IMClient {
                     self.reregister().await?;
                 }
 
-                let uuid = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
-                let time_recv = load.as_dictionary().unwrap().get("e").unwrap().as_unsigned_integer().unwrap();
+                let uuid = load.get("U").unwrap().as_data().unwrap();
+                let time_recv = load.get("e").unwrap().as_unsigned_integer().unwrap();
                 // we need to forward to our chats
                 Some(IMessage {
                     id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
-                    sender: load.as_dictionary().unwrap().get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
+                    sender: load.get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
                     after_guid: None,
                     conversation: None,
                     message: Message::PeerCacheInvalidate,
@@ -597,6 +592,7 @@ impl IMClient {
     pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool) -> Result<(), PushError> {
         self.ensure_not_failed().await?;
         // find participants whose keys need to be fetched
+        debug!("Getting keys for {:?}", participants);
         let key_cache = self.key_cache.lock().await;
         let fetch: Vec<String> = if refresh {
             participants.to_vec()
@@ -608,32 +604,35 @@ impl IMClient {
             return Ok(())
         }
         drop(key_cache);
-        let users = self.users.read().await;
-        let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), fetch).await {
-            Ok(results) => results,
-            Err(err) => {
-                if let PushError::LookupFailed(6005) = err {
-                    warn!("IDS returned 6005; attempting to re-register");
-                    drop(users); // release mutex
-                    self.reregister().await?;
-                    return self.cache_keys(participants, handle, refresh).await;
-                } else {
-                    return Err(err)
+        for chunk in fetch.chunks(18) {
+            debug!("Fetching keys for chunk {:?}", chunk);
+            let users = self.users.read().await;
+            let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), chunk.to_vec()).await {
+                Ok(results) => results,
+                Err(err) => {
+                    if let PushError::LookupFailed(6005) = err {
+                        warn!("IDS returned 6005; attempting to re-register");
+                        drop(users); // release mutex
+                        self.reregister().await?;
+                        return self.cache_keys(participants, handle, refresh).await;
+                    } else {
+                        return Err(err)
+                    }
                 }
-            }
-        };
-        debug!("Got keys for {:?}", participants);
+            };
+            debug!("Got keys for {:?}", chunk);
 
-        let mut key_cache = self.key_cache.lock().await;
-        if results.len() == 0 {
-            warn!("warn IDS returned zero keys for query {:?}", participants);
-        }
-        for (id, results) in results {
+            let mut key_cache = self.key_cache.lock().await;
             if results.len() == 0 {
-                warn!("IDS returned zero keys for participant {}", id);
-                continue;
+                warn!("warn IDS returned zero keys for query {:?}", chunk);
             }
-            key_cache.put_keys(handle, &id, results);
+            for (id, results) in results {
+                if results.len() == 0 {
+                    warn!("IDS returned zero keys for participant {}", id);
+                    continue;
+                }
+                key_cache.put_keys(handle, &id, results);
+            }   
         }
         debug!("Cached keys for {:?}", participants);
         Ok(())
@@ -711,6 +710,7 @@ impl IMClient {
     }
 
     pub async fn send(&self, message: &mut IMessage) -> Result<(), PushError> {
+        debug!("Send queue {message}");
         message.sanity_check_send();
 
         let start = SystemTime::now();
@@ -766,7 +766,13 @@ impl IMClient {
         } else {
             let mut result = vec![];
             for participant in with_participants {
-                let keys = key_cache.get_keys(&sender, participant).ok_or(PushError::KeyNotFound(participant.clone()))?;
+                let Some(keys) = key_cache.get_keys(&sender, participant) else {
+                    if with_participants.len() > 2 {
+                        continue; // some pariticpants may be deregistered, don't drop the whole group
+                    } else {
+                        return Err(PushError::KeyNotFound(participant.clone()))
+                    }
+                };
                 result.extend(keys.into_iter().map(|i| (participant.as_str(), i)))
             }
             result
@@ -831,15 +837,20 @@ impl IMClient {
                 let mut refresh_tokens: Vec<Vec<u8>> = vec![];
                 info!("payload {payloads_cnt}");
                 for _i in 0..payloads_cnt {
-                    let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(15), confirm_reciever.recv()).await else {
-                        if (_i as f32) / (payloads_cnt as f32) > 0.95f32 {
-                            warn!("Greater than 95% submission rate, ignoring undeliverable messages!");
+                    let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.95f32;
+                    let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
+                        250 // wait max 250ms after "good enough" to catch any stray 5032s, to prevent a network race condition
+                    } else {
+                        15000 // 15 seconds wait
+                    }), confirm_reciever.recv()).await else {
+                        if is_good_enough {
+                            warn!("timeout with {_i}/{payloads_cnt}");
+                            warn!("Greater than 80% submission rate, ignoring undeliverable messages!");
                             return Ok(refresh_tokens);
                         }
                         error!("timeout with {_i}/{payloads_cnt}");
                         return Err(PushError::SendTimedOut)
                     };
-                    debug!("taken {:?}", msg);
                     let payload = msg.expect("APN service was dropped??");
                     let body = payload.get_field(3).unwrap();
                     let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
