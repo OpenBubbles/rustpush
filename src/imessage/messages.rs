@@ -1001,7 +1001,7 @@ fn remove_prefix(participants: &[String]) -> Vec<String> {
         p.replace("mailto:", "").replace("tel:", "")).collect()
 }
 
-fn add_prefix(participants: &[String]) -> Vec<String> {
+pub fn add_prefix(participants: &[String]) -> Vec<String> {
     participants.iter().map(|p| if p.contains("@") {
         format!("mailto:{}", p)
     } else {
@@ -1519,7 +1519,7 @@ impl IMessage {
                     }
                 },
                 2000..=2999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 3000).ok_or(PushError::BadMsg)?,
+                    reaction: ReactMessage::from_idx(loaded.amt - 2000).ok_or(PushError::BadMsg)?,
                     enable: true
                 },
                 3000..=3999 => ReactMessageType::React {

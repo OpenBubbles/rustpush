@@ -10,39 +10,39 @@ struct NotificationData {
 }
 
 #[derive(Serialize, Deserialize)]
-struct RawRenameMessage {
+pub struct RawRenameMessage {
     #[serde(rename = "nn")]
-    new_name: String,
+    pub new_name: String,
     #[serde(rename = "sp")]
-    participants: Vec<String>,
-    gv: String,
+    pub participants: Vec<String>,
+    pub gv: String,
     #[serde(rename = "old")]
-    old_name: Option<String>,
+    pub old_name: Option<String>,
     #[serde(rename = "n")]
-    name: String,
+    pub name: String,
     #[serde(rename = "type")]
-    msg_type: String,
+    pub msg_type: String,
     #[serde(rename = "gid")]
-    sender_guid: Option<String>,
+    pub sender_guid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct RawChangeMessage {
+pub struct RawChangeMessage {
     #[serde(rename = "pv")]
-    group_version: u64,
+    pub group_version: u64,
     #[serde(rename = "tp")]
-    target_participants: Vec<String>,
+    pub target_participants: Vec<String>,
     #[serde(rename = "nn")]
-    new_name: String,
+    pub new_name: String,
     #[serde(rename = "sp")]
-    source_participants: Vec<String>,
-    gv: String,
+    pub source_participants: Vec<String>,
+    pub gv: String,
     #[serde(rename = "n")]
-    name: String,
+    pub name: String,
     #[serde(rename = "type")]
-    msg_type: String,
+    pub msg_type: String,
     #[serde(rename = "gid")]
-    sender_guid: Option<String>,
+    pub sender_guid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

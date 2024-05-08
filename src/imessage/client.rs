@@ -11,7 +11,7 @@ use rand::Rng;
 use async_recursion::async_recursion;
 use thiserror::Error;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo}}, imessage::messages::{BundledPayload, MessageTarget, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig};
+use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo}}, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig, RenameMessage};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -21,6 +21,7 @@ const NORMAL_NONCE: [u8; 16] = [
 ];
 
 const KEY_REFRESH_MS: u64 = 86400 * 1000; // one day
+const EMPTY_REFRESH_MS: u64 = 3600 * 1000; // one hour
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CachedKeys {
@@ -33,7 +34,7 @@ impl CachedKeys {
         let ms_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards").as_millis() as u64; // make serde happy
-        ms_now <= self.at_ms + KEY_REFRESH_MS
+        ms_now <= self.at_ms + (if self.keys.is_empty() { EMPTY_REFRESH_MS } else { KEY_REFRESH_MS })
     }
 }
 
@@ -487,6 +488,45 @@ impl IMClient {
             }))
         }
 
+        if get_c == 190 {
+            let msg_guid: Vec<u8> = load.get("U").expect("No c U").as_data().unwrap().to_vec();
+            let token: Vec<u8> = load.get("t").expect("No c T").as_data().unwrap().to_vec();
+            let time_recv = load.get("e").expect("No c E").as_unsigned_integer().unwrap();
+            let sender = load.get("sP").and_then(|i| i.as_string().map(|i| i.to_string()));
+            if let Some(unenc) = load.get("p") {
+                if let Ok(loaded) = plist::from_value::<RawChangeMessage>(unenc) {
+                    return Ok(Some(IMessage {
+                        sender,
+                        id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                        after_guid: None,
+                        sent_timestamp: time_recv / 1000000,
+                        conversation: Some(ConversationData {
+                            participants: add_prefix(&loaded.source_participants),
+                            cv_name: Some(loaded.name.clone()),
+                            sender_guid: loaded.sender_guid.clone()
+                        }),
+                        message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
+                        target: Some(vec![MessageTarget::Token(token)])
+                    }))
+                }
+                if let Ok(loaded) = plist::from_value::<RawRenameMessage>(unenc) {
+                    return Ok(Some(IMessage {
+                        sender,
+                        id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
+                        after_guid: None,
+                        sent_timestamp: time_recv / 1000000,
+                        conversation: Some(ConversationData {
+                            participants: add_prefix(&loaded.participants),
+                            cv_name: loaded.old_name.clone(),
+                            sender_guid: loaded.sender_guid.clone(),
+                        }),
+                        message: Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }),
+                        target: Some(vec![MessageTarget::Token(token)])
+                    }))
+                }
+            }
+        }
+
         if get_c == 130 {
             let mut cache_lock = self.key_cache.lock().await;
             let source = load.get("sP").unwrap().as_string().unwrap();
@@ -629,7 +669,6 @@ impl IMClient {
             for (id, results) in results {
                 if results.len() == 0 {
                     warn!("IDS returned zero keys for participant {}", id);
-                    continue;
                 }
                 key_cache.put_keys(handle, &id, results);
             }   
