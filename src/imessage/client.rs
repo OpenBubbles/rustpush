@@ -107,6 +107,11 @@ impl KeyCache {
         self.save();
     }
 
+    fn invalidate_all(&mut self) {
+        self.cache.clear();
+        self.save();
+    }
+
     fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSIdentityResult)>, PushError> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
@@ -788,6 +793,10 @@ impl IMClient {
         }
 
         self.send_payloads(&message, &target_participants, 0).await
+    }
+
+    pub async fn invalidate_id_cache(&self) {
+        self.key_cache.lock().await.invalidate_all();
     }
 
     #[async_recursion]
