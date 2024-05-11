@@ -37,6 +37,12 @@ pub struct ConversationData {
     pub sender_guid: Option<String>,
 }
 
+impl ConversationData {
+    pub fn is_group(&self) -> bool {
+        self.participants.len() > 2
+    }
+}
+
 #[repr(C)]
 pub enum MessagePart {
     Text(String),
@@ -909,6 +915,14 @@ impl Message {
         }
     }
 
+    pub(super) fn should_send_delivered(&self, conversation: &ConversationData) -> bool {
+        match &self {
+            Message::Message(message) => matches!(message.service, MessageType::IMessage) && !conversation.is_group(),
+            Message::React(_) => conversation.is_group(),
+            _ => false
+        }
+    }
+
     pub(super) fn is_sms(&self) -> bool {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _, from_handle: _ }),
@@ -1024,6 +1038,7 @@ pub struct IMessage {
     pub message: Message,
     pub sent_timestamp: u64,
     pub target: Option<Vec<MessageTarget>>,
+    pub send_delivered: bool,
 }
 
 impl IMessage {
@@ -1363,7 +1378,8 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::EnableSmsActivation(true),
-                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                    send_delivered: matches!(wrapper.send_delivered, Some(true)),
                 })
             }
         }
@@ -1377,7 +1393,8 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::EnableSmsActivation(false),
-                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                    send_delivered: matches!(wrapper.send_delivered, Some(true)),
                 })
             }
         }
@@ -1391,7 +1408,8 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::SmsConfirmSent(wrapper.command == 146),
-                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                    send_delivered: matches!(wrapper.send_delivered, Some(true)),
                 })
             }
         }
@@ -1405,7 +1423,8 @@ impl IMessage {
                     sent_timestamp: wrapper.sent_timestamp / 1000000,
                     conversation: None,
                     message: Message::MarkUnread,
-                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                    target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                    send_delivered: matches!(wrapper.send_delivered, Some(true)),
                 })
             }
         }
@@ -1418,7 +1437,8 @@ impl IMessage {
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: None,
                 message: Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawUpdateExtensionMessage>(&decompressed) {
@@ -1430,7 +1450,8 @@ impl IMessage {
                 sent_timestamp: wrapper.sent_timestamp / 1000000,
                 conversation: None,
                 message: Message::UpdateExtension(UpdateExtensionMessage { for_uuid: loaded.target_id, ext: plist::from_value(&loaded.new_info)? }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawEditMessage>(&decompressed) {
@@ -1446,7 +1467,8 @@ impl IMessage {
                     edit_part: loaded.part_index,
                     new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawChangeMessage>(&decompressed) {
@@ -1462,7 +1484,8 @@ impl IMessage {
                     sender_guid: loaded.sender_guid.clone()
                 }),
                 message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawIconChangeMessage>(&decompressed) {
@@ -1482,7 +1505,8 @@ impl IMessage {
                     file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
                     group_version: loaded.group_version
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawRenameMessage>(&decompressed) {
@@ -1498,7 +1522,8 @@ impl IMessage {
                     sender_guid: loaded.sender_guid.clone(),
                 }),
                 message: Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawReactMessage>(&decompressed) {
@@ -1543,7 +1568,8 @@ impl IMessage {
                     to_text: "".to_string(),
                     reaction: msg,
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawMmsIncomingMessage>(&decompressed) {
@@ -1590,7 +1616,8 @@ impl IMessage {
                         from_handle: Some(loaded.sender.clone()),
                     }
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawSmsOutgoingMessage>(&decompressed) {
@@ -1622,7 +1649,8 @@ impl IMessage {
                         from_handle: None,
                     }
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         if let Ok(loaded) = plist::from_bytes::<RawIMessage>(&decompressed) {
@@ -1662,7 +1690,8 @@ impl IMessage {
                     reply_part: replies.as_ref().map(|r| r.1.clone()),
                     service: MessageType::IMessage
                 }),
-                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())])
+                target: Some(vec![MessageTarget::Token(wrapper.token.clone().into())]),
+                send_delivered: matches!(wrapper.send_delivered, Some(true)),
             })
         }
         Err(PushError::BadMsg)

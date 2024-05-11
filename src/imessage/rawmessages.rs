@@ -298,7 +298,7 @@ pub(super) struct BundledPayload {
     #[serde(rename = "tP")]
     pub(super) participant: String,
     #[serde(rename = "D")]
-    pub(super) not_me: bool,
+    pub(super) send_delivered: bool,
     #[serde(rename = "sT")]
     pub(super) session_token: Data,
     #[serde(rename = "P")]
@@ -344,4 +344,6 @@ pub(super) struct RecvMsg {
     pub(super) command: u64,
     #[serde(rename = "nr")]
     pub(super) no_reply: Option<bool>,
+    #[serde(rename = "D")]
+    pub(super) send_delivered: Option<bool>,
 }

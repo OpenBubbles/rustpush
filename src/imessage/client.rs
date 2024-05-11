@@ -487,6 +487,7 @@ impl IMClient {
         if get_c == 101 || get_c == 102 || ex == Some(0) {
             let uuid = load.get("U").unwrap().as_data().unwrap();
             let time_recv = load.get("e").unwrap().as_unsigned_integer().unwrap();
+            let send_delivered = load.get("D").map(|v| v.as_boolean().unwrap()).unwrap_or(false);
             return Ok(Some(IMessage {
                 id: Uuid::from_bytes(uuid.try_into().unwrap()).to_string().to_uppercase(),
                 sender: load.get("sP").and_then(|i| i.as_string().map(|i| i.to_string())),
@@ -515,7 +516,8 @@ impl IMClient {
                     Message::Read
                 },
                 target: Some(load.get("t").map(|t| vec![MessageTarget::Token(t.as_data().unwrap().to_vec())]).unwrap_or(vec![])),
-                sent_timestamp: time_recv / 1000000
+                sent_timestamp: time_recv / 1000000,
+                send_delivered,
             }))
         }
 
@@ -524,6 +526,7 @@ impl IMClient {
             let token: Vec<u8> = load.get("t").expect("No c T").as_data().unwrap().to_vec();
             let time_recv = load.get("e").expect("No c E").as_unsigned_integer().unwrap();
             let sender = load.get("sP").and_then(|i| i.as_string().map(|i| i.to_string()));
+            let send_delivered = load.get("D").map(|v| v.as_boolean().unwrap()).unwrap_or(false);
             if let Some(unenc) = load.get("p") {
                 if let Ok(loaded) = plist::from_value::<RawChangeMessage>(unenc) {
                     return Ok(Some(IMessage {
@@ -537,7 +540,8 @@ impl IMClient {
                             sender_guid: loaded.sender_guid.clone()
                         }),
                         message: Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }),
-                        target: Some(vec![MessageTarget::Token(token)])
+                        target: Some(vec![MessageTarget::Token(token)]),
+                        send_delivered,
                     }))
                 }
                 if let Ok(loaded) = plist::from_value::<RawRenameMessage>(unenc) {
@@ -552,7 +556,8 @@ impl IMClient {
                             sender_guid: loaded.sender_guid.clone(),
                         }),
                         message: Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }),
-                        target: Some(vec![MessageTarget::Token(token)])
+                        target: Some(vec![MessageTarget::Token(token)]),
+                        send_delivered,
                     }))
                 }
             }
@@ -562,6 +567,7 @@ impl IMClient {
             let mut cache_lock = self.key_cache.lock().await;
             let source = load.get("sP").unwrap().as_string().unwrap();
             let target = load.get("tP").unwrap().as_string().unwrap();
+            let send_delivered = load.get("D").map(|v| v.as_boolean().unwrap()).unwrap_or(false);
             cache_lock.invalidate(target, source);
             return Ok(if self.get_handles().await.contains(&source.to_string()) && source == target {
                 self.ensure_private_self(&mut cache_lock, target, true).await?;
@@ -588,7 +594,8 @@ impl IMClient {
                     conversation: None,
                     message: Message::PeerCacheInvalidate,
                     target: Some(vec![MessageTarget::Token(sender_token)]),
-                    sent_timestamp: time_recv / 1000000
+                    sent_timestamp: time_recv / 1000000,
+                    send_delivered
                 })
             } else {
                 None
@@ -720,9 +727,10 @@ impl IMClient {
             id: Uuid::new_v4().to_string().to_uppercase(),
             after_guid: None,
             sent_timestamp: 0,
+            send_delivered: message.should_send_delivered(&conversation),
             conversation: Some(conversation),
             message,
-            target: None
+            target: None,
         }
     }
 
@@ -866,7 +874,7 @@ impl IMClient {
 
             payloads.push((encrypted.as_ref().map_or(0, |e| e.len()), BundledPayload {
                 participant: participant.to_string(),
-                not_me: participant != message.sender.as_ref().unwrap(),
+                send_delivered: if message.send_delivered { participant != message.sender.as_ref().unwrap() } else { false },
                 session_token: token.session_token.clone().into(),
                 payload: encrypted.map(|e| e.into()),
                 token: token.push_token.clone().into()
@@ -945,10 +953,11 @@ impl IMClient {
         // When sending attachments, APNs gets mad at us if we send too much at the same time.
         let mut staged_payloads: Vec<BundledPayload> = vec![];
         let mut staged_size: usize = 0;
-        let send_staged = |send: Vec<BundledPayload>| {
-            async {
+        let send_staged = |send: Vec<BundledPayload>, batch: u8| {
+            let bytes_id = &bytes_id;
+            async move {
                 let complete = SendMsg {
-                    fcn: 1,
+                    fcn: batch,
                     c: message.message.get_c(),
                     e: if message.has_payload() { Some("pair".to_string()) } else { None },
                     ua: self.os_config.get_version_ua(),
@@ -966,16 +975,19 @@ impl IMClient {
             }
         };
 
+        let mut send_count = 0;
         for payload in &payloads {
             staged_payloads.push(payload.1.clone());
             staged_size += payload.0;
             if staged_size > PAYLOADS_MAX_SIZE {
                 staged_size = 0;
-                send_staged(staged_payloads).await?;
+                send_count += 1;
+                send_staged(staged_payloads, send_count).await?;
                 staged_payloads = vec![];
             }
         }
-        send_staged(staged_payloads).await?;
+        send_count += 1;
+        send_staged(staged_payloads, send_count).await?;
 
         if let Some(check_task) = check_task {
             let needs_refresh = check_task.await.unwrap()?;
