@@ -125,7 +125,7 @@ async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str, os_co
     let resp = client.post(ids_bag.get(endpoint_key).unwrap().as_string().unwrap())
             .header("x-protocol-version", os_config.get_protocol_version())
             .header("accept-encoding", "gzip")
-            .header("user-agent", os_config.get_registration_ua())
+            .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
             .header("content-encoding", "gzip")
             .body(gzip_normal(plist_to_string(&body)?.as_bytes())?)
             .send()
@@ -233,7 +233,9 @@ struct IDSClientData {
 struct IDSIdentityRespRes {
     client_data: Option<IDSClientData>,
     push_token: Data,
-    session_token: Data
+    session_token: Data,
+    session_token_expires_seconds: u64,
+    session_token_refresh_seconds: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -242,7 +244,26 @@ pub struct IDSIdentityResult {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub push_token: Vec<u8>,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
-    pub session_token: Vec<u8>
+    pub session_token: Vec<u8>,
+    pub expires_seconds: u64,
+    pub refresh_seconds: u64,
+}
+
+#[derive(Default)]
+pub struct QueryOptions {
+    pub required_for_message: bool,
+    pub result_expected: bool,
+}
+
+impl QueryOptions {
+    fn add_headers(&self, headers: &mut Dictionary) {
+        if self.required_for_message {
+            headers.insert("x-required-for-message".to_string(), Value::String("true".into()));
+        }
+        if self.result_expected {
+            headers.insert("x-result-expected".to_string(), Value::String("true".into()));
+        }
+    }
 }
 
 #[repr(C)]
@@ -298,7 +319,7 @@ impl IDSUser {
         }).collect())
     }
 
-    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>, os_config: &dyn OSConfig, meta: &QueryOptions) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
         println!("Performing an IDS Lookup for: {:?}", query);
         let body = plist_to_string(&LookupReq { uris: query })?;
 
@@ -308,8 +329,11 @@ impl IDSUser {
         let handle = self.handles.first().unwrap();
         let mut headers = Dictionary::from_iter([
             ("x-id-self-uri", Value::String(handle.clone())),
-            ("x-protocol-version", self.protocol_version.to_string().into())
+            ("x-protocol-version", self.protocol_version.to_string().into()),
+            ("User-Agent", format!("com.apple.madrid-lookup {}", os_config.get_version_ua()).into()),
         ].into_iter());
+
+        meta.add_headers(&mut headers);
 
         add_id_signature(&mut headers, &encoded, "id-query", 
             self.identity.as_ref().unwrap().id_keypair.as_ref().unwrap(), &conn.get_token().await)?;
@@ -350,6 +374,7 @@ impl IDSUser {
         
         // gzip decode
         let decoded_data = ungzip(loaded.as_dictionary().unwrap().get("b").unwrap().as_data().unwrap())?;
+        debug!("lookup result: {:?}", plist::from_bytes::<Value>(&decoded_data).unwrap());
 
         let lookup_resp: IDSLookupResp = plist::from_bytes(&decoded_data).unwrap();
         if lookup_resp.status != 0 {
@@ -365,7 +390,9 @@ impl IDSUser {
                     IDSIdentityResult {
                         identity: IDSPublicIdentity::decode(&key).unwrap(),
                         push_token: identity.push_token.clone().into(),
-                        session_token: identity.session_token.clone().into()
+                        session_token: identity.session_token.clone().into(),
+                        expires_seconds: identity.session_token_expires_seconds,
+                        refresh_seconds: identity.session_token_refresh_seconds,
                     }
                 }).collect())
         }));

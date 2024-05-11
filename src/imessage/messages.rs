@@ -931,7 +931,6 @@ impl Message {
             Self::SmsConfirmSent(_) => Some(true),
             Self::MarkUnread => Some(true),
             Self::PeerCacheInvalidate => Some(true),
-            Self::SmsConfirmSent(_) => Some(true),
             _ => None
         }
     }

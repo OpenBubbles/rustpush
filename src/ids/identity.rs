@@ -236,7 +236,6 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
                 ("supports-protobuf-payload-data-v2", Value::Boolean(true)),
                 ("supports-hdr", Value::Boolean(true)),
                 ("supports-heif", Value::Boolean(true)),
-                ("supports-certified-delivery-v1", Value::Boolean(true)),
                 ("supports-dq-nr", Value::Boolean(true)),
                 ("supports-family-invite-message-bubble", Value::Boolean(true)),
                 ("supports-live-delivery", Value::Boolean(true)),
@@ -292,7 +291,7 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
 
     let mut builder = client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
         .header("x-protocol-version", os_config.get_protocol_version().to_string())
-        .header("user-agent", os_config.get_registration_ua())
+        .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("content-encoding", "gzip")
         .header("accept-encoding", "gzip");
     for (idx, user) in users.iter().enumerate() {

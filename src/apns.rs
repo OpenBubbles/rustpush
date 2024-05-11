@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::{Duration, SystemTime}};
+use std::{io, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, warn, info};
 use openssl::{sha::{Sha1, sha1}, pkey::PKey, hash::MessageDigest, sign::Signer, rsa::Padding, x509::X509};
@@ -13,7 +13,7 @@ use serde::{Serialize, Deserialize};
 use async_recursion::async_recursion;
 use tokio::time::interval;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, OSConfig, util::{bin_deserialize_opt, bin_serialize_opt, KeyPair}, PushError};
+use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, util::{bin_deserialize_opt, bin_serialize_opt, plist_to_bin, KeyPair}, OSConfig, PushError};
 
 #[derive(Debug, Clone)]
 pub struct APNSPayload {
@@ -131,7 +131,7 @@ impl APNSSubmitter {
         Ok(())
     }
     
-    pub async fn filter(&self, topics: &[&str]) -> Result<(), PushError> {
+    async fn filter(&self, topics: &[&str]) -> Result<(), PushError> {
         debug!("Sending filter for {:?}", topics);
         let mut fields = vec![(1, self.token().await)];
         for topic in topics {
@@ -451,8 +451,28 @@ impl APNSConnection {
 
         debug!("Recieved connect response with token {:?}", token);
 
-        submitter.set_state(1).await.unwrap();
-        submitter.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await.unwrap();
+        submitter.set_state(1).await?;
+        submitter.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await?;
+
+        // if we aren't told we don't need to ask, ask.
+        if let Err(_) = tokio::time::timeout(Duration::from_millis(500), reader.wait_find(0xE)).await {
+            debug!("Sending flush cache msg");
+            #[derive(Serialize)]
+            struct FlushCacheMsg {
+                e: u64,
+                c: u64,
+            }
+
+            let start = SystemTime::now();
+            let since_the_epoch = start
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards");
+            let msg = FlushCacheMsg { c: 160, e: since_the_epoch.as_nanos() as u64 };
+
+            // hack, fix later
+            let _ = submitter.send_message("com.apple.madrid", &plist_to_bin(&msg)?, None).await;
+            debug!("sent");
+        }
 
         Ok(())
     }

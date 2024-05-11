@@ -61,8 +61,8 @@ impl OSConfig for MacOSConfig {
         format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, self.aoskit_version)
     }
 
-    fn get_registration_ua(&self) -> String {
-        format!("com.apple.invitation-registration [macOS,{},{},{},1]", self.version, self.inner.os_build_num, self.inner.product_name)
+    fn get_version_ua(&self) -> String {
+        format!("[macOS,{},{},{}]", self.version, self.inner.os_build_num, self.inner.product_name)
     }
 
     fn get_activation_device(&self) -> String {
