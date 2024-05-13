@@ -166,34 +166,18 @@ async fn main() {
     loop {
         tokio::select! {
             msg = client.recieve_wait() => {
-                if let Some(msg) = msg.unwrap() {
+                if let Ok(Some(msg)) = msg {
                     if msg.has_payload() && !received_msgs.contains(&msg.id) {
                         received_msgs.push(msg.id.clone());
                         println!("{}", msg);
                         print!(">> ");
                         std::io::stdout().flush().unwrap();
-                        match msg.message {
-                            Message::Message(inner) => {
-                                if inner.service == MessageType::IMessage {
-                                    let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                    msg2.id = msg.id;
-                                    msg2.target = msg.target;
-                                    client.send(&mut msg2).await.unwrap();
-                                }
-                            },
-                            Message::React(_inner) => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                msg2.target = msg.target;
-                                client.send(&mut msg2).await.unwrap();
-                            },
-                            Message::Typing => {
-                                let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
-                                msg2.id = msg.id;
-                                msg2.target = msg.target;
-                                client.send(&mut msg2).await.unwrap();
-                            },
-                            _ => {}
+                        if msg.send_delivered {
+                            println!("sending delivered");
+                            let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                            msg2.id = msg.id;
+                            msg2.target = msg.target;
+                            let _ = client.send(&mut msg2).await;
                         }
                     }
                 }

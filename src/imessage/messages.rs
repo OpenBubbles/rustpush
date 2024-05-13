@@ -1057,7 +1057,6 @@ impl IMessage {
             Message::Read => false,
             Message::Delivered => false,
             Message::Typing => false,
-            Message::StopTyping => false,
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
             _ => true
