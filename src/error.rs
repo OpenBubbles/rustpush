@@ -1,11 +1,13 @@
-use std::{io, sync::Arc};
+use std::{io, time::SystemTimeError};
 
+use deku::DekuError;
 #[cfg(feature = "macOS")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
+use tokio::sync::broadcast::{self, error::SendError};
 
-use crate::{ids::identity::SupportAlert, imessage::client::RegistrationFailure};
+use crate::{aps::APSMessage, ids::identity::SupportAlert, imessage::client::RegistrationFailure};
 
 #[derive(Error, Debug)]
 pub enum PushError {
@@ -29,8 +31,8 @@ pub enum PushError {
     KeyError(KeyError),
     #[error("IDS key missing for {0}")]
     KeyNotFound(String),
-    #[error("Failed to connect to APNs")]
-    APNSConnectError,
+    #[error("Failed to connect to APS")]
+    APSConnectError,
     #[error("TLS error {0}")]
     TLSError(#[from] rustls::Error),
     #[error("Response error {0}")]
@@ -56,4 +58,12 @@ pub enum PushError {
     AuthInvalid(u64),
     #[error("Reregistration failed {0}")]
     ReRegistrationFailure(#[from] RegistrationFailure),
+    #[error("APS parse error {0}")]
+    APSParseError(#[from] DekuError),
+    #[error("Other side hung up! {0}")]
+    APSSendError(#[from] SendError<APSMessage>),
+    #[error("Time went backwards!")]
+    TimeError(#[from] SystemTimeError),
+    #[error("ConnectionClosed")]
+    ConnectionClosed(#[from] broadcast::error::RecvError),
 }

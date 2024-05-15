@@ -1,6 +1,6 @@
 mod bags;
 mod albert;
-mod apns;
+mod aps;
 mod ids;
 mod util;
 mod imessage;
@@ -15,7 +15,7 @@ pub mod mmcsp {
 }
 
 use albert::ActivationInfo;
-pub use apns::{APNSState, APNSConnection};
+pub use aps::{APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
 pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};
 pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};

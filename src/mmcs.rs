@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APNSConnection};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APSConnection};
 use log::{info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
-use rand::Rng;
+use rand::RngCore;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -273,7 +273,7 @@ struct MMCSUploadResponse {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APNSConnection, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
+pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APSConnection, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
@@ -294,12 +294,12 @@ pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &Pre
     buf.reserve(get.encoded_len());
     get.encode(&mut buf).unwrap();
 
-    let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+    let msg_id = rand::thread_rng().next_u32();
     let complete = RequestMMCSUpload {
         c: 150,
         ua: "[macOS,12.6.9,21G726,iMac13,1]".to_string(),
         v: 3,
-        i: u32::from_be_bytes(msg_id),
+        i: msg_id,
         length: prepared.total_len,
         signature: prepared.total_sig.clone().into(),
         cv: 2,
@@ -313,18 +313,21 @@ pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &Pre
         body: buf.into()
     };
     let binary = plist_to_bin(&complete)?;
-    apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+    let recv = apns.subscribe().await;
+    apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
 
-    let response = apns.reader.wait_find_msg(move |loaded| {
+    let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
         let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-            return false
+            return None
         };
         let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-            return false
+            return None
         };
-        c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
-    }).await?;
-    let apns_response: MMCSUploadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
+        if c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+            Some(loaded)
+        } else { None }
+    }, &["com.apple.madrid"])).await?;
+    let apns_response: MMCSUploadResponse = plist::from_value(&reader).unwrap();
 
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(apns_response.response)).unwrap();
     let sources = vec![ChunkedContainer::new(prepared.chunk_sigs.clone(), source)];
@@ -633,9 +636,9 @@ struct MMCSDownloadResponse {
     object: String
 }
 
-pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnection, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
     let domain = url.replace(&format!("/{}", object), "");
-    let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+    let msg_id = rand::thread_rng().next_u32();
     let request_download = RequestMMCSDownload {
         object: object.to_string(),
         c: 151,
@@ -650,23 +653,26 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APNSConnection
         v: 8,
         domain,
         cv: 2,
-        i: u32::from_be_bytes(msg_id),
+        i: msg_id,
         signature: sig.to_vec().into()
     };
     
     let binary = plist_to_bin(&request_download)?;
-    apns.send_message("com.apple.madrid", &binary, Some(&msg_id)).await?;
+    let recv = apns.subscribe().await;
+    apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
 
-    let response = apns.reader.wait_find_msg(move |loaded| {
+    let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
         let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-            return false
+            return None
         };
         let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-            return false
+            return None
         };
-        c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == u32::from_be_bytes(msg_id)
-    }).await?;
-    let apns_response: MMCSDownloadResponse = plist::from_bytes(response.get_field(3).unwrap()).unwrap();
+        if c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+            Some(loaded)
+        } else { None }
+    }, &["com.apple.madrid"])).await?;
+    let apns_response: MMCSDownloadResponse = plist::from_value(&reader).unwrap();
 
     let data: Vec<u8> = apns_response.response.clone().into();
     let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(data)).unwrap();

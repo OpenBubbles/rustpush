@@ -7,7 +7,7 @@ use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
 use uuid::Uuid;
-use crate::{apns::{APNSConnection, APNSState}, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, OSConfig};
+use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, APSConnection, APSState, OSConfig};
 
 use super::{identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -162,7 +162,7 @@ struct HandleResult {
     status: u64,
 }
 
-pub async fn get_handles(protocol_ver: u32, user_id: &str, auth_keypair: &KeyPair, push_state: &APNSState) -> Result<Vec<String>, PushError> {
+pub async fn get_handles(protocol_ver: u32, user_id: &str, auth_keypair: &KeyPair, push_state: &APSState) -> Result<Vec<String>, PushError> {
     let ids_bag = get_bag(IDS_BAG).await?;
     let client = make_reqwest();
     let resp = auth_sign_req(
@@ -279,11 +279,11 @@ pub struct PrivateDeviceInfo {
 
 impl IDSUser {
     // possible handles, which may have changed since registration
-    pub async fn possible_handles(&self, conn: &APNSConnection) -> Result<Vec<String>, PushError> {
+    pub async fn possible_handles(&self, conn: &APSConnection) -> Result<Vec<String>, PushError> {
         get_handles(self.protocol_version, &self.user_id, &self.auth_keypair, &*conn.state.read().await).await
     }
 
-    pub async fn get_dependent_registrations(&self, conn: &APNSConnection) -> Result<Vec<PrivateDeviceInfo>, PushError> {
+    pub async fn get_dependent_registrations(&self, conn: &APSConnection) -> Result<Vec<PrivateDeviceInfo>, PushError> {
         let ids_bag = get_bag(IDS_BAG).await?;
         let client = make_reqwest();
         let conn_state = conn.state.read().await;
@@ -319,7 +319,7 @@ impl IDSUser {
         }).collect())
     }
 
-    pub async fn lookup(&self, conn: Arc<APNSConnection>, query: Vec<String>, os_config: &dyn OSConfig, meta: &QueryOptions) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+    pub async fn lookup(&self, conn: Arc<APSConnection>, query: Vec<String>, os_config: &dyn OSConfig, meta: &QueryOptions) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
         println!("Performing an IDS Lookup for: {:?}", query);
         let body = plist_to_string(&LookupReq { uris: query })?;
 
@@ -352,25 +352,22 @@ impl IDSUser {
         ].into_iter()));
 
         let conn_cpy = conn.clone();
-        let msg = tokio::spawn(async move {
-            conn_cpy.reader.wait_find_msg(move |loaded| {
-                let Some(resp_id) = loaded.as_dictionary().unwrap().get("U") else {
-                    return false
-                };
-                let resp_id = resp_id.as_data().unwrap();
-                resp_id == msg_id
-            }).await
-        });
+        let receiver = conn_cpy.subscribe().await;
 
         debug!("Sending query");
-        conn.send_message("com.apple.madrid", &plist_to_bin(&request)?, None).await?;
+        conn.send_message("com.apple.madrid", plist_to_bin(&request)?, None).await?;
         debug!("Sent");
 
-        let response = msg.await.unwrap()?;
+        let loaded = conn_cpy.wait_for_timeout(receiver, get_message(|payload| {
+            let Some(resp_id) = payload.as_dictionary().unwrap().get("U") else {
+                return None
+            };
+            let resp_id = resp_id.as_data().unwrap();
+            return if resp_id == msg_id {
+                Some(payload)
+            } else { None }
+        }, &["com.apple.madrid"])).await?;
         debug!("Recieved");
-
-        let data = response.get_field(3).unwrap();
-        let loaded: Value = plist::from_bytes(data).unwrap();
         
         // gzip decode
         let decoded_data = ungzip(loaded.as_dictionary().unwrap().get("b").unwrap().as_data().unwrap())?;
@@ -402,7 +399,7 @@ impl IDSUser {
 }
 
 impl IDSAppleUser {
-    pub async fn authenticate(_conn: &APNSConnection, username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(_conn: &APSConnection, username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let (token, user_id) = get_auth_token(username, pet, os_config).await?;
         let auth_keypair = get_auth_cert(&user_id, &token, os_config).await?;
 
@@ -418,7 +415,7 @@ impl IDSAppleUser {
 }
 
 impl IDSPhoneUser {
-    pub async fn authenticate(conn: &APNSConnection, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+    pub async fn authenticate(conn: &APSConnection, phone_number: &str, phone_sig: &[u8], os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
         let auth_keypair = get_phone_cert(phone_number, 
                 &conn.get_token().await, &[phone_sig.to_vec()], os_config).await?;
 

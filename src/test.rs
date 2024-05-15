@@ -5,8 +5,8 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APNSConnection, APNSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, OSConfig};
-use tokio::{fs, io::{self, BufReader, AsyncBufReadExt}};
+use rustpush::{init_logger, register, APSConnection, APSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage};
+use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
-    push: APNSState,
+    push: APSState,
     users: Vec<IDSUser>
 }
 
@@ -39,7 +39,7 @@ async fn read_input() -> String {
     username
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 1)]
 async fn main() {
     init_logger();
 
@@ -61,7 +61,7 @@ async fn main() {
     
     
     
-    let config: MacOSConfig = if let Ok(config) = plist::from_file("hwconfig.plist") {
+    let config: Arc<MacOSConfig> = Arc::new(if let Ok(config) = plist::from_file("hwconfig.plist") {
         config
     } else {
         println!("Missing hardware config!");
@@ -86,19 +86,22 @@ async fn main() {
             icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
             aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         }
-    };
-    fs::write("hwconfig.plist", plist_to_string(&config).unwrap()).await.unwrap();
+    });
+    fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
-    let connection = Arc::new(
-        APNSConnection::new(
-            &config,
+    let (connection, error) = 
+        APSConnection::new(
+            config.clone(),
             saved_state.as_ref().map(|state| state.push.clone()),
         )
-        .await
-        .unwrap(),
-    );
+        .await;
+
+    
+    if let Some(error) = error {
+        panic!("{}", error);
+    }
     let mut users = if let Some(state) = saved_state.as_ref() {
         state.users.clone()
     } else {
@@ -127,25 +130,23 @@ async fn main() {
         let account = acc.unwrap();
         let pet = account.get_pet().unwrap();
 
-        let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, &config).await.unwrap();
+        let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, config.as_ref()).await.unwrap();
 
         vec![user]
     };
 
     if users[0].identity.is_none() {
         info!("Registering new identity...");
-        register(&config, &mut users, &connection).await.unwrap();
+        register(config.as_ref(), &mut users, connection.as_ref()).await.unwrap();
     }
 
     let mut state = SavedState {
-        push: connection.clone_state().await,
+        push: connection.state.read().await.clone(),
         users: users.clone()
     };
     fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
-
-    let os_config: Arc<dyn OSConfig> = Arc::new(config);
     
-    let client = IMClient::new(connection.clone(), users, "id_cache.plist".into(), os_config, Box::new(move |updated_keys| {
+    let client = IMClient::new(connection.clone(), users, "id_cache.plist".into(), config, Box::new(move |updated_keys| {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;

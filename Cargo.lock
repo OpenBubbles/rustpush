@@ -1899,6 +1899,7 @@ dependencies = [
  "async-recursion",
  "async-trait",
  "base64 0.21.2",
+ "deku",
  "flume",
  "html-escape",
  "icloud_auth",

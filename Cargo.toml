@@ -32,6 +32,7 @@ async-trait = "0.1.73"
 flume = "0.11.0"
 open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, features = ["serde"] }
 icloud_auth = { path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth" }
+deku = "0.16.0"
 
 [features]
 default = ["macOS"]

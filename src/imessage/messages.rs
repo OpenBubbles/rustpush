@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{apns::APNSConnection, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{base64_encode, decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
+use crate::{aps::APSConnection, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
 
 include!("./rawmessages.rs");
@@ -770,7 +770,7 @@ impl MMCSFile {
     }
 
     // create and upload a new attachment to MMCS
-    pub async fn new(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<MMCSFile, PushError> {
+    pub async fn new(apns: &APSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<MMCSFile, PushError> {
 
         let mut send_container = IMessageContainer::new(&prepared.key, None, Some(reader));
         let result = put_mmcs(&mut send_container, &prepared.mmcs, apns, progress).await?;
@@ -787,7 +787,7 @@ impl MMCSFile {
     }
 
     // request to get and download attachment from MMCS
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
+    pub async fn get_attachment(&self, apns: &APSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
         let mut recieve_container = IMessageContainer::new(&self.key, Some(writer), None);
         get_mmcs(&self.signature, &self.url, &self.object, apns, &mut recieve_container, progress).await?;
 
@@ -814,7 +814,7 @@ pub struct Attachment {
 
 impl Attachment {
 
-    pub async fn new_mmcs(apns: &APNSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<Attachment, PushError> {
+    pub async fn new_mmcs(apns: &APSConnection, prepared: &AttachmentPreparedPut, reader: &mut (dyn Read + Send + Sync), mime: &str, uti: &str, name: &str, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
             a_type: AttachmentType::MMCS(mmcs),
@@ -833,7 +833,7 @@ impl Attachment {
         }
     }
 
-    pub async fn get_attachment(&self, apns: &APNSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
+    pub async fn get_attachment(&self, apns: &APSConnection, writer: &mut (dyn Write + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
         match &self.a_type {
             AttachmentType::Inline(data) => {
                 writer.write_all(&data.clone())?;
@@ -1071,7 +1071,7 @@ impl IMessage {
         }
     }
 
-    pub(super) async fn to_raw(&self, my_handles: &[String], apns: &APNSConnection) -> Result<Vec<u8>, PushError> {
+    pub(super) async fn to_raw(&self, my_handles: &[String], apns: &APSConnection) -> Result<Vec<u8>, PushError> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -1364,7 +1364,7 @@ impl IMessage {
     }
 
     #[async_recursion]
-    pub(super) async fn from_raw(bytes: &[u8], wrapper: &RecvMsg, apns: &APNSConnection) -> Result<IMessage, PushError> {
+    pub(super) async fn from_raw(bytes: &[u8], wrapper: &RecvMsg, apns: &APSConnection) -> Result<IMessage, PushError> {
         let decompressed = ungzip(&bytes).unwrap_or_else(|_| bytes.to_vec());
         debug!("xml: {:?}", plist::Value::from_reader(Cursor::new(&decompressed)));
         if let Ok(loaded) = plist::from_bytes::<RawSmsActivateMessage>(&decompressed) {

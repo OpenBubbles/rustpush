@@ -111,19 +111,22 @@ where
     Ok(vec.try_into().unwrap())
 }
 
-pub fn bin_serialize_opt<S>(x: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
+pub fn bin_serialize_opt<S>(x: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    x.clone().map(|i| Data::new(i)).serialize(s)
+    x.clone().map(|i| Data::new(i.to_vec())).serialize(s)
 }
 
-pub fn bin_deserialize_opt<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
+pub fn bin_deserialize_opt<'de, D>(d: D) -> Result<Option<[u8; 32]>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s: Option<Data> = Deserialize::deserialize(d)?;
-    Ok(s.map(|i| i.into()))
+    Ok(s.map(|i| {
+        let i: Vec<u8> = i.into();
+        i.try_into().unwrap()
+    }))
 }
 
 // both in der

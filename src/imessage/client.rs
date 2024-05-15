@@ -3,15 +3,16 @@ use std::{collections::{HashMap, HashSet}, fmt::Display, fs, io::Cursor, path::P
 
 use flume::RecvError;
 use log::{debug, error, info, warn};
-use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer, symm::{decrypt, encrypt, Cipher}};
+use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sign::Signer, symm::{decrypt, encrypt, Cipher}};
+use plist::Value;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::{mpsc::Receiver, Mutex, RwLock}, time::sleep};
+use tokio::{sync::{broadcast, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
-use rand::Rng;
+use rand::{Rng, RngCore};
 use async_recursion::async_recursion;
 use thiserror::Error;
 
-use crate::{apns::{APNSConnection, APNSPayload}, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo, QueryOptions}}, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, OSConfig, RenameMessage};
+use crate::{aps::get_message, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo, QueryOptions}}, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, APSConnection, APSMessage, OSConfig, RenameMessage};
 
 use super::messages::{IMessage, ConversationData, Message, RecvMsg};
 
@@ -67,7 +68,7 @@ struct CachedHandle {
 
 impl CachedHandle {
     // hash key factors
-    async fn verity(&mut self, conn: &APNSConnection, user: &IDSUser) {
+    async fn verity(&mut self, conn: &APSConnection, user: &IDSUser) {
         let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
         env.update(&user.identity.as_ref().unwrap().id_keypair.as_ref().unwrap().cert).unwrap();
         env.update(&conn.get_token().await).unwrap();
@@ -88,7 +89,7 @@ struct KeyCache {
 }
 
 impl KeyCache {
-    async fn new(path: PathBuf, conn: &APNSConnection, users: &[IDSUser]) -> KeyCache {
+    async fn new(path: PathBuf, conn: &APSConnection, users: &[IDSUser]) -> KeyCache {
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
@@ -105,7 +106,7 @@ impl KeyCache {
     }
 
     // verify integrity
-    async fn verity(&mut self, conn: &APNSConnection, users: &[IDSUser]) {
+    async fn verity(&mut self, conn: &APSConnection, users: &[IDSUser]) {
         for user in users {
             for handle in &user.handles {
                 self.cache.entry(handle.clone()).or_default().verity(conn, user).await;
@@ -218,40 +219,42 @@ pub enum RegisterState {
 }
 
 pub struct IMClient {
-    pub conn: Arc<APNSConnection>,
+    pub conn: Arc<APSConnection>,
     pub users: Arc<RwLock<Vec<IDSUser>>>,
     key_cache: Arc<Mutex<KeyCache>>,
-    raw_inbound: Mutex<Receiver<APNSPayload>>,
+    raw_inbound: Mutex<broadcast::Receiver<APSMessage>>,
     rereg_signal: Mutex<flume::Sender<()>>,
-    rereg_success: tokio::sync::broadcast::Receiver<Result<(), RegistrationFailure>>,
+    rereg_success: broadcast::Receiver<Result<(), RegistrationFailure>>,
     register_state: Arc<Mutex<RegisterState>>,
     os_config: Arc<dyn OSConfig>,
     id_lock: Mutex<()>,
 }
 
 impl IMClient {
-    pub async fn new(conn: Arc<APNSConnection>, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+    pub async fn new(conn: Arc<APSConnection>, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         let (rereg_signal, recieve) = flume::bounded(0);
         let (rereg_finish, recv_finish) = tokio::sync::broadcast::channel(1);
+        
+        Self::configure_conn(conn.as_ref()).await;
+
+        let mut to_refresh = conn.connected.subscribe();
+        let reconn_conn = Arc::downgrade(&conn);
+        tokio::spawn(async move {
+            loop {
+                match to_refresh.recv().await {
+                    Ok(()) => {
+                        let Some(conn) = reconn_conn.upgrade() else { break };
+                        Self::configure_conn(conn.as_ref()).await;
+                    },
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         let client = IMClient {
             key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users).await)),
-            raw_inbound: Mutex::new(conn.reader.register_for(|pay| {
-                if pay.id != 0x0A {
-                    return false
-                }
-                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) &&
-                    pay.get_field(2).unwrap() != &sha1("com.apple.private.alloy.sms".as_bytes()) {
-                    return false
-                }
-                let Some(body) = pay.get_field(3) else {
-                    return false
-                };
-                let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-                let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-                debug!("mydatsa: {:?}", load);
-                get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || get_c == 111 || get_c == 130 || get_c == 122 ||
-                    get_c == 145 || get_c == 143 || get_c == 146 || get_c == 144 || get_c == 140 || get_c == 141 || get_c == 149
-            }).await),
+            raw_inbound: Mutex::new(conn.messages_cont.subscribe()),
             conn,
             users: Arc::new(RwLock::new(users)),
             rereg_signal: Mutex::new(rereg_signal),
@@ -271,8 +274,33 @@ impl IMClient {
         client
     }
 
+    async fn configure_conn(conn: &APSConnection) {
+        let _ = conn.send(APSMessage::SetState { state: 1 }).await;
+        let _ = conn.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await;
+
+        if let Err(_) = tokio::time::timeout(Duration::from_millis(500), conn.wait_for_timeout(conn.subscribe().await, 
+            |msg| if let APSMessage::NoStorage = msg { Some(()) } else { None })).await {
+            debug!("Sending flush cache msg");
+            #[derive(Serialize)]
+            struct FlushCacheMsg {
+                e: u64,
+                c: u64,
+            }
+        
+            let start = SystemTime::now();
+            let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+            let msg = FlushCacheMsg { c: 160, e: since_the_epoch.as_nanos() as u64 };
+        
+            // hack, fix later
+            let _ = conn.send_message("com.apple.madrid", plist_to_bin(&msg).unwrap(), None).await;
+            debug!("sent");
+        }
+    }
+
     #[async_recursion]
-    async fn schedule_ids_rereg(conn_ref: Arc<APNSConnection>,
+    async fn schedule_ids_rereg(conn_ref: Arc<APSConnection>,
             users_ref: Arc<RwLock<Vec<IDSUser>>>,
             key_cache_ref: Arc<Mutex<KeyCache>>,
             os_config: Arc<dyn OSConfig>,
@@ -416,22 +444,23 @@ impl IMClient {
         Ok(decrypted_sym)
     }
 
-    pub async fn recieve(&self) -> Result<Option<IMessage>, PushError> {
-        let Ok(payload) = self.raw_inbound.lock().await.try_recv() else {
-            return Ok(None)
-        };
-        let recieved = self.recieve_payload(payload).await;
-        if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
-        recieved
-    }
-
     pub async fn recieve_wait(&self) -> Result<Option<IMessage>, PushError> {
-        let Some(payload) = self.raw_inbound.lock().await.recv().await else {
-            return Ok(None)
-        };
-        let recieved = self.recieve_payload(payload).await;
-        if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
-        recieved
+        let mut filter = get_message(|load| {
+            let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
+            debug!("mydatsa: {:?}", load);
+            if get_c == 100 || get_c == 101 || get_c == 102 || get_c == 190 || get_c == 118 || get_c == 111 || get_c == 130 || get_c == 122 ||
+                get_c == 145 || get_c == 143 || get_c == 146 || get_c == 144 || get_c == 140 || get_c == 141 || get_c == 149 {
+                    Some(load)
+                } else { None }
+        }, &["com.apple.madrid", "com.apple.private.alloy.sms"]);
+        loop {
+            let msg = self.raw_inbound.lock().await.recv().await.expect("APS dropped???");
+            if let Some(received) = filter(msg) {
+                let recieved = self.recieve_payload(received).await;
+                if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
+                return recieved
+            }
+        }
     }
 
     fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
@@ -476,11 +505,9 @@ impl IMClient {
         Ok(())
     }
 
-    async fn recieve_payload(&self, payload: APNSPayload) -> Result<Option<IMessage>, PushError> {
-        let body = payload.get_field(3).unwrap();
-        info!("startasdf");
+    async fn recieve_payload(&self, payload: Value) -> Result<Option<IMessage>, PushError> {
 
-        let load = plist::Value::from_reader(Cursor::new(body))?.into_dictionary().unwrap();
+        let load = payload.as_dictionary().unwrap();
         let get_c = load.get("c").unwrap().as_unsigned_integer().unwrap();
         let ex = load.get("eX").map(|v| v.as_unsigned_integer().unwrap());
         let has_p = load.contains_key("P");
@@ -606,7 +633,7 @@ impl IMClient {
             return Ok(None)
         }
 
-        let loaded: RecvMsg = plist::from_bytes(body)?;
+        let loaded: RecvMsg = plist::from_value(&payload)?;
 
         let users_locked = self.users.read().await;
         let Some(identity) = users_locked.iter().find(|user| user.handles.contains(&loaded.target)) else {
@@ -882,72 +909,12 @@ impl IMClient {
         }
         drop(key_cache);
 
-        let msg_id = rand::thread_rng().gen::<[u8; 4]>();
+        let msg_id = rand::thread_rng().next_u32();
 
         let bytes_id = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
 
-        let my_reader = self.conn.clone();
         let payloads_cnt = payloads.len();
         let bytes_id_1 = bytes_id.clone();
-
-        // spawn task so it's waiting before we even send our message
-        let check_task = if message.message.get_nr() != Some(true) {
-            let mut confirm_reciever = my_reader.reader.register_for(move |pay| {
-                if pay.id != 0x0A {
-                    return false
-                }
-                if pay.get_field(2).unwrap() != &sha1("com.apple.madrid".as_bytes()) {
-                    return false
-                }
-                let Some(body) = pay.get_field(3) else {
-                    return false
-                };
-                let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-                let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
-                if get_c == 255 {
-                    // make sure it's my message
-                    let get_u = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
-                    get_u == bytes_id_1
-                } else {
-                    false
-                }
-            }).await;
-
-            Some(tokio::spawn(async move {
-                let mut refresh_tokens: Vec<Vec<u8>> = vec![];
-                info!("payload {payloads_cnt}");
-                for _i in 0..payloads_cnt {
-                    let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.80f32;
-                    let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
-                        250 // wait max 250ms after "good enough" to catch any stray 5032s, to prevent a network race condition
-                    } else {
-                        15000 // 15 seconds wait
-                    }), confirm_reciever.recv()).await else {
-                        if is_good_enough {
-                            warn!("timeout with {_i}/{payloads_cnt}");
-                            warn!("Greater than 80% submission rate, ignoring undeliverable messages!");
-                            return Ok(refresh_tokens);
-                        }
-                        error!("timeout with {_i}/{payloads_cnt}");
-                        return Err(PushError::SendTimedOut)
-                    };
-                    let payload = msg.expect("APN service was dropped??");
-                    let body = payload.get_field(3).unwrap();
-                    let load = plist::Value::from_reader(Cursor::new(body)).unwrap();
-                    let s = load.as_dictionary().unwrap().get("s").unwrap().as_signed_integer().unwrap();
-                    if s == 5032 {
-                        info!("got 5032, refreshing keys!");
-                        let t = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap();
-                        refresh_tokens.push(t.to_vec())
-                    } else if s != 0 && s != 5008 {
-                        return Err(PushError::SendErr(s))
-                    }
-                }
-                Ok(refresh_tokens)
-            }))
-        } else {
-            None
-        };
 
         // chunk payloads together, but if they get too big split them up into mulitple messages.
         // When sending attachments, APNs gets mad at us if we send too much at the same time.
@@ -962,7 +929,7 @@ impl IMClient {
                     e: if message.has_payload() { Some("pair".to_string()) } else { None },
                     ua: self.os_config.get_version_ua(),
                     v: 8,
-                    i: u32::from_be_bytes(msg_id),
+                    i: msg_id,
                     u: bytes_id.clone().into(),
                     dtl: send,
                     sp: message.sender.clone().unwrap(),
@@ -971,9 +938,29 @@ impl IMClient {
                 };
         
                 let binary = plist_to_bin(&complete)?;
-                Ok::<(), PushError>(self.conn.send_message(if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" }, &binary, Some(&msg_id)).await?)
+                Ok::<(), PushError>(self.conn.send_message(if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" }, binary, Some(msg_id)).await?)
             }
         };
+
+        let mut messages = self.conn.subscribe().await;
+
+        async fn get_next_msg(messages: &mut broadcast::Receiver<APSMessage>, search: &[u8]) -> Result<Value, PushError> {
+            let mut filter = get_message(|load| {
+                let get_c = load.as_dictionary().unwrap().get("c").unwrap().as_unsigned_integer().unwrap();
+                if get_c != 255 {
+                    return None
+                }
+                // make sure it's my message
+                let get_u = load.as_dictionary().unwrap().get("U").unwrap().as_data().unwrap();
+                if get_u == search { Some(load) } else { None }
+            }, &["com.apple.madrid"]);
+            loop {
+                let msg = messages.recv().await?;
+                if let Some(msg) = filter(msg) {
+                    return Ok(msg);
+                }
+            }
+        }
 
         let mut send_count = 0;
         for payload in &payloads {
@@ -989,12 +976,39 @@ impl IMClient {
         send_count += 1;
         send_staged(staged_payloads, send_count).await?;
 
-        if let Some(check_task) = check_task {
-            let needs_refresh = check_task.await.unwrap()?;
+        if message.message.get_nr() != Some(true) {
+            let mut refresh_tokens: Vec<Vec<u8>> = vec![];
+            info!("payload {payloads_cnt}");
+            for _i in 0..payloads_cnt {
+                let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.80f32;
+                let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
+                    250 // wait max 250ms after "good enough" to catch any stray 5032s, to prevent a network race condition
+                } else {
+                    15000 // 15 seconds wait
+                }), get_next_msg(&mut messages, &bytes_id_1)).await else {
+                    if is_good_enough {
+                        warn!("timeout with {_i}/{payloads_cnt}");
+                        warn!("Greater than 80% submission rate, ignoring undeliverable messages!");
+                        break
+                    }
+                    error!("timeout with {_i}/{payloads_cnt}");
+                    return Err(PushError::SendTimedOut)
+                };
+                let load = msg?;
+                let s = load.as_dictionary().unwrap().get("s").unwrap().as_signed_integer().unwrap();
+                if s == 5032 {
+                    info!("got 5032, refreshing keys!");
+                    let t = load.as_dictionary().unwrap().get("t").unwrap().as_data().unwrap();
+                    refresh_tokens.push(t.to_vec())
+                } else if s != 0 && s != 5008 {
+                    return Err(PushError::SendErr(s))
+                }
+            }
+
             let sender = message.sender.as_ref().unwrap().to_string();
             let mut key_cache = self.key_cache.lock().await;
             let refresh_msg: HashSet<_> = payloads.into_iter().filter_map(|i| {
-                let found = needs_refresh.contains(&i.1.token.as_ref().into());
+                let found = refresh_tokens.contains(&i.1.token.as_ref().into());
                 if found {
                     // invalidate keys
                     key_cache.invalidate(&sender, &i.1.participant);

@@ -2,9 +2,8 @@ use std::{fmt::Display, io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
-use uuid::Uuid;
 
-use crate::{apns::APNSConnection, error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, gzip_normal, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, OSConfig};
+use crate::{error::PushError, util::{bin_deserialize, bin_serialize, ec_deserialize, ec_serialize, gzip_normal, make_reqwest, plist_to_string, rsa_deserialize, rsa_serialize, KeyPair}, APSConnection, OSConfig};
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::{Deserialize, Serialize};
@@ -188,7 +187,7 @@ impl IDSIdentity {
     }
 }
 
-pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &APNSConnection) -> Result<(), PushError> {
+pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &APSConnection) -> Result<(), PushError> {
 
     let mut user_payloads: Vec<Value> = vec![];
     for user in users.iter_mut() {
