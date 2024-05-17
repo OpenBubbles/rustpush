@@ -711,7 +711,7 @@ impl IMClient {
         for chunk in fetch.chunks(18) {
             debug!("Fetching keys for chunk {:?}", chunk);
             let users = self.users.read().await;
-            let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), chunk.to_vec(), self.os_config.as_ref(), meta).await {
+            let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), handle, chunk.to_vec(), self.os_config.as_ref(), meta).await {
                 Ok(results) => results,
                 Err(err) => {
                     if let PushError::LookupFailed(6005) = err {

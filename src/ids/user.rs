@@ -319,16 +319,15 @@ impl IDSUser {
         }).collect())
     }
 
-    pub async fn lookup(&self, conn: Arc<APSConnection>, query: Vec<String>, os_config: &dyn OSConfig, meta: &QueryOptions) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
+    pub async fn lookup(&self, conn: Arc<APSConnection>, handle: &str, query: Vec<String>, os_config: &dyn OSConfig, meta: &QueryOptions) -> Result<HashMap<String, Vec<IDSIdentityResult>>, PushError> {
         println!("Performing an IDS Lookup for: {:?}", query);
         let body = plist_to_string(&LookupReq { uris: query })?;
 
         // gzip encode
         let encoded = gzip(body.as_bytes())?;
 
-        let handle = self.handles.first().unwrap();
         let mut headers = Dictionary::from_iter([
-            ("x-id-self-uri", Value::String(handle.clone())),
+            ("x-id-self-uri", Value::String(handle.to_string())),
             ("x-protocol-version", self.protocol_version.to_string().into()),
             ("User-Agent", format!("com.apple.madrid-lookup {}", os_config.get_version_ua()).into()),
         ].into_iter());
