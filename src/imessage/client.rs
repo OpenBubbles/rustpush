@@ -826,7 +826,7 @@ impl IMClient {
         
         let handles = self.get_handles().await;
         let mut target_participants = message.conversation.as_ref().unwrap().participants.clone();
-        if let Message::Delivered = message.message {
+        if let Message::Delivered | Message::Typing | Message::StopTyping = message.message {
             // do not send delivery reciepts to other devices on same acct
             target_participants.retain(|p| {
                 !handles.contains(p)
