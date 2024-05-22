@@ -1590,7 +1590,7 @@ impl IMessage {
             let msg_guid: Vec<u8> = wrapper.msg_guid.clone().into();
             let parts = MessageParts::parse_sms(&loaded);
             return Ok(IMessage {
-                sender: Some(loaded.sender.clone()),
+                sender: Some(wrapper.sender.clone()),
                 id: Uuid::from_bytes(msg_guid.try_into().unwrap()).to_string().to_uppercase(),
                 after_guid: None,
                 sent_timestamp: system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
