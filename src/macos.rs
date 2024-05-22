@@ -1,7 +1,9 @@
 
+use std::time::{Duration, SystemTime};
+
 use async_trait::async_trait;
 use open_absinthe::nac::{HardwareConfig, ValidationCtx};
-use plist::Data;
+use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -114,5 +116,30 @@ impl OSConfig for MacOSConfig {
             os_version: format!("macOS,{},{}", self.version, self.inner.os_build_num),
             software_version: self.inner.os_build_num.clone(),
         }
+    }
+
+    fn get_private_data(&self) -> Dictionary {
+        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
+        Dictionary::from_iter([
+            ("ap", Value::String("0".to_string())), // 1 for ios
+
+            // ("c", Value::String("1".to_string())), // not on ios, omitted for beeper
+
+            ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
+            ("dt", Value::Integer(1.into())),
+            ("gt", Value::String("0".to_string())),
+            ("h", Value::String("1".to_string())),
+            ("m", Value::String("0".to_string())),
+            ("p", Value::String("0".to_string())),
+
+            ("pb", Value::String(self.inner.os_build_num.clone())),
+            ("pn", Value::String("macOS".to_string())),
+            ("pv", Value::String(self.version.clone())),
+
+            ("s", Value::String("0".to_string())),
+            ("t", Value::String("0".to_string())),
+            ("u", Value::String(self.device_id.clone().to_uppercase())),
+            ("v", Value::String("1".to_string())),
+        ])
     }
 }

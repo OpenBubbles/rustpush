@@ -1,4 +1,4 @@
-use std::{fmt::Display, io::Cursor, time::{SystemTime, UNIX_EPOCH}};
+use std::{fmt::Display, io::Cursor, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPointRef}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::Rsa, sha::sha256, sign::{Signer, Verifier}, x509::X509};
 use plist::{Dictionary, Value};
@@ -7,7 +7,6 @@ use crate::{error::PushError, util::{bin_deserialize, bin_serialize, ec_deserial
 
 use super::{user::{IDSUser, IDSUserType}, signing::auth_sign_req};
 use serde::{Deserialize, Serialize};
-
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -262,9 +261,7 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
         ("language", Value::String("en-US".to_string())),
         ("os-version", Value::String(meta.os_version)),
         ("software-version", Value::String(meta.software_version)),
-        ("private-device-data", Value::Dictionary(Dictionary::from_iter([
-            ("u", Value::String(os_config.get_device_uuid().to_uppercase())),
-        ]))),
+        ("private-device-data", Value::Dictionary(os_config.get_private_data())),
         ("services", Value::Array(vec![
             Value::Dictionary(Dictionary::from_iter([
                 ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([

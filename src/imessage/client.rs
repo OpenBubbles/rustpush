@@ -54,6 +54,9 @@ impl CachedKeys {
         if refresh {
             return stale_time.as_secs() >= REFRESH_MIN_S;
         }
+        if self.keys.is_empty() {
+            return stale_time.as_secs() >= EMPTY_REFRESH_S;
+        }
         self.keys.iter().any(|key| stale_time.as_secs() >= key.refresh_seconds)
     }
 }
@@ -313,9 +316,9 @@ impl IMClient {
         if users_lock.len() == 0 {
             return
         }
-        // reregister 60 seconds before exp
+        // reregister 3 minutes before exp
         let (next_rereg, next_rereg_in) = users_lock.iter()
-            .map(|user| (user.handles.clone(), user.identity.as_ref().unwrap().get_exp().unwrap() - 60))
+            .map(|user| (user.handles.clone(), user.identity.as_ref().unwrap().get_exp().unwrap() - 180))
             .min_by_key(|(_handles, exp)| *exp).unwrap();
         drop(users_lock);
         tokio::spawn(async move {

@@ -26,6 +26,7 @@ pub use macos::MacOSConfig;
 #[cfg(feature = "macOS")]
 pub use open_absinthe::nac::HardwareConfig;
 
+use plist::Dictionary;
 pub struct RegisterMeta {
     pub hardware_version: String,
     pub os_version: String,
@@ -44,6 +45,7 @@ pub trait OSConfig: Sync + Send {
     fn get_version_ua(&self) -> String;
     fn get_device_name(&self) -> String;
     fn get_device_uuid(&self) -> String;
+    fn get_private_data(&self) -> Dictionary;
 }
 
 extern crate pretty_env_logger;
