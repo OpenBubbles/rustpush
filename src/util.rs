@@ -1,17 +1,25 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::num::ParseIntError;
 
 use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
+use log::info;
 use openssl::ec::EcKey;
 use openssl::pkey::Public;
 use openssl::rsa::Rsa;
 use plist::{Data, Error, Value};
 use base64::Engine;
-use reqwest::{Client, Certificate};
+use reqwest::{Certificate, Client, Proxy};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tokio_rustls::client;
 use std::io::{Write, Read};
 use std::fmt::Write as FmtWrite;
+
+use rand::thread_rng;
+use rand::seq::SliceRandom;
+
+use crate::PushError;
 
 // make reqwest using system roots
 pub fn make_reqwest_system() -> Client {
@@ -37,10 +45,10 @@ pub fn make_reqwest() -> Client {
         builder = builder.add_root_certificate(certificate);
     }
 
-    /*let builder = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://localhost:8080").unwrap())
-        .danger_accept_invalid_certs(true);*/
+        .proxy(Proxy::https("https://192.168.99.43:8080").unwrap())
+        .danger_accept_invalid_certs(true);
     
     builder.build().unwrap()
 }
@@ -142,6 +150,10 @@ pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
+pub fn base64_decode(data: String) -> Vec<u8> {
+    general_purpose::STANDARD.decode(data).unwrap()
+}
+
 pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, Error> {
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
 }
@@ -195,3 +207,84 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     }
     s
 }
+
+
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MobileCarrier {
+    bundle_name: Option<String>,
+    #[serde(rename = "MVNOs")]
+    mvnos: Option<Vec<MobileCarrier>>,
+}
+
+impl MobileCarrier {
+    fn get_bundles(&self) -> Vec<&String> {
+        if let Some(bundle) = &self.bundle_name {
+            vec![bundle]
+        } else if let Some(mvnos) = &self.mvnos {
+            mvnos.iter().flat_map(|i| i.get_bundles()).collect()
+        } else {
+            vec![]
+        }
+    }
+}
+
+
+#[derive(Deserialize, Debug)]
+struct MobileCarrierBundle {
+    #[serde(rename = "BundleURL")]
+    bundle_url: Option<String>
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MasterList {
+    mobile_device_carriers_by_mcc_mnc: HashMap<String, MobileCarrier>,
+    mobile_device_carrier_bundles_by_product_version: HashMap<String, Value>
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Carrier {
+    phone_number_registration_gateway_address: String,
+}
+
+const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
+
+pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
+    let client = make_reqwest_system();
+    let data = client.get(CARRIER_CONFIG).send().await?.text().await?;
+    
+    let parsed: MasterList = plist::from_reader_xml(Cursor::new(data))?;
+
+    let carrier = parsed.mobile_device_carriers_by_mcc_mnc.get(mccmnc).ok_or(PushError::CarrierNotFound)?;
+
+    let mut bundles = carrier.get_bundles();
+    bundles.shuffle(&mut thread_rng());
+
+    for bundle in bundles {
+        let Some(bundle) = parsed.mobile_device_carrier_bundles_by_product_version.get(bundle) else { continue };
+        let bundle: HashMap<String, MobileCarrierBundle> = plist::from_value(bundle)?;
+        let Some(latest) = bundle.keys().max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0)) else { continue };
+
+        let Some(url) = &bundle.get(latest).unwrap().bundle_url else { continue };
+
+        info!("Fetching carrier config from {url}");
+
+        let data = client.get(url).send().await?.bytes().await?;
+        let mut reader = Cursor::new(data);
+        let mut zip = zip::ZipArchive::new(&mut reader)?;
+
+        let Some(carrier) = zip.file_names().find(|name| name.starts_with("Payload/") && name.ends_with("/carrier.plist")) else { continue };
+        
+        let mut out = vec![];
+        zip.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
+        let parsed_file: Carrier = plist::from_bytes(&out)?;
+
+        return Ok(parsed_file.phone_number_registration_gateway_address)
+    }
+
+    Err(PushError::CarrierNotFound)
+}
+

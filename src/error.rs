@@ -66,4 +66,8 @@ pub enum PushError {
     TimeError(#[from] SystemTimeError),
     #[error("ConnectionClosed")]
     ConnectionClosed(#[from] broadcast::error::RecvError),
+    #[error("Carrier Not Found")]
+    CarrierNotFound,
+    #[error("Carrier Zip Error")]
+    ZipError(#[from] zip::result::ZipError),
 }

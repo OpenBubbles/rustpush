@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APSConnection, APSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage};
+use rustpush::{get_gateways_for_mccmnc, init_logger, register, APSConnection, APSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -43,6 +43,8 @@ async fn read_input() -> String {
 async fn main() {
     init_logger();
 
+    // info!("here {}", get_gateways_for_mccmnc("310160").await.unwrap());
+
     let data: String = match fs::read_to_string("config.plist").await {
 		Ok(v) => v,
 		Err(e) => {
@@ -61,31 +63,44 @@ async fn main() {
     
     
     
-    let config: Arc<MacOSConfig> = Arc::new(if let Ok(config) = plist::from_file("hwconfig.plist") {
-        config
-    } else {
-        println!("Missing hardware config!");
-        println!("The easiest way to get your hardware config is to extract it from validation data from a Mac.");
-        println!("This validation data will not be used to authenticate, and therefore does not need to be recent or valid.");
-        println!("If you need help obtaining validation data, please visit https://github.com/beeper/mac-registration-provider");
-        println!("As long as the hardware identifiers are valid rustpush will work fine.");
-        println!("Validation data will not be required for subsequent re-registrations.");
-        // save hardware config
-        print!("Validation data: ");
-        std::io::stdout().flush().unwrap();
-        let validation_data_b64 = read_input().await;
+    // let config: Arc<MacOSConfig> = Arc::new(if let Ok(config) = plist::from_file("hwconfig.plist") {
+    //     config
+    // } else {
+    //     println!("Missing hardware config!");
+    //     println!("The easiest way to get your hardware config is to extract it from validation data from a Mac.");
+    //     println!("This validation data will not be used to authenticate, and therefore does not need to be recent or valid.");
+    //     println!("If you need help obtaining validation data, please visit https://github.com/beeper/mac-registration-provider");
+    //     println!("As long as the hardware identifiers are valid rustpush will work fine.");
+    //     println!("Validation data will not be required for subsequent re-registrations.");
+    //     // save hardware config
+    //     print!("Validation data: ");
+    //     std::io::stdout().flush().unwrap();
+    //     let validation_data_b64 = read_input().await;
 
-        let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
-        let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
+    //     let validation_data = general_purpose::STANDARD.decode(validation_data_b64.trim()).unwrap();
+    //     let extracted = HardwareConfig::from_validation_data(&validation_data).unwrap();
 
-        MacOSConfig {
-            inner: extracted,
-            version: "13.6.4".to_string(),
-            protocol_version: 1660,
-            device_id: Uuid::new_v4().to_string(),
-            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-        }
+    //     MacOSConfig {
+    //         inner: extracted,
+    //         version: "13.6.4".to_string(),
+    //         protocol_version: 1660,
+    //         device_id: Uuid::new_v4().to_string(),
+    //         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+    //         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+    //     }
+    // });
+    let host = "https://registration-relay.beeper.com".to_string();
+    let code = "BZUL-7TB6-JUGN-6Q6W".to_string();
+    let token = Some("5c175851953ecaf5209185d897591badb6c3e712".to_string());
+    let config: Arc<RelayConfig> = Arc::new(RelayConfig {
+        version: RelayConfig::get_versions(&host, &code, &token).await.unwrap(),
+        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        dev_uuid: Uuid::new_v4().to_string(),
+        protocol_version: 1640,
+        host,
+        code,
+        beeper_token: token,
     });
     fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
 	

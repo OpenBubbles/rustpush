@@ -1,13 +1,13 @@
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use log::{info, debug};
-use openssl::{pkey::{PKey, Private}, rsa::Rsa, bn::BigNum, x509::{X509ReqBuilder, X509NameBuilder}, nid::Nid, hash::MessageDigest};
+use openssl::{bn::BigNum, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::Rsa, sha::sha1, x509::{X509NameBuilder, X509ReqBuilder}};
 use plist::{Value, Data, Dictionary};
 use rand::Rng;
 use serde::Serialize;
 use serde::Deserialize;
 use uuid::Uuid;
-use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, APSConnection, APSState, OSConfig};
+use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, error::PushError, ids::signing::auth_sign_req, util::{bin_deserialize, bin_serialize, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_string, ungzip, KeyPair}, APSConnection, APSState, OSConfig};
 
 use super::{identity::{IDSIdentity, IDSPublicIdentity}, signing::add_id_signature};
 
@@ -34,7 +34,7 @@ async fn attempt_auth(username: &str, pet: &str, os_config: &dyn OSConfig) -> Re
     };
 
     let client = make_reqwest();
-    let resp = client.post("https://setup.icloud.com/setup/prefpane/loginDelegates")
+    let resp = client.post(os_config.get_login_url())
             .header("User-Agent", os_config.get_icloud_ua())
             .header("Accept-Encoding", "gzip")
             .header("X-Mme-Client-Info", os_config.get_mme_clientinfo())
@@ -96,11 +96,11 @@ struct AuthCertRequest {
     realm_user_id: String
 }
 
-fn gen_csr(priv_key: &PKey<Private>) -> Result<Vec<u8>, PushError> {
+fn gen_csr(priv_key: &PKey<Private>, user_id: &str) -> Result<Vec<u8>, PushError> {
     let mut csr_builder = X509ReqBuilder::new()?;
     let mut name = X509NameBuilder::new()?;
-    let random_bytes = rand::thread_rng().gen::<[u8; 20]>().iter().map(|byte| format!("{:02x}", byte)).collect::<Vec<String>>().join("");
-    name.append_entry_by_nid(Nid::COMMONNAME, &random_bytes)?;
+    let common_name = encode_hex(&sha1(user_id.as_bytes()));
+    name.append_entry_by_nid(Nid::COMMONNAME, &common_name)?;
     csr_builder.set_subject_name(&name.build())?;
     csr_builder.set_version(0)?;
     csr_builder.set_pubkey(priv_key)?;
@@ -114,7 +114,7 @@ async fn authenticate(user_id: &str, auth_data: Value, endpoint_key: &str, os_co
     let private_key = PKey::from_rsa(Rsa::generate_with_e(2048, BigNum::from_u32(65537)?.as_ref())?)?;
     let body = AuthCertRequest {
         authentication_data: auth_data,
-        csr: gen_csr(&private_key)?.into(),
+        csr: gen_csr(&private_key, user_id)?.into(),
         realm_user_id: user_id.to_string()
     };
 

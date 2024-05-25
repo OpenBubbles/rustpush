@@ -7,7 +7,7 @@ use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{albert::ActivationInfo, util::{make_reqwest, plist_to_buf}, OSConfig, PushError, RegisterMeta};
+use crate::{albert::ActivationInfo, util::{make_reqwest, plist_to_buf}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -116,6 +116,18 @@ impl OSConfig for MacOSConfig {
             os_version: format!("macOS,{},{}", self.version, self.inner.os_build_num),
             software_version: self.inner.os_build_num.clone(),
         }
+    }
+
+    fn get_debug_meta(&self) -> DebugMeta {
+        DebugMeta {
+            user_version: self.version.clone(),
+            hardware_version: self.inner.product_name.clone(),
+            serial_number: self.inner.platform_serial_number.clone(),
+        }
+    }
+
+    fn get_login_url(&self) -> &'static str {
+        "https://setup.icloud.com/setup/prefpane/loginDelegates"
     }
 
     fn get_private_data(&self) -> Dictionary {

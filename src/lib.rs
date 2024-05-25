@@ -10,9 +10,13 @@ mod error;
 #[cfg(feature = "macOS")]
 mod macos;
 
+mod relay;
+
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
+
+use std::fmt::Debug;
 
 use albert::ActivationInfo;
 pub use aps::{APSConnection, APSMessage, APSState};
@@ -27,10 +31,19 @@ pub use macos::MacOSConfig;
 pub use open_absinthe::nac::HardwareConfig;
 
 use plist::Dictionary;
+pub use relay::RelayConfig;
+pub use util::get_gateways_for_mccmnc;
+
 pub struct RegisterMeta {
     pub hardware_version: String,
     pub os_version: String,
     pub software_version: String,
+}
+
+pub struct DebugMeta {
+    pub user_version: String,
+    pub hardware_version: String,
+    pub serial_number: String,
 }
 
 #[async_trait]
@@ -46,6 +59,8 @@ pub trait OSConfig: Sync + Send {
     fn get_device_name(&self) -> String;
     fn get_device_uuid(&self) -> String;
     fn get_private_data(&self) -> Dictionary;
+    fn get_debug_meta(&self) -> DebugMeta;
+    fn get_login_url(&self) -> &'static str;
 }
 
 extern crate pretty_env_logger;
