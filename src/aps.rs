@@ -377,7 +377,7 @@ impl APSConnection {
     }
 
     pub async fn subscribe(&self) -> Receiver<APSMessage> {
-        self.messages.read().await.as_ref().unwrap().subscribe()
+        self.messages.read().await.as_ref().map(|msgs| msgs.subscribe()).unwrap_or_else(|| Sender::new(1).subscribe())
     }
 
     pub async fn wait_for_timeout<F, T>(&self, mut recv: Receiver<APSMessage>, mut f: F) -> Result<T, PushError>
@@ -490,7 +490,7 @@ impl APSConnection {
         }
         raw.update()?;
         let text = raw.to_bytes()?;
-        if let Err(e) = self.socket.lock().await.as_mut().unwrap().write_all(&text).await {
+        if let Err(e) = self.socket.lock().await.as_mut().ok_or(PushError::NotConnected)?.write_all(&text).await {
             error!("Failed to write to socket!");
             self.do_reload().await;
             return Err(e.into());

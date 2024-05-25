@@ -66,4 +66,6 @@ pub enum PushError {
     TimeError(#[from] SystemTimeError),
     #[error("ConnectionClosed")]
     ConnectionClosed(#[from] broadcast::error::RecvError),
+    #[error("Not Connected")]
+    NotConnected,
 }
