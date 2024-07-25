@@ -285,10 +285,11 @@ pub async fn register(os_config: &dyn OSConfig, users: &mut [IDSUser], conn: &AP
     let body = gzip_normal(plist_to_string(&body)?.as_bytes())?;
     let client = make_reqwest();
 
-    let mut builder = client.get("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
+    let mut builder = client.post("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/register")
         .header("x-protocol-version", os_config.get_protocol_version().to_string())
         .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("content-encoding", "gzip")
+        .header("content-type", "application/x-apple-plist")
         .header("accept-encoding", "gzip");
     for (idx, user) in users.iter().enumerate() {
         builder = auth_sign_req(
