@@ -2,6 +2,7 @@ use openssl::{hash::MessageDigest, nid::Nid, pkey::PKey, rsa::{Padding, Rsa}, si
 use plist::{Data, Value};
 use rand::{seq::SliceRandom, thread_rng};
 use regex::Regex;
+use reqwest::Version;
 use serde::Serialize;
 
 use crate::{util::{get_nested_value, make_reqwest, plist_to_buf, plist_to_string, KeyPair}, OSConfig, PushError};
@@ -94,6 +95,7 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
 
     let request = make_reqwest()
         .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
+        .header("User-Agent", os_config.get_albert_ua())
         .form(&FormBody { activation_info: plist_to_string(&request)? })
         .send().await?
         .text().await?;

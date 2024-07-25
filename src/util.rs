@@ -45,6 +45,7 @@ pub fn make_reqwest() -> Client {
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .default_headers(headers.clone())
+        .http1_title_case_headers()
         .tls_built_in_root_certs(false);
 
     for certificate in certificates.into_iter() {
@@ -55,6 +56,7 @@ pub fn make_reqwest() -> Client {
         .use_rustls_tls()
         .proxy(Proxy::https("https://localhost:8080").unwrap())
         .default_headers(headers)
+        .http1_title_case_headers()
         .danger_accept_invalid_certs(true);
     
     builder.build().unwrap()

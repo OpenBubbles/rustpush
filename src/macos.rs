@@ -58,6 +58,10 @@ impl OSConfig for MacOSConfig {
         self.icloud_ua.clone()
     }
 
+    fn get_albert_ua(&self) -> String {
+        "ApplePushService/4.0 CFNetwork/1492.0.1 Darwin/23.3.0".to_string()
+    }
+
     fn get_mme_clientinfo(&self) -> String {
         format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, self.aoskit_version)
     }

@@ -54,6 +54,7 @@ pub trait OSConfig: Sync + Send {
     fn get_protocol_version(&self) -> u32;
     fn get_register_meta(&self) -> RegisterMeta;
     fn get_icloud_ua(&self) -> String;
+    fn get_albert_ua(&self) -> String;
     fn get_mme_clientinfo(&self) -> String;
     fn get_version_ua(&self) -> String;
     fn get_device_name(&self) -> String;
