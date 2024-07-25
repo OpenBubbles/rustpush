@@ -1,5 +1,5 @@
 mod bags;
-mod albert;
+mod activation;
 mod aps;
 mod ids;
 mod util;
@@ -18,7 +18,7 @@ pub mod mmcsp {
 
 use std::fmt::Debug;
 
-use albert::ActivationInfo;
+use activation::ActivationInfo;
 pub use aps::{APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
 pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};

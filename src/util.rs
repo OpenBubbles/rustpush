@@ -10,6 +10,7 @@ use openssl::pkey::Public;
 use openssl::rsa::Rsa;
 use plist::{Data, Error, Value};
 use base64::Engine;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio_rustls::client;
@@ -37,8 +38,13 @@ pub fn make_reqwest() -> Client {
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
     ];
+    let mut headers = HeaderMap::new();
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+
+
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
+        .default_headers(headers.clone())
         .tls_built_in_root_certs(false);
 
     for certificate in certificates.into_iter() {
@@ -47,7 +53,8 @@ pub fn make_reqwest() -> Client {
 
     let builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://192.168.99.43:8080").unwrap())
+        .proxy(Proxy::https("https://localhost:8080").unwrap())
+        .default_headers(headers)
         .danger_accept_invalid_certs(true);
     
     builder.build().unwrap()

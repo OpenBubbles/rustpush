@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{albert::ActivationInfo, util::{base64_decode, make_reqwest_system}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{base64_decode, make_reqwest_system}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Deserialize)]
 pub struct DataResp {
@@ -60,15 +60,15 @@ impl RelayConfig {
 impl OSConfig for RelayConfig {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
-            activation_randomness: Uuid::new_v4().to_string(),
-            activation_state: "Unactivated".to_string(),
+            activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
+            activation_state: "Unactivated",
             build_version: self.version.software_build_id.clone(),
             device_cert_request: csr.into(),
             device_class: "MacOS".to_string(),
             product_type: "iMac13,1".to_string(),
             product_version: self.version.software_version.clone(),
             serial_number: self.version.serial_number.clone(),
-            unique_device_id: self.version.unique_device_id.clone(),
+            unique_device_id: self.version.unique_device_id.clone().to_uppercase(),
         }
     }
 

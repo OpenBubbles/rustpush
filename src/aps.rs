@@ -12,7 +12,7 @@ use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, util::{KeyPair, bin_deserialize_opt, bin_serialize_opt}, OSConfig, PushError};
+use crate::{activation::activate, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, util::{KeyPair, bin_deserialize_opt, bin_serialize_opt}, OSConfig, PushError};
 
 #[derive(DekuRead, DekuWrite, Clone)]
 #[deku(endian = "big")]
@@ -327,7 +327,7 @@ impl APSConnection {
         let mut state = self.state.write().await;
 
         if state.keypair.is_none() {
-            state.keypair = Some(generate_push_cert(self.os_config.as_ref()).await?);
+            state.keypair = Some(activate(self.os_config.as_ref()).await?);
         }
         let pair = state.keypair.as_ref().unwrap();
         

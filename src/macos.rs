@@ -7,7 +7,7 @@ use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{albert::ActivationInfo, util::{make_reqwest, plist_to_buf}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{make_reqwest, plist_to_buf}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -20,7 +20,6 @@ pub struct MacOSConfig {
     pub icloud_ua: String,
     pub aoskit_version: String,
 }
-
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -43,15 +42,15 @@ struct CertsResponse {
 impl OSConfig for MacOSConfig {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
-            activation_randomness: Uuid::new_v4().to_string(),
-            activation_state: "Unactivated".to_string(),
+            activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
+            activation_state: "Unactivated",
             build_version: self.inner.os_build_num.clone(),
             device_cert_request: csr.into(),
             device_class: "MacOS".to_string(),
             product_type: self.inner.product_name.clone(),
             product_version: self.version.clone(),
             serial_number: self.inner.platform_serial_number.clone(),
-            unique_device_id: self.device_id.clone(),
+            unique_device_id: self.device_id.clone().to_uppercase(),
         }
     }
 
