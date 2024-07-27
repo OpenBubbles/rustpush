@@ -12,7 +12,7 @@ use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{activation::activate, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, util::{KeyPair, bin_deserialize_opt, bin_serialize_opt}, OSConfig, PushError};
+use crate::{activation::activate, bags::{get_bag, APNS_BAG}, auth::{do_signature, generate_nonce, NonceType}, util::{bin_deserialize_opt, bin_serialize_opt, KeyPair}, OSConfig, PushError};
 
 #[derive(DekuRead, DekuWrite, Clone)]
 #[deku(endian = "big")]
@@ -330,17 +330,9 @@ impl APSConnection {
             state.keypair = Some(activate(self.os_config.as_ref()).await?);
         }
         let pair = state.keypair.as_ref().unwrap();
-        
-        let mut signer = Signer::new(MessageDigest::sha1(), &PKey::private_key_from_der(&pair.private).unwrap())?;
-        signer.set_rsa_padding(Padding::PKCS1)?;
 
-        let nonce = generate_nonce(0);
-        let sig = signer.sign_oneshot_to_vec(&nonce)?;
-
-        let signature = [
-            vec![1, 1],
-            sig
-        ].concat();
+        let nonce = generate_nonce(NonceType::APNS);
+        let signature = do_signature(&PKey::private_key_from_der(&pair.private).unwrap(), &nonce)?;
 
         let recv = self.subscribe().await;
         self.send(APSMessage::Connect {

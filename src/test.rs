@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{get_gateways_for_mccmnc, init_logger, register, APSConnection, APSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnection, APSState, ConversationData, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -145,14 +145,14 @@ async fn main() {
         let account = acc.unwrap();
         let pet = account.get_pet().unwrap();
 
-        let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, config.as_ref()).await.unwrap();
+        let user = authenticate_apple(&user_trimmed, &pet, config.as_ref()).await.unwrap();
 
         vec![user]
     };
 
-    if users[0].identity.is_none() {
+    if users[0].registration.is_none() {
         info!("Registering new identity...");
-        register(config.as_ref(), &mut users, connection.as_ref()).await.unwrap();
+        register(config.as_ref(), &*connection.state.read().await, &mut users).await.unwrap();
     }
 
     let mut state = SavedState {

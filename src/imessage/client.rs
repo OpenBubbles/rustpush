@@ -3,7 +3,7 @@ use std::{collections::{HashMap, HashSet}, fmt::Display, fs, io::Cursor, path::P
 
 use flume::RecvError;
 use log::{debug, error, info, warn};
-use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sign::Signer, symm::{decrypt, encrypt, Cipher}};
+use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::{PKey, PKeyRef}, rsa::Padding, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
 use plist::Value;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{broadcast, Mutex, RwLock}, time::sleep};
@@ -12,9 +12,9 @@ use rand::{Rng, RngCore};
 use async_recursion::async_recursion;
 use thiserror::Error;
 
-use crate::{aps::get_message, error::PushError, ids::{identity::IDSPublicIdentity, user::{IDSIdentityResult, IDSUser, PrivateDeviceInfo, QueryOptions}}, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, register, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, APSConnection, APSMessage, OSConfig, RenameMessage};
+use crate::{aps::get_message, error::PushError, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, APSConnection, APSMessage, OSConfig, RenameMessage};
 
-use super::messages::{IMessage, ConversationData, Message, RecvMsg};
+use super::{messages::{ConversationData, IMessage, Message, RecvMsg}, user::{register, IDSDeliveryData, IDSIdentity, IDSPublicIdentity, IDSUser, PrivateDeviceInfo, QueryOptions}};
 
 const PAYLOADS_MAX_SIZE: usize = 10000;
 const NORMAL_NONCE: [u8; 16] = [
@@ -28,7 +28,7 @@ const REFRESH_MIN_S: u64 = 60;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CachedKeys {
-    keys: Vec<IDSIdentityResult>,
+    keys: Vec<IDSDeliveryData>,
     at_ms: u64
 }
 
@@ -44,7 +44,7 @@ impl CachedKeys {
         if self.keys.is_empty() {
             stale_time.as_secs() < EMPTY_REFRESH_S
         } else {
-            self.keys.iter().all(|key| stale_time.as_secs() < key.expires_seconds)
+            self.keys.iter().all(|key| stale_time.as_secs() < key.session_token_expires_seconds)
         }
     }
 
@@ -57,7 +57,7 @@ impl CachedKeys {
         if self.keys.is_empty() {
             return stale_time.as_secs() >= EMPTY_REFRESH_S;
         }
-        self.keys.iter().any(|key| stale_time.as_secs() >= key.refresh_seconds)
+        self.keys.iter().any(|key| stale_time.as_secs() >= key.session_token_refresh_seconds)
     }
 }
 
@@ -73,7 +73,7 @@ impl CachedHandle {
     // hash key factors
     async fn verity(&mut self, conn: &APSConnection, user: &IDSUser) {
         let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
-        env.update(&user.identity.as_ref().unwrap().id_keypair.as_ref().unwrap().cert).unwrap();
+        env.update(&user.registration.as_ref().unwrap().id_keypair.cert).unwrap();
         env.update(&conn.get_token().await).unwrap();
         let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
         if hash != self.env_hash {
@@ -111,7 +111,7 @@ impl KeyCache {
     // verify integrity
     async fn verity(&mut self, conn: &APSConnection, users: &[IDSUser]) {
         for user in users {
-            for handle in &user.handles {
+            for handle in &user.registration.as_ref().unwrap().handles {
                 self.cache.entry(handle.clone()).or_default().verity(conn, user).await;
             }
         }
@@ -137,7 +137,7 @@ impl KeyCache {
         self.save();
     }
 
-    fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSIdentityResult)>, PushError> {
+    fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSDeliveryData)>, PushError> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
         };
@@ -162,7 +162,7 @@ impl KeyCache {
         }).collect())
     }
     
-    fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSIdentityResult> {
+    fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return vec![]
         };
@@ -187,7 +187,7 @@ impl KeyCache {
         return !cached.is_dirty(refresh);
     }
 
-    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSIdentityResult>) {
+    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
         let Some(handle_cache) = self.cache.get_mut(handle) else {
             panic!("No handle cache for handle {}!", handle);
         };
@@ -318,7 +318,7 @@ impl IMClient {
         }
         // reregister 3 minutes before exp
         let (next_rereg, next_rereg_in) = users_lock.iter()
-            .map(|user| (user.handles.clone(), user.identity.as_ref().unwrap().get_exp().unwrap() - 180))
+            .map(|user| (user.registration.as_ref().unwrap().handles.clone(), user.registration.as_ref().unwrap().get_exp().unwrap() - 180))
             .min_by_key(|(_handles, exp)| *exp).unwrap();
         drop(users_lock);
         tokio::spawn(async move {
@@ -334,8 +334,8 @@ impl IMClient {
             let _ = rereg_signal.try_recv(); // clear any pending reregs
             info!("Reregistering {:?} now!", next_rereg);
             let mut users_lock = users_ref.write().await;
-            let user = users_lock.iter_mut().find(|user| user.handles == next_rereg).unwrap();
-            if let Err(err) = register(os_config.as_ref(), std::slice::from_mut(user), &conn_ref).await {
+            let user = users_lock.iter_mut().find(|user| user.registration.as_ref().unwrap().handles == next_rereg).unwrap();
+            if let Err(err) = register(os_config.as_ref(), &*conn_ref.state.read().await, std::slice::from_mut(user)).await {
                 drop(users_lock);
                 
                 let retry_in = if let PushError::AuthInvalid(6005) = err {
@@ -389,7 +389,7 @@ impl IMClient {
 
     pub async fn get_handles(&self) -> Vec<String> {
         let users_locked = self.users.read().await;
-        users_locked.iter().flat_map(|user| user.handles.clone()).collect::<Vec<String>>()
+        users_locked.iter().flat_map(|user| user.registration.as_ref().unwrap().handles.clone()).collect::<Vec<String>>()
     }
 
     #[async_recursion]
@@ -421,7 +421,10 @@ impl IMClient {
         };
 
         let (body, sig) = Self::parse_payload(payload);
-        let valid = identity.identity.verify(body, sig).unwrap();
+
+        let their_key = identity.client_data.public_message_identity_key.pkey_signing().unwrap();
+        let mut verifier = Verifier::new(MessageDigest::sha1(), their_key.as_ref()).unwrap();
+        let valid = verifier.verify_oneshot(sig, body).unwrap();
 
         valid
     }
@@ -429,7 +432,7 @@ impl IMClient {
     pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, PushError> {
         let (body, _sig) = Self::parse_payload(payload);
         
-        let key = user.identity.as_ref().unwrap().priv_enc_key();
+        let key = user.identity.pkey_enc()?;
         let mut decrypter = Decrypter::new(&key)?;
         decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
         decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
@@ -467,7 +470,7 @@ impl IMClient {
     }
 
     fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
-        users.iter().find(|user| user.handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
+        users.iter().find(|user| user.registration.as_ref().unwrap().handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
     pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
@@ -498,7 +501,7 @@ impl IMClient {
         }
         let user_lock = self.users.read().await;
         let my_user = Self::user_by_handle(&user_lock, handle);
-        let regs = my_user.get_dependent_registrations(&self.conn).await?;
+        let regs = my_user.get_dependent_registrations(&*self.conn.state.read().await).await?;
         if my_cache.private_data.len() != 0 && regs.len() != my_cache.private_data.len() {
             // something changed, requery IDS too
             cache_lock.invalidate(handle, handle);
@@ -639,7 +642,7 @@ impl IMClient {
         let loaded: RecvMsg = plist::from_value(&payload)?;
 
         let users_locked = self.users.read().await;
-        let Some(identity) = users_locked.iter().find(|user| user.handles.contains(&loaded.target)) else {
+        let Some(identity) = users_locked.iter().find(|user| user.registration.as_ref().unwrap().handles.contains(&loaded.target)) else {
             return Err(PushError::KeyNotFound(loaded.sender))
         };
 
@@ -714,7 +717,7 @@ impl IMClient {
         for chunk in fetch.chunks(18) {
             debug!("Fetching keys for chunk {:?}", chunk);
             let users = self.users.read().await;
-            let results = match Self::user_by_handle(&users, handle).lookup(self.conn.clone(), handle, chunk.to_vec(), self.os_config.as_ref(), meta).await {
+            let results = match Self::user_by_handle(&users, handle).query(self.os_config.as_ref(), &self.conn, handle, chunk.to_vec(), meta).await {
                 Ok(results) => results,
                 Err(err) => {
                     if let PushError::LookupFailed(6005) = err {
@@ -774,8 +777,8 @@ impl IMClient {
         let result = signer.sign_oneshot_to_vec(&[
             raw.to_vec(),
             vec![0x02],
-            user.identity.as_ref().unwrap().public().hash().to_vec(),
-            key.hash().to_vec()
+            user.identity.hash()?.to_vec(),
+            key.hash()?.to_vec()
         ].concat())?;
 
         let aes_key = [
@@ -785,7 +788,7 @@ impl IMClient {
 
         let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&NORMAL_NONCE), raw).unwrap();
 
-        let encryption_key = PKey::from_rsa(key.encryption_key.clone())?;
+        let encryption_key = key.pkey_enc()?;
 
         let payload = [
             aes_key,
@@ -805,7 +808,9 @@ impl IMClient {
             encrypted_sym[encrypted_sym.len().min(100)..].to_vec()
         ].concat();
 
-        let sig = user.identity.as_ref().unwrap().sign(&payload)?;
+        let mut signer = Signer::new(MessageDigest::sha1(), user.identity.pkey_signing()?.as_ref())?;
+
+        let sig = signer.sign_oneshot_to_vec(&payload)?;
         let payload = [
             vec![0x02],
             (payload.len() as u16).to_be_bytes().to_vec(),
@@ -894,7 +899,7 @@ impl IMClient {
                 continue;
             }
             let encrypted = if message.has_payload() {
-                let payload = self.encrypt_payload(&raw, &token.identity, &sender).await?;
+                let payload = self.encrypt_payload(&raw, &token.client_data.public_message_identity_key, &sender).await?;
                 Some(payload)
             } else {
                 None

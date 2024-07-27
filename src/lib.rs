@@ -1,11 +1,11 @@
 mod bags;
 mod activation;
 mod aps;
-mod ids;
 mod util;
 mod imessage;
 mod mmcs;
 mod error;
+mod auth;
 
 #[cfg(feature = "macOS")]
 mod macos;
@@ -21,9 +21,10 @@ use std::fmt::Debug;
 use activation::ActivationInfo;
 pub use aps::{APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
-pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};
 pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::client::{IMClient, RegisterState};
+pub use imessage::user::{IDSUser, register};
+pub use auth::authenticate_apple;
 pub use error::PushError;
 #[cfg(feature = "macOS")]
 pub use macos::MacOSConfig;
@@ -33,6 +34,7 @@ pub use open_absinthe::nac::HardwareConfig;
 use plist::Dictionary;
 pub use relay::RelayConfig;
 pub use util::get_gateways_for_mccmnc;
+
 
 pub struct RegisterMeta {
     pub hardware_version: String,

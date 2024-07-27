@@ -7,7 +7,7 @@ use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 use tokio::sync::broadcast::{self, error::SendError};
 
-use crate::{aps::APSMessage, ids::identity::SupportAlert, imessage::client::RegistrationFailure};
+use crate::{aps::APSMessage, imessage::{client::RegistrationFailure, user::SupportAlert}};
 
 #[derive(Error, Debug)]
 pub enum PushError {

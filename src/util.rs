@@ -6,7 +6,7 @@ use base64::engine::general_purpose;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use log::info;
 use openssl::ec::EcKey;
-use openssl::pkey::Public;
+use openssl::pkey::{Private, Public};
 use openssl::rsa::Rsa;
 use plist::{Data, Error, Value};
 use base64::Engine;
@@ -102,6 +102,40 @@ where
     use serde::de::Error;
     let s: Data = Deserialize::deserialize(d)?;
     Rsa::public_key_from_der(s.as_ref()).map_err(Error::custom)
+}
+
+pub fn ec_serialize_priv<S>(x: &EcKey<Private>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.private_key_to_der().map_err(Error::custom)?)
+}
+
+pub fn ec_deserialize_priv<'de, D>(d: D) -> Result<EcKey<Private>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    EcKey::private_key_from_der(s.as_ref()).map_err(Error::custom)
+}
+
+pub fn rsa_serialize_priv<S>(x: &Rsa<Private>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.private_key_to_der().map_err(Error::custom)?)
+}
+
+pub fn rsa_deserialize_priv<'de, D>(d: D) -> Result<Rsa<Private>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    Rsa::private_key_from_der(s.as_ref()).map_err(Error::custom)
 }
 
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>

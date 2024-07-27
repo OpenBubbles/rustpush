@@ -34,6 +34,7 @@ open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, f
 icloud_auth = { path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth" }
 deku = "0.16.0"
 zip = { version = "1.3.0", default-features = false, features = ["deflate-zlib"] }
+rasn = "0.16.0"
 
 [features]
 default = ["macOS"]
