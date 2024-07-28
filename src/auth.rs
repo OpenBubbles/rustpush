@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair}, APSConnection, APSState, OSConfig, PushError};
+use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -255,7 +255,7 @@ impl SignedRequest {
             .send().await?)
     }
 
-    pub async fn send_apns(self, aps: &APSConnection) -> Result<Vec<u8>, PushError> {
+    pub async fn send_apns(self, aps: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
         let ids_bag = get_bag(IDS_BAG).await?;
 
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();

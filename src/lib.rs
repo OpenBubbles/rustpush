@@ -19,10 +19,11 @@ pub mod mmcsp {
 use std::fmt::Debug;
 
 use activation::ActivationInfo;
-pub use aps::{APSConnection, APSMessage, APSState};
+pub use aps::{APSConnectionResource, APSMessage, APSState};
 use async_trait::async_trait;
 pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
-pub use imessage::client::{IMClient, RegisterState};
+pub use imessage::client::IMClient;
+pub use util::ResourceState;
 pub use imessage::user::{IDSUser, register};
 pub use auth::authenticate_apple;
 pub use error::PushError;

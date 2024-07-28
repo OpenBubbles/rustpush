@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APSConnection};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APSConnectionResource};
 use log::{info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -273,7 +273,7 @@ struct MMCSUploadResponse {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APSConnection, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
+pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APSConnectionResource, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
@@ -636,7 +636,7 @@ struct MMCSDownloadResponse {
     object: String
 }
 
-pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnection, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnectionResource, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
     let domain = url.replace(&format!("/{}", object), "");
     let msg_id = rand::thread_rng().next_u32();
     let request_download = RequestMMCSDownload {

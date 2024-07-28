@@ -1,13 +1,13 @@
 use std::{collections::HashMap, fmt::Display, time::{SystemTime, UNIX_EPOCH}};
 
-use log::error;
+use log::{debug, error};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey}, error::ErrorStack, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::{self, Rsa}, sha::sha256, x509::X509};
 use plist::{Data, Dictionary, Value};
 use rasn::{AsnType, Decode, Encode};
 use reqwest::Method;
 use serde::{de, ser::Error, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize, ec_deserialize_priv, ec_serialize, ec_serialize_priv, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_buf, rsa_deserialize, rsa_deserialize_priv, rsa_serialize, rsa_serialize_priv, KeyPair}, APSConnection, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize, ec_deserialize_priv, ec_serialize, ec_serialize_priv, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_buf, rsa_deserialize, rsa_deserialize_priv, rsa_serialize, rsa_serialize_priv, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
 
 
 #[repr(C)]
@@ -345,7 +345,7 @@ impl IDSUser {
         }).collect())
     }
 
-    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnection, handle: &str, query: Vec<String>, options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
+    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, handle: &str, query: Vec<String>, options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
         let body = plist_to_buf(&LookupReq { uris: query })?;
 
         let request = options.add_headers(SignedRequest::new("id-query", Method::GET /* unused */))
@@ -356,6 +356,8 @@ impl IDSUser {
             .body(gzip(&body)?)
             .sign(&self.registration.as_ref().unwrap().id_keypair, KeyType::Id, &*aps.state.read().await, None)?
             .send_apns(aps).await?;
+
+        debug!("receieved apns query {:?}", plist::from_bytes::<Value>(&request)?);
 
         let loaded: IDSLookupResp = plist::from_bytes(&request)?;
         if loaded.status != 0 || loaded.results.is_none() {

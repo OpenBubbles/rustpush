@@ -1,6 +1,7 @@
 
 use std::{collections::{HashMap, HashSet}, fmt::Display, fs, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
+use backon::{BlockingRetryable, ConstantBuilder};
 use flume::RecvError;
 use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::{PKey, PKeyRef}, rsa::Padding, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
@@ -10,237 +11,31 @@ use tokio::{sync::{broadcast, Mutex, RwLock}, time::sleep};
 use uuid::Uuid;
 use rand::{Rng, RngCore};
 use async_recursion::async_recursion;
+use backon::Retryable;
 use thiserror::Error;
 
-use crate::{aps::get_message, error::PushError, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, APSConnection, APSMessage, OSConfig, RenameMessage};
+use crate::{aps::{get_message, APSConnection}, error::PushError, imessage::messages::{add_prefix, BundledPayload, ChangeParticipantMessage, MessageTarget, RawChangeMessage, RawRenameMessage, SendMsg}, util::{base64_encode, bin_deserialize_sha, bin_serialize, plist_to_bin, plist_to_string}, APSConnectionResource, APSMessage, OSConfig, RenameMessage, ResourceState};
 
-use super::{messages::{ConversationData, IMessage, Message, RecvMsg}, user::{register, IDSDeliveryData, IDSIdentity, IDSPublicIdentity, IDSUser, PrivateDeviceInfo, QueryOptions}};
+use super::{identity_manager::{IdentityManager, IdentityResource, KeyCache}, messages::{ConversationData, IMessage, Message, RecvMsg}, user::{register, IDSDeliveryData, IDSIdentity, IDSPublicIdentity, IDSUser, PrivateDeviceInfo, QueryOptions}};
 
 const PAYLOADS_MAX_SIZE: usize = 10000;
 const NORMAL_NONCE: [u8; 16] = [
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
 ];
 
-const EMPTY_REFRESH_S: u64 = 3600; // one hour
-
- // one minute. Used to prevent during message replay mass spamming IDS with queries for a given key.
-const REFRESH_MIN_S: u64 = 60;
-
-#[derive(Serialize, Deserialize, Debug)]
-struct CachedKeys {
-    keys: Vec<IDSDeliveryData>,
-    at_ms: u64
-}
-
-impl CachedKeys {
-    fn get_stale_time(&self) -> Duration {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH + Duration::from_millis(self.at_ms))
-            .expect("Time went backwards")
-    }
-
-    fn is_valid(&self) -> bool {
-        let stale_time = self.get_stale_time();
-        if self.keys.is_empty() {
-            stale_time.as_secs() < EMPTY_REFRESH_S
-        } else {
-            self.keys.iter().all(|key| stale_time.as_secs() < key.session_token_expires_seconds)
-        }
-    }
-
-    // should be refreshed
-    fn is_dirty(&self, refresh: bool) -> bool {
-        let stale_time = self.get_stale_time();
-        if refresh {
-            return stale_time.as_secs() >= REFRESH_MIN_S;
-        }
-        if self.keys.is_empty() {
-            return stale_time.as_secs() >= EMPTY_REFRESH_S;
-        }
-        self.keys.iter().any(|key| stale_time.as_secs() >= key.session_token_refresh_seconds)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Default)]
-struct CachedHandle {
-    keys: HashMap<String, CachedKeys>,
-    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize_sha")]
-    env_hash: [u8; 20],
-    private_data: Vec<PrivateDeviceInfo>,
-}
-
-impl CachedHandle {
-    // hash key factors
-    async fn verity(&mut self, conn: &APSConnection, user: &IDSUser) {
-        let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
-        env.update(&user.registration.as_ref().unwrap().id_keypair.cert).unwrap();
-        env.update(&conn.get_token().await).unwrap();
-        let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
-        if hash != self.env_hash {
-            // invalidate cache
-            self.env_hash = hash;
-            self.keys.clear();
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct KeyCache {
-    cache: HashMap<String, CachedHandle>,
-    #[serde(skip)]
-    cache_location: PathBuf,
-}
-
-impl KeyCache {
-    async fn new(path: PathBuf, conn: &APSConnection, users: &[IDSUser]) -> KeyCache {
-        if let Ok(data) = fs::read(&path) {
-            if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
-                loaded.cache_location = path;
-                loaded.verity(conn, users).await;
-                return loaded
-            }
-        }
-        let mut cache = KeyCache {
-            cache: HashMap::new(),
-            cache_location: path,
-        };
-        cache.verity(conn, users).await;
-        cache
-    }
-
-    // verify integrity
-    async fn verity(&mut self, conn: &APSConnection, users: &[IDSUser]) {
-        for user in users {
-            for handle in &user.registration.as_ref().unwrap().handles {
-                self.cache.entry(handle.clone()).or_default().verity(conn, user).await;
-            }
-        }
-    }
-
-    fn save(&self) {
-        let saved = plist_to_string(self).unwrap();
-        fs::write(&self.cache_location, saved).unwrap();
-    }
-
-    fn invalidate(&mut self, handle: &str, keys_for: &str) {
-        let Some(handle_cache) = self.cache.get_mut(handle) else {
-            panic!("No handle cache for handle {}!", handle);
-        };
-        handle_cache.keys.remove(keys_for);
-        self.save();
-    }
-
-    fn invalidate_all(&mut self) {
-        for cache in self.cache.values_mut() {
-            cache.keys.clear();
-        }
-        self.save();
-    }
-
-    fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSDeliveryData)>, PushError> {
-        let Some(handle_cache) = self.cache.get(handle) else {
-            return Err(PushError::KeyNotFound(handle.to_string()))
-        };
-        let target_tokens = keys_for.iter().map(|i| Ok(match i {
-            MessageTarget::Token(token) => token,
-            MessageTarget::Uuid(uuid) => {
-                let Some(saved) = handle_cache.private_data.iter().find(|p| p.uuid.as_ref() == Some(uuid)) else {
-                    return Err(PushError::KeyNotFound(uuid.to_string()))
-                };
-                &saved.token
-            }
-        })).collect::<Result<Vec<_>, PushError>>()?;
-        if let Some(not_found) = participants.iter().find(|p| 
-                !handle_cache.keys.get(*p).map(|c| c.is_valid()).unwrap_or(false)) {
-            return Err(PushError::KeyNotFound(not_found.to_string())) // at least one of our caches isn't up-to-date
-        }
-        Ok(participants.iter().flat_map(|p| {
-            let Some(eval_keys) = handle_cache.keys.get(p) else {
-                return vec![]
-            };
-            eval_keys.keys.iter().filter(|cached| target_tokens.contains(&&cached.push_token)).map(|i| (p.as_str(), i)).collect()
-        }).collect())
-    }
-    
-    fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
-        let Some(handle_cache) = self.cache.get(handle) else {
-            return vec![]
-        };
-        let Some(cached) = handle_cache.keys.get(keys_for) else {
-            return vec![]
-        };
-        if !cached.is_valid() {
-            // expired
-            vec![]
-        } else {
-            cached.keys.iter().collect()
-        }
-    }
-
-    fn does_not_need_refresh(&self, handle: &str, keys_for: &str, refresh: bool) -> bool {
-        let Some(handle_cache) = self.cache.get(handle) else {
-            return false
-        };
-        let Some(cached) = handle_cache.keys.get(keys_for) else {
-            return false
-        };
-        return !cached.is_dirty(refresh);
-    }
-
-    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
-        let Some(handle_cache) = self.cache.get_mut(handle) else {
-            panic!("No handle cache for handle {}!", handle);
-        };
-        let ms_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards").as_millis();
-        handle_cache.keys.insert(keys_for.to_string(), CachedKeys {
-            keys,
-            at_ms: ms_now as u64
-        });
-        self.save();
-    }
-}
-
-#[derive(Clone, Debug, Error)]
-pub struct RegistrationFailure {
-    pub retry_wait: Option<u64>,
-    pub error: Arc<PushError>,
-}
-
-impl Display for RegistrationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed to reregister {}; {}", self.error, 
-            if let Some(retry_in) = self.retry_wait { format!("retrying in {}s", retry_in) } else { "not retrying".to_string() })
-    }
-}
-
-pub enum RegisterState {
-    Registered,
-    Registering,
-    Failed (RegistrationFailure)
-}
-
 pub struct IMClient {
-    pub conn: Arc<APSConnection>,
-    pub users: Arc<RwLock<Vec<IDSUser>>>,
-    key_cache: Arc<Mutex<KeyCache>>,
+    pub conn: APSConnection,
+    pub identity: IdentityManager,
     raw_inbound: Mutex<broadcast::Receiver<APSMessage>>,
-    rereg_signal: Mutex<flume::Sender<()>>,
-    rereg_success: broadcast::Receiver<Result<(), RegistrationFailure>>,
-    register_state: Arc<Mutex<RegisterState>>,
     os_config: Arc<dyn OSConfig>,
-    id_lock: Mutex<()>,
 }
 
 impl IMClient {
-    pub async fn new(conn: Arc<APSConnection>, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
-        let (rereg_signal, recieve) = flume::bounded(0);
-        let (rereg_finish, recv_finish) = tokio::sync::broadcast::channel(1);
+    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         
         Self::configure_conn(conn.as_ref()).await;
 
-        let mut to_refresh = conn.connected.subscribe();
+        let mut to_refresh = conn.generated_signal.subscribe();
         let reconn_conn = Arc::downgrade(&conn);
         tokio::spawn(async move {
             loop {
@@ -255,29 +50,31 @@ impl IMClient {
             }
         });
 
-        let client = IMClient {
-            key_cache: Arc::new(Mutex::new(KeyCache::new(cache_path, &conn, &users).await)),
+        let identity = IdentityResource::new(users, cache_path, conn.clone(), os_config.clone()).await;
+
+        let mut to_refresh = identity.generated_signal.subscribe();
+        let my_ident_ref = identity.resource.clone();
+        tokio::spawn(async move {
+            loop {
+                match to_refresh.recv().await {
+                    Ok(()) => {
+                        keys_updated(my_ident_ref.users.read().await.clone())
+                    },
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        IMClient {
             raw_inbound: Mutex::new(conn.messages_cont.subscribe()),
             conn,
-            users: Arc::new(RwLock::new(users)),
-            rereg_signal: Mutex::new(rereg_signal),
-            rereg_success: recv_finish,
-            register_state: Arc::new(Mutex::new(RegisterState::Registered)),
             os_config: os_config.clone(),
-            id_lock: Mutex::new(())
-        };
-        Self::schedule_ids_rereg(client.conn.clone(), 
-            client.users.clone(), 
-            client.key_cache.clone(), 
-            os_config, 
-            0, keys_updated, 
-            recieve,
-            rereg_finish,
-            client.register_state.clone()).await;
-        client
+            identity,
+        }
     }
 
-    async fn configure_conn(conn: &APSConnection) {
+    async fn configure_conn(conn: &APSConnectionResource) {
         let _ = conn.send(APSMessage::SetState { state: 1 }).await;
         let _ = conn.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await;
 
@@ -302,152 +99,8 @@ impl IMClient {
         }
     }
 
-    #[async_recursion]
-    async fn schedule_ids_rereg(conn_ref: Arc<APSConnection>,
-            users_ref: Arc<RwLock<Vec<IDSUser>>>,
-            key_cache_ref: Arc<Mutex<KeyCache>>,
-            os_config: Arc<dyn OSConfig>,
-            mut retry_count: u8,
-            mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>,
-            rereg_signal: flume::Receiver<()>,
-            rereg_finished: tokio::sync::broadcast::Sender<Result<(), RegistrationFailure>>,
-            register_state: Arc<Mutex<RegisterState>>) {
-        let users_lock = users_ref.read().await;
-        if users_lock.len() == 0 {
-            return
-        }
-        // reregister 3 minutes before exp
-        let (next_rereg, next_rereg_in) = users_lock.iter()
-            .map(|user| (user.registration.as_ref().unwrap().handles.clone(), user.registration.as_ref().unwrap().get_exp().unwrap() - 180))
-            .min_by_key(|(_handles, exp)| *exp).unwrap();
-        drop(users_lock);
-        tokio::spawn(async move {
-            info!("Reregistering {:?} in {} seconds", next_rereg, next_rereg_in);
-            if next_rereg_in > 0 {
-                // wait until expiry, or until someone requests a reregister
-                if let Ok(Err(RecvError::Disconnected)) = tokio::time::timeout(Duration::from_secs(next_rereg_in as u64), rereg_signal.recv_async()).await {
-                    // do not reregister on crashes :P
-                    return
-                }
-            }
-            *register_state.lock().await = RegisterState::Registering;
-            let _ = rereg_signal.try_recv(); // clear any pending reregs
-            info!("Reregistering {:?} now!", next_rereg);
-            let mut users_lock = users_ref.write().await;
-            let user = users_lock.iter_mut().find(|user| user.registration.as_ref().unwrap().handles == next_rereg).unwrap();
-            if let Err(err) = register(os_config.as_ref(), &*conn_ref.state.read().await, std::slice::from_mut(user)).await {
-                drop(users_lock);
-                
-                let retry_in = if let PushError::AuthInvalid(6005) = err {
-                    error!("Auth cert invalid; re-login needed!");
-                    None
-                } else {
-                    Some(2_u64.pow(retry_count as u32) * 300) // 5 minutes doubling
-                };
-
-                let err_arc = RegistrationFailure {
-                    retry_wait: retry_in,
-                    error: Arc::new(err),
-                };
-                error!("{}", err_arc);
-                *register_state.lock().await = RegisterState::Failed(err_arc.clone());
-                rereg_finished.send(Err(err_arc)).unwrap();
-                
-                if let Some(retry_secs) = retry_in {
-                    sleep(Duration::from_secs(retry_secs)).await;
-                } else {
-                    return; // we're toast.
-                }
-                
-                if retry_count < 8 {
-                    retry_count += 1; // max retry a day
-                }
-            } else {
-                retry_count = 0;
-                key_cache_ref.lock().await.verity(&conn_ref, &users_lock).await;
-                keys_updated(users_lock.clone());
-                rereg_finished.send(Ok(())).unwrap();
-                *register_state.lock().await = RegisterState::Registered;
-                drop(users_lock);
-                info!("Successfully reregistered!");
-            }
-            Self::schedule_ids_rereg(conn_ref, users_ref, key_cache_ref, os_config, retry_count, keys_updated, rereg_signal, rereg_finished, register_state).await;
-        });
-    }
-
-    pub async fn get_regstate(&self) -> Arc<Mutex<RegisterState>> {
-        self.register_state.clone()
-    }
-
-    fn parse_payload(payload: &[u8]) -> (&[u8], &[u8]) {
-        let body_len = u16::from_be_bytes(payload[1..3].try_into().unwrap()) as usize;
-        let body = &payload[3..(3 + body_len)];
-        let sig_len = u8::from_be_bytes(payload[(3 + body_len)..(4 + body_len)].try_into().unwrap()) as usize;
-        let sig = &payload[(4 + body_len)..(4 + body_len + sig_len)];
-        (body, sig)
-    }
-
-    pub async fn get_handles(&self) -> Vec<String> {
-        let users_locked = self.users.read().await;
-        users_locked.iter().flat_map(|user| user.registration.as_ref().unwrap().handles.clone()).collect::<Vec<String>>()
-    }
-
-    #[async_recursion]
-    async fn verify_payload(&self, payload: &[u8], sender: &str, sender_token: &[u8], handle: &str, retry: u8) -> bool {
-
-        if let Err(error) = self.cache_keys(&[sender.to_string()], handle, retry > 0, &QueryOptions { required_for_message: false, result_expected: true }).await {
-            warn!("Cannot verify; failed to query! {}", error);
-            if retry < 1 {
-                return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
-            } else {
-                warn!("giving up");
-            }
-            return false
-        }
-
-        let cache = self.key_cache.lock().await;
-
-        let keys = cache.get_keys(handle, sender);
-
-        let Some(identity) = keys.iter().find(|key| key.push_token == sender_token) else {
-            drop(cache); // we're holding the damn mutex :(
-            warn!("Cannot verify; no public key {retry}");
-            if retry < 1 {
-                return self.verify_payload(payload, sender, sender_token, handle, retry+1).await;
-            } else {
-                warn!("giving up");
-            }
-            return false
-        };
-
-        let (body, sig) = Self::parse_payload(payload);
-
-        let their_key = identity.client_data.public_message_identity_key.pkey_signing().unwrap();
-        let mut verifier = Verifier::new(MessageDigest::sha1(), their_key.as_ref()).unwrap();
-        let valid = verifier.verify_oneshot(sig, body).unwrap();
-
-        valid
-    }
-
-    pub async fn decrypt(&self, user: &IDSUser, payload: &[u8]) -> Result<Vec<u8>, PushError> {
-        let (body, _sig) = Self::parse_payload(payload);
-        
-        let key = user.identity.pkey_enc()?;
-        let mut decrypter = Decrypter::new(&key)?;
-        decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
-        decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
-        decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
-        let buffer_len = decrypter.decrypt_len(&payload).unwrap();
-        let mut decrypted_asym = vec![0; buffer_len];
-        let decrypted_len = decrypter.decrypt(&body[..160], &mut decrypted_asym[..])?;
-        decrypted_asym.truncate(decrypted_len);
-
-        let decrypted_sym = decrypt(Cipher::aes_128_ctr(), &decrypted_asym[..16], Some(&NORMAL_NONCE), &[
-            decrypted_asym[16..decrypted_asym.len().min(116)].to_vec(),
-            body[160..].to_vec()
-        ].concat()).unwrap();
-
-        Ok(decrypted_sym)
+    pub async fn get_regstate(&self) -> ResourceState {
+        self.identity.resource_state.lock().await.clone()
     }
 
     pub async fn recieve_wait(&self) -> Result<Option<IMessage>, PushError> {
@@ -467,48 +120,6 @@ impl IMClient {
                 return recieved
             }
         }
-    }
-
-    fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
-        users.iter().find(|user| user.registration.as_ref().unwrap().handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
-    }
-
-    pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
-        let mut cache_lock = self.key_cache.lock().await;
-        self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
-        Ok(private_self.clone())
-    }
-
-    pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
-        let mut cache_lock = self.key_cache.lock().await;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
-        if let Some(found) = private_self.iter().find(|i| i.token == token) {
-            if let Some(uuid) = &found.uuid {
-                return Ok(uuid.clone())
-            }
-        }
-        self.ensure_private_self(&mut cache_lock, handle, true).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
-        Ok(private_self.iter().find(|i| i.token == token).ok_or(PushError::KeyNotFound(handle.to_string()))?.uuid.as_ref()
-            .ok_or(PushError::KeyNotFound(handle.to_string()))?.clone())
-    }
-
-    async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
-        let my_cache = cache_lock.cache.get_mut(handle).unwrap();
-        if my_cache.private_data.len() != 0 && !refresh {
-            return Ok(())
-        }
-        let user_lock = self.users.read().await;
-        let my_user = Self::user_by_handle(&user_lock, handle);
-        let regs = my_user.get_dependent_registrations(&*self.conn.state.read().await).await?;
-        if my_cache.private_data.len() != 0 && regs.len() != my_cache.private_data.len() {
-            // something changed, requery IDS too
-            cache_lock.invalidate(handle, handle);
-        }
-        cache_lock.cache.get_mut(handle).unwrap().private_data = regs;
-        cache_lock.save();
-        Ok(())
     }
 
     async fn recieve_payload(&self, payload: Value) -> Result<Option<IMessage>, PushError> {
@@ -597,13 +208,13 @@ impl IMClient {
         }
 
         if get_c == 130 {
-            let mut cache_lock = self.key_cache.lock().await;
+            let mut cache_lock = self.identity.cache.lock().await;
             let source = load.get("sP").unwrap().as_string().unwrap();
             let target = load.get("tP").unwrap().as_string().unwrap();
             let send_delivered = load.get("D").map(|v| v.as_boolean().unwrap()).unwrap_or(false);
             cache_lock.invalidate(target, source);
-            return Ok(if self.get_handles().await.contains(&source.to_string()) && source == target {
-                self.ensure_private_self(&mut cache_lock, target, true).await?;
+            return Ok(if self.identity.get_handles().await.contains(&source.to_string()) && source == target {
+                self.identity.ensure_private_self(&mut cache_lock, target, true).await?;
                 let private_self = &cache_lock.cache.get(target).unwrap().private_data;
 
                 let sender_token = load.get("t").unwrap().as_data().unwrap().to_vec();
@@ -612,9 +223,9 @@ impl IMClient {
                     return Ok(None)
                 };
 
-                if new_device.identites.len() != self.get_handles().await.len() {
+                if new_device.identites.len() != self.identity.get_handles().await.len() {
                     info!("Re-registering due to new handles");
-                    self.reregister().await?;
+                    self.identity.refresh().await?;
                 }
 
                 let uuid = load.get("U").unwrap().as_data().unwrap();
@@ -641,17 +252,23 @@ impl IMClient {
 
         let loaded: RecvMsg = plist::from_value(&payload)?;
 
-        let users_locked = self.users.read().await;
+        let users_locked = self.identity.users.read().await;
         let Some(identity) = users_locked.iter().find(|user| user.registration.as_ref().unwrap().handles.contains(&loaded.target)) else {
             return Err(PushError::KeyNotFound(loaded.sender))
         };
 
         let payload: Vec<u8> = loaded.payload.clone().into();
         let token: Vec<u8> = loaded.token.clone().into();
-        if !self.verify_payload(&payload, &loaded.sender, &token, &loaded.target, 0).await {
-            warn!("Payload verification failed!");
-            return Err(PushError::KeyNotFound(loaded.sender))
+
+
+        let identity = self.identity.get_key_for_sender(&loaded.target, &loaded.sender, &token).await;
+        if identity.is_err() {
+            error!("Failed to get identity for payload with error {}", identity.as_ref().unwrap_err());
+            return Err(identity.err().unwrap())
         }
+        let identity = identity.unwrap();
+
+        let decrypted = self.identity.decrypt_payload(&identity.client_data.public_message_identity_key, &loaded.target, &payload).await?;
 
         if get_c == 145 && loaded.no_reply != Some(true) {
             // send back a confirm
@@ -662,8 +279,6 @@ impl IMClient {
             }, &loaded.target, Message::MessageReadOnDevice).await;
             let _ = self.send(&mut msg).await; // maybe find a better way to handle this
         }
-
-        let decrypted = self.decrypt(identity, &payload).await?;
         
         match IMessage::from_raw(&decrypted, &loaded, &self.conn).await {
             Err(err) => {
@@ -675,83 +290,6 @@ impl IMClient {
             },
             Ok(msg) => Ok(Some(msg))
         }
-    }
-
-    async fn ensure_not_failed(&self) -> Result<(), PushError> {
-        if let RegisterState::Failed(error) = &*self.register_state.lock().await {
-            return Err(error.clone().into())
-        }
-        Ok(())
-    }
-
-    pub async fn reregister(&self) -> Result<(), PushError> {
-        self.ensure_not_failed().await?;
-        // first one who gets here drives the reregister process
-        if let Ok(channel) = self.rereg_signal.try_lock() {
-            channel.send_async(()).await.unwrap();
-            self.rereg_success.resubscribe().recv().await.unwrap()?;
-        } else {
-            // techinally a race condition here, if above condition fails *right* as rereg_success is being sent,
-            // this might not subscribe in time and hang forever (until next reregistration, which may be never)
-            self.rereg_success.resubscribe().recv().await.unwrap()?;
-        }
-        Ok(())
-    }
-
-    // keyCache and users must be unlocked
-    #[async_recursion]
-    pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
-         // only one IDS query can happen at the a time. period.
-        let id_lock = self.id_lock.lock().await;
-        
-        self.ensure_not_failed().await?;
-        // find participants whose keys need to be fetched
-        debug!("Getting keys for {:?}", participants);
-        let key_cache = self.key_cache.lock().await;
-        let fetch: Vec<String> = participants.iter().filter(|p| !key_cache.does_not_need_refresh(handle, *p, refresh))
-            .map(|p| p.to_string()).collect();
-        if fetch.len() == 0 {
-            return Ok(())
-        }
-        drop(key_cache);
-        for chunk in fetch.chunks(18) {
-            debug!("Fetching keys for chunk {:?}", chunk);
-            let users = self.users.read().await;
-            let results = match Self::user_by_handle(&users, handle).query(self.os_config.as_ref(), &self.conn, handle, chunk.to_vec(), meta).await {
-                Ok(results) => results,
-                Err(err) => {
-                    if let PushError::LookupFailed(6005) = err {
-                        warn!("IDS returned 6005; attempting to re-register");
-                        drop(users); // release mutex
-                        drop(id_lock);
-                        self.reregister().await?;
-                        return self.cache_keys(participants, handle, refresh, meta).await;
-                    } else {
-                        return Err(err)
-                    }
-                }
-            };
-            debug!("Got keys for {:?}", chunk);
-
-            let mut key_cache = self.key_cache.lock().await;
-            if results.len() == 0 {
-                warn!("warn IDS returned zero keys for query {:?}", chunk);
-            }
-            for (id, results) in results {
-                if results.len() == 0 {
-                    warn!("IDS returned zero keys for participant {}", id);
-                }
-                key_cache.put_keys(handle, &id, results);
-            }   
-        }
-        debug!("Cached keys for {:?}", participants);
-        Ok(())
-    }
-
-    pub async fn validate_targets(&self, targets: &[String], handle: &str) -> Result<Vec<String>, PushError> {
-        self.cache_keys(targets, handle, false, &QueryOptions::default()).await?;
-        let key_cache = self.key_cache.lock().await;
-        Ok(targets.iter().filter(|target| !key_cache.get_keys(handle, *target).is_empty()).map(|i| i.clone()).collect())
     }
 
     pub async fn new_msg(&self, conversation: ConversationData, sender: &str, message: Message) -> IMessage {
@@ -767,61 +305,6 @@ impl IMClient {
         }
     }
 
-    async fn encrypt_payload(&self, raw: &[u8], key: &IDSPublicIdentity, sender: &str) -> Result<Vec<u8>, PushError> {
-        let rand = rand::thread_rng().gen::<[u8; 11]>();
-        let users = self.users.read().await;
-        let user = Self::user_by_handle(&users, sender);
-
-        let hmac = PKey::hmac(&rand)?;
-        let mut signer = Signer::new(MessageDigest::sha256(), &hmac)?;
-        let result = signer.sign_oneshot_to_vec(&[
-            raw.to_vec(),
-            vec![0x02],
-            user.identity.hash()?.to_vec(),
-            key.hash()?.to_vec()
-        ].concat())?;
-
-        let aes_key = [
-            rand.to_vec(),
-            result[..5].to_vec()
-        ].concat();
-
-        let encrypted_sym = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&NORMAL_NONCE), raw).unwrap();
-
-        let encryption_key = key.pkey_enc()?;
-
-        let payload = [
-            aes_key,
-            encrypted_sym[..encrypted_sym.len().min(100)].to_vec()
-        ].concat();
-        let mut encrypter = Encrypter::new(&encryption_key)?;
-        encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
-        encrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
-        encrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
-        let buffer_len = encrypter.encrypt_len(&payload).unwrap();
-        let mut encrypted = vec![0; buffer_len];
-        let encrypted_len = encrypter.encrypt(&payload, &mut encrypted).unwrap();
-        encrypted.truncate(encrypted_len);
-
-        let payload = [
-            encrypted,
-            encrypted_sym[encrypted_sym.len().min(100)..].to_vec()
-        ].concat();
-
-        let mut signer = Signer::new(MessageDigest::sha1(), user.identity.pkey_signing()?.as_ref())?;
-
-        let sig = signer.sign_oneshot_to_vec(&payload)?;
-        let payload = [
-            vec![0x02],
-            (payload.len() as u16).to_be_bytes().to_vec(),
-            payload,
-            (sig.len() as u8).to_be_bytes().to_vec(),
-            sig
-        ].concat();
-
-        Ok(payload)
-    }
-
     pub async fn send(&self, message: &mut IMessage) -> Result<(), PushError> {
         debug!("Send queue {message}");
         message.sanity_check_send();
@@ -832,7 +315,7 @@ impl IMClient {
             .expect("Time went backwards");
         message.sent_timestamp = since_the_epoch.as_millis() as u64;
         
-        let handles = self.get_handles().await;
+        let handles = self.identity.get_handles().await;
         let mut target_participants = message.conversation.as_ref().unwrap().participants.clone();
         if let Message::Delivered | Message::Typing | Message::StopTyping = message.message {
             // do not send delivery reciepts to other devices on same acct
@@ -864,20 +347,16 @@ impl IMClient {
         self.send_payloads(&message, &target_participants, 0).await
     }
 
-    pub async fn invalidate_id_cache(&self) {
-        self.key_cache.lock().await.invalidate_all();
-    }
-
     #[async_recursion]
     async fn send_payloads(&self, message: &IMessage, with_participants: &[String], retry_count: u8) -> Result<(), PushError> {
         let sender = message.sender.as_ref().unwrap().to_string();
-        self.cache_keys(with_participants, &sender, false, &QueryOptions { required_for_message: true, result_expected: true }).await?;
-        let handles = self.get_handles().await;
+        self.identity.cache_keys(with_participants, &sender, false, &QueryOptions { required_for_message: true, result_expected: true }).await?;
+        let handles = self.identity.get_handles().await;
         let raw = if message.has_payload() { message.to_raw(&handles, &self.conn).await? } else { vec![] };
 
         let mut payloads: Vec<(usize, BundledPayload)> = vec![];
 
-        let key_cache = self.key_cache.lock().await;
+        let key_cache = self.identity.cache.lock().await;
         let target_identities = if let Some(exact_targets) = &message.target {
             key_cache.get_targets(&sender, &with_participants, &exact_targets)?
         } else {
@@ -899,7 +378,7 @@ impl IMClient {
                 continue;
             }
             let encrypted = if message.has_payload() {
-                let payload = self.encrypt_payload(&raw, &token.client_data.public_message_identity_key, &sender).await?;
+                let payload = self.identity.encrypt_payload(&sender, &token.client_data.public_message_identity_key, &raw).await?;
                 Some(payload)
             } else {
                 None
@@ -1014,7 +493,7 @@ impl IMClient {
             }
 
             let sender = message.sender.as_ref().unwrap().to_string();
-            let mut key_cache = self.key_cache.lock().await;
+            let mut key_cache = self.identity.cache.lock().await;
             let refresh_msg: HashSet<_> = payloads.into_iter().filter_map(|i| {
                 let found = refresh_tokens.contains(&i.1.token.as_ref().into());
                 if found {

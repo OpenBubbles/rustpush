@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnection, APSState, ConversationData, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -107,7 +107,7 @@ async fn main() {
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
     let (connection, error) = 
-        APSConnection::new(
+        APSConnectionResource::new(
             config.clone(),
             saved_state.as_ref().map(|state| state.push.clone()),
         )
@@ -165,7 +165,7 @@ async fn main() {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
-    let handle = client.get_handles().await[0].clone();
+    let handle = client.identity.get_handles().await[0].clone();
 
 
     //sleep(Duration::from_millis(10000)).await;
@@ -182,6 +182,10 @@ async fn main() {
     loop {
         tokio::select! {
             msg = client.recieve_wait() => {
+                if msg.is_err() {
+                    error!("Failed to receive {}", msg.err().unwrap());
+                    continue;
+                }
                 if let Ok(Some(msg)) = msg {
                     if msg.has_payload() && !received_msgs.contains(&msg.id) {
                         received_msgs.push(msg.id.clone());
