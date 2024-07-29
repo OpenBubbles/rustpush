@@ -7,7 +7,7 @@ use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{albert::ActivationInfo, util::{make_reqwest, plist_to_buf}, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{get_bag, get_reqwest, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -20,7 +20,6 @@ pub struct MacOSConfig {
     pub icloud_ua: String,
     pub aoskit_version: String,
 }
-
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -43,20 +42,24 @@ struct CertsResponse {
 impl OSConfig for MacOSConfig {
     fn build_activation_info(&self, csr: Vec<u8>) -> ActivationInfo {
         ActivationInfo {
-            activation_randomness: Uuid::new_v4().to_string(),
-            activation_state: "Unactivated".to_string(),
+            activation_randomness: Uuid::new_v4().to_string().to_uppercase(),
+            activation_state: "Unactivated",
             build_version: self.inner.os_build_num.clone(),
             device_cert_request: csr.into(),
             device_class: "MacOS".to_string(),
             product_type: self.inner.product_name.clone(),
             product_version: self.version.clone(),
             serial_number: self.inner.platform_serial_number.clone(),
-            unique_device_id: self.device_id.clone(),
+            unique_device_id: self.device_id.clone().to_uppercase(),
         }
     }
 
     fn get_icloud_ua(&self) -> String {
         self.icloud_ua.clone()
+    }
+
+    fn get_albert_ua(&self) -> String {
+        "ApplePushService/4.0 CFNetwork/1492.0.1 Darwin/23.3.0".to_string()
     }
 
     fn get_mme_clientinfo(&self) -> String {
@@ -80,9 +83,10 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        let client = make_reqwest();
+        let client = get_reqwest();
 
-        let key = client.get("http://static.ess.apple.com/identity/validation/cert-1.0.plist")
+        let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
+        let key = client.get(url)
             .send().await?;
         let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
         let certs: Vec<u8> = response.cert.into();
@@ -95,7 +99,8 @@ impl OSConfig for MacOSConfig {
         };
 
         let info = plist_to_buf(&init)?;
-        let activation = client.post("https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/initializeValidation")
+        let url = get_bag(IDS_BAG, "id-initialize-validation").await?.into_string().unwrap();
+        let activation = client.post(url)
             .body(info)
             .send().await?;
 
@@ -118,12 +123,22 @@ impl OSConfig for MacOSConfig {
         }
     }
 
+    fn get_debug_meta(&self) -> DebugMeta {
+        DebugMeta {
+            user_version: self.version.clone(),
+            hardware_version: self.inner.product_name.clone(),
+            serial_number: self.inner.platform_serial_number.clone(),
+        }
+    }
+
+    fn get_login_url(&self) -> &'static str {
+        "https://setup.icloud.com/setup/prefpane/loginDelegates"
+    }
+
     fn get_private_data(&self) -> Dictionary {
         let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
         Dictionary::from_iter([
             ("ap", Value::String("0".to_string())), // 1 for ios
-
-            // ("c", Value::String("1".to_string())), // not on ios, omitted for beeper
 
             ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
             ("dt", Value::Integer(1.into())),

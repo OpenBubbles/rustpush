@@ -1,6 +1,7 @@
 
-use std::{cmp::min, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, SystemTime}};
+use std::{borrow::BorrowMut, cmp::min, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
 
+use backon::ExponentialBuilder;
 use deku::prelude::*;
 use log::error;
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer};
@@ -8,11 +9,11 @@ use plist::Value;
 use rand::{Rng, RngCore};
 use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
 use serde::{Deserialize, Serialize};
-use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, select, sync::{broadcast::{self, error::RecvError, Receiver, Sender}, mpsc, Mutex, RwLock}};
+use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, select, sync::{broadcast::{self, error::RecvError, Receiver, Sender}, mpsc, Mutex, RwLock}, task::{self, JoinHandle}};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{albert::generate_push_cert, bags::{get_bag, APNS_BAG}, ids::signing::generate_nonce, util::{KeyPair, bin_deserialize_opt, bin_serialize_opt}, OSConfig, PushError};
+use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, util::{bin_deserialize_opt, bin_serialize_opt, get_bag, KeyPair, Resource, ResourceManager, APNS_BAG}, OSConfig, PushError};
 
 #[derive(DekuRead, DekuWrite, Clone)]
 #[deku(endian = "big")]
@@ -227,14 +228,14 @@ pub struct APSState {
     pub keypair: Option<KeyPair>,
 }
 
-pub struct APSConnection {
+pub struct APSConnectionResource {
     os_config: Arc<dyn OSConfig>,
     pub state: RwLock<APSState>,
     socket: Mutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
     messages: RwLock<Option<broadcast::Sender<APSMessage>>>,
-    reload_trigger: Mutex<mpsc::Sender<()>>,
-    pub connected: broadcast::Sender<()>,
     pub messages_cont: broadcast::Sender<APSMessage>,
+    reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
+    manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
 }
 
 const APNS_PORT: u16 = 5223;
@@ -252,13 +253,12 @@ async fn open_socket() -> Result<TlsStream<TcpStream>, PushError> {
     config.alpn_protocols = vec!["apns-security-v3".into()];
     let connector = TlsConnector::from(Arc::new(config));
     
-    let apns_bag = get_bag(APNS_BAG).await?;
-    let hostcount = apns_bag.get("APNSCourierHostcount").unwrap().as_unsigned_integer().unwrap();
-    let hostname = apns_bag.get("APNSCourierHostname").unwrap().as_string().unwrap();
+    let hostcount = get_bag(APNS_BAG, "APNSCourierHostcount").await?.as_unsigned_integer().unwrap();
+    let hostname = get_bag(APNS_BAG, "APNSCourierHostname").await?.into_string().unwrap();
 
     let domain = format!("{}-{}", rand::thread_rng().gen_range(1..hostcount), hostname);
     
-    let dnsname = ServerName::try_from(hostname).unwrap();
+    let dnsname = ServerName::try_from(hostname.as_str()).unwrap();
     
     let stream = TcpStream::connect((domain.as_str(), APNS_PORT).to_socket_addrs()?.next().unwrap()).await?;
     let stream = connector.connect(dnsname, stream).await?;
@@ -266,33 +266,93 @@ async fn open_socket() -> Result<TlsStream<TcpStream>, PushError> {
     Ok(stream)
 }
 
-impl APSConnection {
 
-    pub async fn new(config: Arc<dyn OSConfig>, state: Option<APSState>) -> (Arc<Self>, Option<PushError>) {
-        let (next, recv) = mpsc::channel(9999);
-        let (conn_send, _) = broadcast::channel(10);
+impl Resource for APSConnectionResource {
+    async fn generate(self: &Arc<Self>) -> Result<JoinHandle<()>, PushError> {
+        let socket = match open_socket().await {
+            Ok(e) => e,
+            Err(err) => {
+                error!("failed to connect to socket {err}!");
+                return Err(err);
+            }
+        };
+
+        let (read, write) = split(socket);
+
+        let (send, _) = tokio::sync::broadcast::channel(999);
+        *self.messages.write().await = Some(send.clone());
+        *self.socket.lock().await = Some(write);
+        *self.reader.lock().await = Some(read);
+
+        let maintenance_self = self.clone();
+        let maintenence_handle = task::spawn(async move {
+            let mut read = maintenance_self.reader.lock().await.take().unwrap();
+            loop {
+                match APSMessage::read_from_stream(&mut read).await {
+                    Ok(Some(msg)) => {
+                        let _ = maintenance_self.messages.read().await.as_ref().unwrap().send(msg.clone()); // if it fails, someone might care later
+                        let _ = maintenance_self.messages_cont.send(msg);
+                    },
+                    Ok(None) => {},
+                    Err(err) => {
+                        error!("Failed to read message from APS with error {}", err);
+                        return
+                    }
+                };
+            }
+        });
+
+        if let Err(err) = self.clone().do_connect().await {
+            error!("failed to connect {err}!");
+            maintenence_handle.abort();
+            return Err(err);
+        }
+
+        Ok(maintenence_handle)
+    }
+}
+
+pub type APSConnection = Arc<ResourceManager<APSConnectionResource>>;
+
+impl APSConnectionResource {
+
+    pub async fn new(config: Arc<dyn OSConfig>, state: Option<APSState>) -> (APSConnection, Option<PushError>) {
         let (messages_cont, _) = broadcast::channel(9999);
-        let connection = Arc::new(APSConnection {
+        let connection = Arc::new(APSConnectionResource {
             os_config: config,
             state: RwLock::new(state.unwrap_or_default()),
             socket: Mutex::new(None),
             messages: RwLock::new(None),
-            reload_trigger: Mutex::new(next),
-            connected: conn_send,
             messages_cont,
+            reader: Mutex::new(None),
+            manager: Mutex::new(None),
         });
         
-        let socket = connection.clone().setup_socket(recv, 0).await.err();
+        let result = connection.generate().await;
+
+        let (ok, err) = match result {
+            Ok(ok) => (Some(ok), None),
+            Err(err) => (None, Some(err)),
+        };
+
+        let resource = ResourceManager::new(
+            connection, 
+            ExponentialBuilder::default()
+                .with_max_delay(Duration::from_secs(30))
+                .with_max_times(usize::MAX),
+            ok
+        );
+
+        *resource.manager.lock().await = Some(Arc::downgrade(&resource));
 
         // auto ack notifications
-        let ack_ref = Arc::downgrade(&connection);
-        let mut ack_receiver = connection.messages_cont.subscribe();
+        let ack_ref = resource.clone();
+        let mut ack_receiver = resource.messages_cont.subscribe();
         tokio::spawn(async move {
             loop {
                 match ack_receiver.recv().await {
                     Ok(APSMessage::Notification { id, topic: _, token: _, payload: _ }) => {
-                        let Some(conn) = ack_ref.upgrade() else { break };
-                        let _ = conn.send(APSMessage::Ack { token: Some(conn.get_token().await), for_id: id, status: 0 }).await;
+                        let _ = ack_ref.send(APSMessage::Ack { token: Some(ack_ref.get_token().await), for_id: id, status: 0 }).await;
                     }
                     Err(RecvError::Closed) => break,
                     _ => continue,
@@ -301,22 +361,21 @@ impl APSConnection {
         });
 
         // auto ping
-        let keep_alive_ref = Arc::downgrade(&connection);
+        let keep_alive_ref = resource.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let Some(conn) = keep_alive_ref.upgrade() else { break };
-                let waiter = conn.subscribe().await;
-                if let Ok(_) = conn.send(APSMessage::Ping).await {
-                    let _ = conn.wait_for_timeout(waiter, |msg| {
+                let waiter = keep_alive_ref.subscribe().await;
+                if let Ok(_) = keep_alive_ref.send(APSMessage::Ping).await {
+                    let _ = keep_alive_ref.wait_for_timeout(waiter, |msg| {
                         if let APSMessage::Pong = msg { Some(()) } else { None }
                     }).await;
                 }
             }
         });
 
-        (connection, socket)
+        (resource, err)
     }
 
     pub async fn get_token(&self) -> [u8; 32] {
@@ -327,20 +386,12 @@ impl APSConnection {
         let mut state = self.state.write().await;
 
         if state.keypair.is_none() {
-            state.keypair = Some(generate_push_cert(self.os_config.as_ref()).await?);
+            state.keypair = Some(activate(self.os_config.as_ref()).await?);
         }
         let pair = state.keypair.as_ref().unwrap();
-        
-        let mut signer = Signer::new(MessageDigest::sha1(), &PKey::private_key_from_der(&pair.private).unwrap())?;
-        signer.set_rsa_padding(Padding::PKCS1)?;
 
-        let nonce = generate_nonce(0);
-        let sig = signer.sign_oneshot_to_vec(&nonce)?;
-
-        let signature = [
-            vec![1, 1],
-            sig
-        ].concat();
+        let nonce = generate_nonce(NonceType::APNS);
+        let signature = do_signature(&PKey::private_key_from_der(&pair.private).unwrap(), &nonce)?;
 
         let recv = self.subscribe().await;
         self.send(APSMessage::Connect {
@@ -380,10 +431,10 @@ impl APSConnection {
         self.messages.read().await.as_ref().map(|msgs| msgs.subscribe()).unwrap_or_else(|| Sender::new(1).subscribe())
     }
 
-    pub async fn wait_for_timeout<F, T>(&self, mut recv: Receiver<APSMessage>, mut f: F) -> Result<T, PushError>
+    pub async fn wait_for_timeout<F, T>(&self, mut recv: impl BorrowMut<Receiver<APSMessage>>, mut f: F) -> Result<T, PushError>
     where F: FnMut(APSMessage) -> Option<T> {
         let value = tokio::time::timeout(Duration::from_secs(15), async move {
-            while let Ok(item) = recv.recv().await {
+            while let Ok(item) = recv.borrow_mut().recv().await {
                 if let Some(data) = f(item) {
                     return Ok(data);
                 }
@@ -400,87 +451,8 @@ impl APSConnection {
         value
     }
 
-    pub async fn do_reload(&self) {
-        self.reload_trigger.lock().await.send(()).await.unwrap();
-    }
-
-    async fn receive_task(mut read: ReadHalf<TlsStream<TcpStream>>, send: &Sender<APSMessage>, cont: broadcast::Sender<APSMessage>, reload_target: &mut mpsc::Receiver<()>) -> Result<(), PushError> {
-        let start_time = SystemTime::now();
-        loop {
-            select! {
-                stream = APSMessage::read_from_stream(&mut read) => {
-                    if let Some(msg) = stream? {
-                        let _ = send.send(msg.clone()); // if it fails, someone might care later
-                        let _ = cont.send(msg);
-                    }
-                },
-                _ = reload_target.recv() => {
-                    let elapsed = start_time.elapsed()?;
-                    if elapsed.as_secs() < 15 {
-                        // from previous connection, drop it.
-                        continue
-                    }
-                    break // reload connection. Also used on drop, this should be closed
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[async_recursion]
-    async fn setup_socket(self: Arc<Self>, mut reload_target: mpsc::Receiver<()>, retry: u64) -> Result<(), PushError> {
-        let socket = match open_socket().await {
-            Ok(e) => e,
-            Err(err) => {
-                error!("failed to connect to socket {err}!");
-                let retry_handle = Arc::downgrade(&self);
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(min(10 * retry, 30))).await;
-                    if let Some(connection) = retry_handle.upgrade() {
-                        let _ = connection.setup_socket(reload_target, retry + 1).await;
-                    }
-                });
-                return Err(err);
-            }
-        };
-
-        let (read, write) = split(socket);
-
-        let (send, _) = tokio::sync::broadcast::channel(999);
-        *self.messages.write().await = Some(send.clone());
-        *self.socket.lock().await = Some(write);
-
-        let current_retry = Arc::new(AtomicU64::new(retry));
-        let reload_handle = Arc::downgrade(&self);
-        let retry_handle = current_retry.clone();
-        let send_handle = self.messages_cont.clone();
-        tokio::spawn(async move {
-            if let Err(err) = Self::receive_task(read, &send, send_handle, &mut reload_target).await {
-                error!("APS connection terminated with error {err}");
-            }
-
-            // APS connection terminated (or reload requested)
-            if let Some(connection) = reload_handle.upgrade() {
-                // if anyone still cares about our connection and we're not disconnected
-                let retry = retry_handle.load(Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_secs(min(10 * retry, 30))).await;
-                let _ = connection.setup_socket(reload_target, retry + 1).await;
-            }
-
-            Ok::<(), PushError>(())
-        });
-
-        if let Err(err) = self.clone().do_connect().await {
-            error!("failed to connect {err}!");
-            self.do_reload().await;
-            return Err(err);
-        }
-
-        current_retry.store(0, Ordering::Relaxed);
-
-        let _ = self.connected.send(());
-
-        Ok(())
+    async fn do_reload(&self) {
+        self.manager.lock().await.as_ref().unwrap().upgrade().unwrap().request_update().await;
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {

@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{init_logger, register, APSConnection, APSState, ConversationData, IDSAppleUser, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MessageInst, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -42,6 +42,8 @@ async fn read_input() -> String {
 #[tokio::main(worker_threads = 1)]
 async fn main() {
     init_logger();
+
+    // info!("here {}", get_gateways_for_mccmnc("310160").await.unwrap());
 
     let data: String = match fs::read_to_string("config.plist").await {
 		Ok(v) => v,
@@ -87,12 +89,25 @@ async fn main() {
             aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         }
     });
-    fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
+    // let host = "https://registration-relay.beeper.com".to_string();
+    // let code = "BZUL-7TB6-JUGN-6Q6W".to_string();
+    // let token = Some("5c175851953ecaf5209185d897591badb6c3e712".to_string());
+    // let config: Arc<RelayConfig> = Arc::new(RelayConfig {
+    //     version: RelayConfig::get_versions(&host, &code, &token).await.unwrap(),
+    //     icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+    //     aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+    //     dev_uuid: Uuid::new_v4().to_string(),
+    //     protocol_version: 1640,
+    //     host,
+    //     code,
+    //     beeper_token: token,
+    // });
+    // fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
     let (connection, error) = 
-        APSConnection::new(
+        APSConnectionResource::new(
             config.clone(),
             saved_state.as_ref().map(|state| state.push.clone()),
         )
@@ -130,14 +145,14 @@ async fn main() {
         let account = acc.unwrap();
         let pet = account.get_pet().unwrap();
 
-        let user = IDSAppleUser::authenticate(&connection, &user_trimmed, &pet, config.as_ref()).await.unwrap();
+        let user = authenticate_apple(&user_trimmed, &pet, config.as_ref()).await.unwrap();
 
         vec![user]
     };
 
-    if users[0].identity.is_none() {
+    if users[0].registration.is_none() {
         info!("Registering new identity...");
-        register(config.as_ref(), &mut users, connection.as_ref()).await.unwrap();
+        register(config.as_ref(), &*connection.state.read().await, &mut users).await.unwrap();
     }
 
     let mut state = SavedState {
@@ -150,7 +165,7 @@ async fn main() {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
-    let handle = client.get_handles().await[0].clone();
+    let handle = client.identity.get_handles().await[0].clone();
 
 
     //sleep(Duration::from_millis(10000)).await;
@@ -166,7 +181,11 @@ async fn main() {
     
     loop {
         tokio::select! {
-            msg = client.recieve_wait() => {
+            msg = client.receive_wait() => {
+                if msg.is_err() {
+                    error!("Failed to receive {}", msg.err().unwrap());
+                    continue;
+                }
                 if let Ok(Some(msg)) = msg {
                     if msg.has_payload() && !received_msgs.contains(&msg.id) {
                         received_msgs.push(msg.id.clone());
@@ -175,7 +194,7 @@ async fn main() {
                         std::io::stdout().flush().unwrap();
                         if msg.send_delivered {
                             println!("sending delivered");
-                            let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                            let mut msg2 = MessageInst::new(msg.conversation.unwrap(), &handle, Message::Delivered);
                             msg2.id = msg.id;
                             msg2.target = msg.target;
                             let _ = client.send(&mut msg2).await;
@@ -198,22 +217,24 @@ async fn main() {
                     filter_target = input.strip_prefix("filter ").unwrap().to_string().trim().to_string();
                     println!("Filtering to {}", filter_target);
                 } else if input.trim() == "sms" {
-                    let mut msg = client.new_msg(ConversationData {
+                    let mut msg = MessageInst::new(ConversationData {
                         participants: vec![],
                         cv_name: None,
-                        sender_guid: Some(Uuid::new_v4().to_string())
-                    }, &handle, Message::EnableSmsActivation(true)).await;
+                        sender_guid: Some(Uuid::new_v4().to_string()),
+                        after_guid: None,
+                    }, &handle, Message::EnableSmsActivation(true));
                     client.send(&mut msg).await.unwrap();
                     println!("sms activated");
                 } else {
                     if filter_target == "" {
                         println!("Usage: filter [target]");
                     } else {
-                        let mut msg = client.new_msg(ConversationData {
+                        let mut msg = MessageInst::new(ConversationData {
                             participants: vec![filter_target.clone()],
                             cv_name: None,
-                            sender_guid: Some(Uuid::new_v4().to_string())
-                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage))).await;
+                            sender_guid: Some(Uuid::new_v4().to_string()),
+                            after_guid: None,
+                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage)));
                         if let Err(err) = client.send(&mut msg).await {
                             error!("Error sending message {err}");
                         }

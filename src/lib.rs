@@ -1,25 +1,31 @@
-mod bags;
-mod albert;
+
+mod activation;
 mod aps;
-mod ids;
 mod util;
 mod imessage;
 mod mmcs;
 mod error;
+mod auth;
 
 #[cfg(feature = "macOS")]
 mod macos;
+
+mod relay;
 
 pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
 
-use albert::ActivationInfo;
-pub use aps::{APSConnection, APSMessage, APSState};
+use std::fmt::Debug;
+
+use activation::ActivationInfo;
+pub use aps::{APSConnectionResource, APSMessage, APSState};
 use async_trait::async_trait;
-pub use ids::{user::{IDSUser, IDSAppleUser, IDSPhoneUser}, identity::{register, SupportAction, SupportAlert}};
-pub use imessage::messages::{IMessage, BalloonBody, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
-pub use imessage::client::{IMClient, RegisterState};
+pub use imessage::messages::{MessageInst, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
+pub use imessage::aps_client::IMClient;
+pub use util::ResourceState;
+pub use imessage::user::{IDSUser, register};
+pub use auth::authenticate_apple;
 pub use error::PushError;
 #[cfg(feature = "macOS")]
 pub use macos::MacOSConfig;
@@ -27,10 +33,20 @@ pub use macos::MacOSConfig;
 pub use open_absinthe::nac::HardwareConfig;
 
 use plist::Dictionary;
+pub use relay::RelayConfig;
+pub use util::get_gateways_for_mccmnc;
+
+
 pub struct RegisterMeta {
     pub hardware_version: String,
     pub os_version: String,
     pub software_version: String,
+}
+
+pub struct DebugMeta {
+    pub user_version: String,
+    pub hardware_version: String,
+    pub serial_number: String,
 }
 
 #[async_trait]
@@ -41,11 +57,14 @@ pub trait OSConfig: Sync + Send {
     fn get_protocol_version(&self) -> u32;
     fn get_register_meta(&self) -> RegisterMeta;
     fn get_icloud_ua(&self) -> String;
+    fn get_albert_ua(&self) -> String;
     fn get_mme_clientinfo(&self) -> String;
     fn get_version_ua(&self) -> String;
     fn get_device_name(&self) -> String;
     fn get_device_uuid(&self) -> String;
     fn get_private_data(&self) -> Dictionary;
+    fn get_debug_meta(&self) -> DebugMeta;
+    fn get_login_url(&self) -> &'static str;
 }
 
 extern crate pretty_env_logger;

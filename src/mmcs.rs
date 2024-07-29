@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{make_reqwest, make_reqwest_system, plist_to_bin}, APSConnection};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
 use log::{info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -166,7 +166,7 @@ impl MMCSPutContainer {
             let body: Body = Body::wrap_stream(receiver.into_stream());
             let request = self.target.request.clone().unwrap();
             let task = tokio::spawn(async move {
-                let response = transfer_mmcs_container(&make_reqwest_system(), &request, Some(body)).await?;
+                let response = transfer_mmcs_container(&get_reqwest_system(), &request, Some(body)).await?;
                 Ok::<_, PushError>(response)
             });
             self.finalize = Some(task);
@@ -234,7 +234,7 @@ impl Container for MMCSPutContainer {
             let mut buf: Vec<u8> = Vec::new();
             buf.reserve(confirmation.encoded_len());
             confirmation.encode(&mut buf).unwrap();
-            let resp = send_mmcs_req(&make_reqwest(), &self.confirm_url, "putComplete", &format!("{} {} {}", self.target.cl_auth_p1, self.length, self.target.cl_auth_p2), &self.for_object, &buf).await?;
+            let resp = send_mmcs_req(&get_reqwest(), &self.confirm_url, "putComplete", &format!("{} {} {}", self.target.cl_auth_p1, self.length, self.target.cl_auth_p2), &self.for_object, &buf).await?;
             if !resp.status().is_success() {
                 return Err(PushError::MMCSUploadFailed(resp.status().as_u16()));
             }
@@ -273,7 +273,7 @@ struct MMCSUploadResponse {
 }
 
 // upload data to mmcs
-pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APSConnection, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
+pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &PreparedPut, apns: &APSConnectionResource, progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(String, String), PushError> {
     let get = mmcsp::AuthorizePut {
         data: Some(mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
@@ -571,7 +571,7 @@ impl MMCSGetContainer {
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(&make_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await.unwrap();
+            let response = transfer_mmcs_container(&get_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await.unwrap();
             self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None));
             self.response = Some(response);
         }
@@ -636,7 +636,7 @@ struct MMCSDownloadResponse {
     object: String
 }
 
-pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnection, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
+pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnectionResource, target: &mut (dyn Container + Send + Sync), progress: &mut (dyn FnMut(usize, usize) + Send + Sync)) -> Result<(), PushError> {
     let domain = url.replace(&format!("/{}", object), "");
     let msg_id = rand::thread_rng().next_u32();
     let request_download = RequestMMCSDownload {
@@ -709,7 +709,7 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnection,
     let mut buf: Vec<u8> = Vec::new();
     buf.reserve(confirmation.encoded_len());
     confirmation.encode(&mut buf).unwrap();
-    let resp = send_mmcs_req(&make_reqwest(), url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &apns_response.object, &buf).await?;
+    let resp = send_mmcs_req(&get_reqwest(), url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &apns_response.object, &buf).await?;
     if !resp.status().is_success() {
         panic!("confirm failed {}", resp.status())
     }

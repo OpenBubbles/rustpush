@@ -1,4 +1,4 @@
-use std::{io, time::SystemTimeError};
+use std::{io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
 #[cfg(feature = "macOS")]
@@ -7,7 +7,7 @@ use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
 use tokio::sync::broadcast::{self, error::SendError};
 
-use crate::{aps::APSMessage, ids::identity::SupportAlert, imessage::client::RegistrationFailure};
+use crate::{aps::APSMessage, imessage::user::SupportAlert, util::ResourceFailure};
 
 #[derive(Error, Debug)]
 pub enum PushError {
@@ -57,7 +57,7 @@ pub enum PushError {
     #[error("Bad auth cert {0}")]
     AuthInvalid(u64),
     #[error("Reregistration failed {0}")]
-    ReRegistrationFailure(#[from] RegistrationFailure),
+    ReRegistrationFailure(#[from] ResourceFailure),
     #[error("APS parse error {0}")]
     APSParseError(#[from] DekuError),
     #[error("Other side hung up! {0}")]
@@ -68,4 +68,18 @@ pub enum PushError {
     ConnectionClosed(#[from] broadcast::error::RecvError),
     #[error("Not Connected")]
     NotConnected,
+    #[error("Carrier Not Found")]
+    CarrierNotFound,
+    #[error("Carrier Zip Error")]
+    ZipError(#[from] zip::result::ZipError),
+    #[error("Resource Timeout")]
+    ResourceTimeout,
+    #[error("Resource Failure")]
+    ResourceFailure(#[from] Arc<PushError>),
+    #[error("Final error {0}")]
+    DoNotRetry(Box<PushError>),
+    #[error("Verification Failed")]
+    VerificationFailed,
+    #[error("Bag key not found")]
+    BagKeyNotFound,
 }
