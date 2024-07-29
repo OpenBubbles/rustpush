@@ -78,40 +78,6 @@ pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> 
     Some(curr_val)
 }
 
-pub fn ec_serialize<S>(x: &EcKey<Public>, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    use serde::ser::Error;
-    s.serialize_bytes(&x.public_key_to_der().map_err(Error::custom)?)
-}
-
-pub fn ec_deserialize<'de, D>(d: D) -> Result<EcKey<Public>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-    let s: Data = Deserialize::deserialize(d)?;
-    EcKey::public_key_from_der(s.as_ref()).map_err(Error::custom)
-}
-
-pub fn rsa_serialize<S>(x: &Rsa<Public>, s: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    use serde::ser::Error;
-    s.serialize_bytes(&x.public_key_to_der().map_err(Error::custom)?)
-}
-
-pub fn rsa_deserialize<'de, D>(d: D) -> Result<Rsa<Public>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-    let s: Data = Deserialize::deserialize(d)?;
-    Rsa::public_key_from_der(s.as_ref()).map_err(Error::custom)
-}
-
 pub fn ec_serialize_priv<S>(x: &EcKey<Private>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -186,6 +152,14 @@ where
         let i: Vec<u8> = i.into();
         i.try_into().unwrap()
     }))
+}
+
+pub fn bin_deserialize_opt_vec<'de, D>(d: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Data> = Deserialize::deserialize(d)?;
+    Ok(s.map(|i| i.into()))
 }
 
 // both in der

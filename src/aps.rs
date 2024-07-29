@@ -1,5 +1,5 @@
 
-use std::{cmp::min, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
+use std::{borrow::BorrowMut, cmp::min, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
 
 use backon::ExponentialBuilder;
 use deku::prelude::*;
@@ -432,10 +432,10 @@ impl APSConnectionResource {
         self.messages.read().await.as_ref().unwrap().subscribe()
     }
 
-    pub async fn wait_for_timeout<F, T>(&self, mut recv: Receiver<APSMessage>, mut f: F) -> Result<T, PushError>
+    pub async fn wait_for_timeout<F, T>(&self, mut recv: impl BorrowMut<Receiver<APSMessage>>, mut f: F) -> Result<T, PushError>
     where F: FnMut(APSMessage) -> Option<T> {
         let value = tokio::time::timeout(Duration::from_secs(15), async move {
-            while let Ok(item) = recv.recv().await {
+            while let Ok(item) = recv.borrow_mut().recv().await {
                 if let Some(data) = f(item) {
                     return Ok(data);
                 }

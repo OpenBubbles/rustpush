@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MessageInst, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -181,7 +181,7 @@ async fn main() {
     
     loop {
         tokio::select! {
-            msg = client.recieve_wait() => {
+            msg = client.receive_wait() => {
                 if msg.is_err() {
                     error!("Failed to receive {}", msg.err().unwrap());
                     continue;
@@ -194,7 +194,7 @@ async fn main() {
                         std::io::stdout().flush().unwrap();
                         if msg.send_delivered {
                             println!("sending delivered");
-                            let mut msg2 = client.new_msg(msg.conversation.unwrap(), &handle, Message::Delivered).await;
+                            let mut msg2 = MessageInst::new(msg.conversation.unwrap(), &handle, Message::Delivered);
                             msg2.id = msg.id;
                             msg2.target = msg.target;
                             let _ = client.send(&mut msg2).await;
@@ -217,22 +217,24 @@ async fn main() {
                     filter_target = input.strip_prefix("filter ").unwrap().to_string().trim().to_string();
                     println!("Filtering to {}", filter_target);
                 } else if input.trim() == "sms" {
-                    let mut msg = client.new_msg(ConversationData {
+                    let mut msg = MessageInst::new(ConversationData {
                         participants: vec![],
                         cv_name: None,
-                        sender_guid: Some(Uuid::new_v4().to_string())
-                    }, &handle, Message::EnableSmsActivation(true)).await;
+                        sender_guid: Some(Uuid::new_v4().to_string()),
+                        after_guid: None,
+                    }, &handle, Message::EnableSmsActivation(true));
                     client.send(&mut msg).await.unwrap();
                     println!("sms activated");
                 } else {
                     if filter_target == "" {
                         println!("Usage: filter [target]");
                     } else {
-                        let mut msg = client.new_msg(ConversationData {
+                        let mut msg = MessageInst::new(ConversationData {
                             participants: vec![filter_target.clone()],
                             cv_name: None,
-                            sender_guid: Some(Uuid::new_v4().to_string())
-                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage))).await;
+                            sender_guid: Some(Uuid::new_v4().to_string()),
+                            after_guid: None,
+                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage)));
                         if let Err(err) = client.send(&mut msg).await {
                             error!("Error sending message {err}");
                         }

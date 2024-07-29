@@ -278,8 +278,6 @@ struct RawIMessage {
     pv: u64,
     gv: String,
     v: String,
-    bid: Option<String>,
-    b: Option<Data>,
     #[serde(rename = "iid")]
     effect: Option<String>,
     #[serde(rename = "n")]
@@ -308,42 +306,26 @@ pub(super) struct BundledPayload {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct SendMsg {
-    pub(super) fcn: u8,
-    pub(super) c: u8,
+pub(super) struct SendMessage {
+    #[serde(rename = "fcn")]
+    pub(super) batch: u8,
+    #[serde(rename = "c")]
+    pub(super) command: u8,
     #[serde(rename = "E")]
-    pub(super) e: Option<String>,
-    pub(super) ua: String,
+    pub(super) encryption: Option<String>,
+    #[serde(rename = "ua")]
+    pub(super) user_agent: String,
     pub(super) v: u8,
-    pub(super) i: u32,
+    #[serde(rename = "i")]
+    pub(super) message_id: u32,
     #[serde(rename = "U")]
-    pub(super) u: Data,
-    pub(super) dtl: Vec<BundledPayload>,
-    #[serde(rename = "sP")]
-    pub(super) sp: String,
-    #[serde(rename = "eX")]
-    pub(super) ex: Option<u32>,
-    pub(super) nr: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(super) struct RecvMsg {
-    #[serde(rename = "P")]
-    pub(super) payload: Data,
+    pub(super) uuid: Data,
+    #[serde(rename = "dtl")]
+    pub(super) payloads: Vec<BundledPayload>,
     #[serde(rename = "sP")]
     pub(super) sender: String,
-    #[serde(rename = "t")]
-    pub(super) token: Data,
-    #[serde(rename = "tP")]
-    pub(super) target: String,
-    #[serde(rename = "U")]
-    pub(super) msg_guid: Data,
-    #[serde(rename = "e")]
-    pub(super) sent_timestamp: u64,
-    #[serde(rename = "c")]
-    pub(super) command: u64,
+    #[serde(rename = "eX")]
+    pub(super) ex: Option<u32>,
     #[serde(rename = "nr")]
-    pub(super) no_reply: Option<bool>,
-    #[serde(rename = "D")]
-    pub(super) send_delivered: Option<bool>,
+    pub(super) no_response: Option<bool>,
 }

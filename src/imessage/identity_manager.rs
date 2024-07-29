@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use backon::{ConstantBuilder, ExponentialBuilder};
 use deku::{DekuContainerRead, DekuRead, DekuWrite};
@@ -9,9 +9,9 @@ use tokio::sync::{Mutex, RwLock};
 use backon::Retryable;
 use rand::Rng;
 
-use crate::{aps::APSConnection, imessage::user::IDSIdentity, register, util::{bin_deserialize, bin_deserialize_sha, bin_serialize, plist_to_string, Resource, ResourceManager}, APSConnectionResource, IDSUser, OSConfig, PushError};
+use crate::{aps::APSConnection, imessage::user::IDSIdentity, register, util::{bin_deserialize, bin_deserialize_sha, bin_serialize, plist_to_string, Resource, ResourceManager}, APSConnectionResource, IDSUser, MessageInst, OSConfig, PushError};
 
-use super::{messages::MessageTarget, user::{IDSDeliveryData, IDSPublicIdentity, PrivateDeviceInfo, QueryOptions}};
+use super::{messages::{BundledPayload, MessageTarget}, user::{IDSDeliveryData, IDSPublicIdentity, PrivateDeviceInfo, QueryOptions}};
 
 const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
 
@@ -77,6 +77,24 @@ impl CachedHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct DeliveryHandle {
+    pub participant: String,
+    pub delivery_data: IDSDeliveryData,
+}
+
+impl DeliveryHandle {
+    pub fn build_bundle(&self, send_delivered: bool, payload: Option<Vec<u8>>) -> BundledPayload {
+        BundledPayload {
+            participant: self.participant.clone(),
+            send_delivered,
+            session_token: self.delivery_data.session_token.clone().into(),
+            payload: payload.map(|i| i.into()),
+            token: self.delivery_data.push_token.clone().into(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KeyCache {
     pub cache: HashMap<String, CachedHandle>,
@@ -130,7 +148,7 @@ impl KeyCache {
         self.save();
     }
 
-    pub fn get_targets<'a>(&self, handle: &str, participants: &'a [String], keys_for: &[MessageTarget]) -> Result<Vec<(&'a str, &IDSDeliveryData)>, PushError> {
+    pub fn get_targets(&self, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
         };
@@ -147,12 +165,16 @@ impl KeyCache {
                 !handle_cache.keys.get(*p).map(|c| c.is_valid()).unwrap_or(false)) {
             return Err(PushError::KeyNotFound(not_found.to_string())) // at least one of our caches isn't up-to-date
         }
-        Ok(participants.iter().flat_map(|p| {
-            let Some(eval_keys) = handle_cache.keys.get(p) else {
-                return vec![]
-            };
-            eval_keys.keys.iter().filter(|cached| target_tokens.contains(&&cached.push_token)).map(|i| (p.as_str(), i)).collect()
-        }).collect())
+        Ok(self.get_participants_targets(handle, participants).into_iter().filter(|target| target_tokens.contains(&&target.delivery_data.push_token)).collect())
+    }
+
+    pub fn get_participants_targets(&self, handle: &str, participants: &[String]) -> Vec<DeliveryHandle> {
+        participants.iter().flat_map(|participant| {
+            self.get_keys(handle, &participant).into_iter().map(|i| DeliveryHandle {
+                participant: participant.clone(),
+                delivery_data: i.clone(),
+            })
+        }).collect()
     }
     
     pub fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
@@ -434,6 +456,14 @@ impl IdentityResource {
         self.cache_keys(targets, handle, false, &QueryOptions::default()).await?;
         let key_cache = self.cache.lock().await;
         Ok(targets.iter().filter(|target| !key_cache.get_keys(handle, *target).is_empty()).map(|i| i.clone()).collect())
+    }
+
+    pub async fn refresh_handles(&self, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
+        let targets = handles.iter().map(|handle| handle.participant.clone()).collect::<HashSet<String>>().into_iter().collect::<Vec<_>>();
+        self.cache_keys(&targets, handle, true, &QueryOptions { required_for_message: true, result_expected: true }).await?;
+        let search_tokens = handles.iter().map(|handle| handle.delivery_data.push_token.clone()).collect::<Vec<_>>();
+        let key_cache = self.cache.lock().await;
+        Ok(key_cache.get_participants_targets(handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
     }
 
     pub async fn encrypt_payload(&self, handle: &str, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {

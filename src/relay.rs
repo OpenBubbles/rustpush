@@ -148,8 +148,6 @@ impl OSConfig for RelayConfig {
         Dictionary::from_iter([
             ("ap", Value::String("0".to_string())), // 1 for ios
 
-            // ("c", Value::String("1".to_string())), // not on ios, omitted for beeper
-
             ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
             ("dt", Value::Integer(1.into())),
             ("gt", Value::String("0".to_string())),
