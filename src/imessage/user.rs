@@ -7,7 +7,7 @@ use rasn::{AsnType, Decode, Encode};
 use reqwest::Method;
 use serde::{de, ser::Error, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, make_reqwest, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, get_reqwest, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
 
 
 #[repr(C)]
@@ -310,7 +310,7 @@ impl IDSUser {
 
     pub async fn get_possible_handles(&self, aps: &APSState) -> Result<Vec<String>, PushError> {
         let request = self.base_request(aps, "id-get-handles")?
-            .send(&make_reqwest()).await?
+            .send(&get_reqwest()).await?
             .bytes().await?;
 
         let parsed: HandleResult = plist::from_bytes(&request)?;
@@ -323,7 +323,7 @@ impl IDSUser {
 
     pub async fn get_dependent_registrations(&self, aps: &APSState) -> Result<Vec<PrivateDeviceInfo>, PushError> {
         let request = self.base_request(aps, "id-get-dependent-registrations")?
-            .send(&make_reqwest()).await?
+            .send(&get_reqwest()).await?
             .bytes().await?;
 
         let parsed: Value = plist::from_bytes(&request)?;
@@ -478,7 +478,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             .sign(&user.auth_keypair, KeyType::Auth, aps, Some(idx))?;
     }
 
-    let resp: Value = plist::from_bytes(&request.send(&make_reqwest()).await?.bytes().await?)?;
+    let resp: Value = plist::from_bytes(&request.send(&get_reqwest()).await?.bytes().await?)?;
 
     let status = resp.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {

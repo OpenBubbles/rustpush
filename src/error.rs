@@ -78,4 +78,6 @@ pub enum PushError {
     DoNotRetry(Box<PushError>),
     #[error("Verification Failed")]
     VerificationFailed,
+    #[error("Bag key not found")]
+    BagKeyNotFound,
 }

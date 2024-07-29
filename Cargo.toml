@@ -7,7 +7,6 @@ default-run = "rustpush-test"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-lazy_static = "1.4.0"
 plist = "1.5.0"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls", "gzip", "stream"] }

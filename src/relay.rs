@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use crate::{activation::ActivationInfo, util::{base64_decode, make_reqwest_system}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{base64_decode, get_reqwest_system}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Deserialize)]
 pub struct DataResp {
@@ -41,7 +41,7 @@ pub struct RelayConfig {
 
 impl RelayConfig {
     pub async fn get_versions(host: &str, code: &str, beeper_token: &Option<String>) -> Result<Versions, PushError> {
-        let client = make_reqwest_system();
+        let client = get_reqwest_system();
 
         let mut data = client.post(format!("{}/api/v1/bridge/get-version-info", host))
             .bearer_auth(code);
@@ -113,7 +113,7 @@ impl OSConfig for RelayConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        let client = make_reqwest_system();
+        let client = get_reqwest_system();
 
         let mut data = client.post(format!("{}/api/v1/bridge/get-validation-data", self.host))
             .bearer_auth(&self.code);

@@ -13,7 +13,7 @@ use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, bags::{get_bag, APNS_BAG}, util::{bin_deserialize_opt, bin_serialize_opt, KeyPair, Resource, ResourceManager}, OSConfig, PushError};
+use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, util::{bin_deserialize_opt, bin_serialize_opt, get_bag, KeyPair, Resource, ResourceManager, APNS_BAG}, OSConfig, PushError};
 
 #[derive(DekuRead, DekuWrite, Clone)]
 #[deku(endian = "big")]
@@ -253,13 +253,12 @@ async fn open_socket() -> Result<TlsStream<TcpStream>, PushError> {
     config.alpn_protocols = vec!["apns-security-v3".into()];
     let connector = TlsConnector::from(Arc::new(config));
     
-    let apns_bag = get_bag(APNS_BAG).await?;
-    let hostcount = apns_bag.get("APNSCourierHostcount").unwrap().as_unsigned_integer().unwrap();
-    let hostname = apns_bag.get("APNSCourierHostname").unwrap().as_string().unwrap();
+    let hostcount = get_bag(APNS_BAG, "APNSCourierHostcount").await?.as_unsigned_integer().unwrap();
+    let hostname = get_bag(APNS_BAG, "APNSCourierHostname").await?.into_string().unwrap();
 
     let domain = format!("{}-{}", rand::thread_rng().gen_range(1..hostcount), hostname);
     
-    let dnsname = ServerName::try_from(hostname).unwrap();
+    let dnsname = ServerName::try_from(hostname.as_str()).unwrap();
     
     let stream = TcpStream::connect((domain.as_str(), APNS_PORT).to_socket_addrs()?.next().unwrap()).await?;
     let stream = connector.connect(dnsname, stream).await?;

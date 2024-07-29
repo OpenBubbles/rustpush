@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
@@ -12,7 +12,7 @@ use log::{debug, info};
 use openssl::ec::EcKey;
 use openssl::pkey::{Private, Public};
 use openssl::rsa::Rsa;
-use plist::{Data, Error, Value};
+use plist::{Data, Dictionary, Error, Value};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
@@ -30,44 +30,82 @@ use rand::seq::SliceRandom;
 
 use crate::PushError;
 
-// make reqwest using system roots
-pub fn make_reqwest_system() -> Client {
-    reqwest::Client::builder()
-        .use_rustls_tls()
-        .build()
-        .unwrap()
-}
+pub const APNS_BAG: &str = "http://init-p01st.push.apple.com/bag";
+pub const IDS_BAG: &str = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3";
 
-pub fn make_reqwest() -> Client {
-    let certificates = vec![
-        Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
-    ];
-    let mut headers = HeaderMap::new();
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Dictionary>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    
+    let mut locked = cache.lock().await;
 
+    if !locked.contains_key(url) {
+        let client = get_reqwest();
+        let content = client.get(url).send().await?;
+        if !content.status().is_success() {
+            return Err(PushError::StatusError(content.status()))
+        }
 
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .default_headers(headers.clone())
-        .http1_title_case_headers()
-        .tls_built_in_root_certs(false);
-
-    for certificate in certificates.into_iter() {
-        builder = builder.add_root_certificate(certificate);
+        #[derive(Deserialize)]
+        struct BagBody {
+            bag: Data
+        }
+        let parsed: BagBody = plist::from_bytes(&content.bytes().await?)?;
+        let dict: Dictionary = plist::from_bytes(parsed.bag.as_ref())?;
+        
+        locked.insert(url.to_string(), dict);
     }
 
-    let builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .proxy(Proxy::https("https://localhost:8080").unwrap())
-        .default_headers(headers)
-        .http1_title_case_headers()
-        .danger_accept_invalid_certs(true);
+    let bag = locked.get(url).unwrap();
+    bag.get(item).cloned().ok_or(PushError::BagKeyNotFound)
+}
+
+
+// make reqwest using system roots
+pub fn get_reqwest_system() -> &'static Client {
+    static SYSTEM_CLIENT: OnceLock<Client> = OnceLock::new();
+    SYSTEM_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .unwrap()
+    })
+}
+
+pub fn get_reqwest() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+
+    CLIENT.get_or_init(|| {
+        let certificates = vec![
+            Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
+            Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
+            Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
+            Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
+            Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
     
-    builder.build().unwrap()
+    
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .default_headers(headers.clone())
+            .http1_title_case_headers()
+            .tls_built_in_root_certs(false);
+    
+        for certificate in certificates.into_iter() {
+            builder = builder.add_root_certificate(certificate);
+        }
+    
+        let builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .proxy(Proxy::https("https://localhost:8080").unwrap())
+            .default_headers(headers)
+            .http1_title_case_headers()
+            .danger_accept_invalid_certs(true);
+        
+        builder.build().unwrap()
+    })
 }
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
@@ -168,7 +206,7 @@ pub struct KeyPair {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub cert: Vec<u8>,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
-    pub private: Vec<u8>
+    pub private: Vec<u8>,
 }
 
 pub fn base64_encode(data: &[u8]) -> String {
@@ -278,7 +316,7 @@ struct Carrier {
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
-    let client = make_reqwest_system();
+    let client = get_reqwest_system();
     let data = client.get(CARRIER_CONFIG).send().await?.text().await?;
     
     let parsed: MasterList = plist::from_reader_xml(Cursor::new(data))?;
@@ -312,6 +350,10 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
 
     Err(PushError::CarrierNotFound)
 }
+
+
+
+
 
 pub trait Resource: Send + Sync + Sized {
     // resolve when resource is done

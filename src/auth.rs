@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{aps::get_message, bags::{get_bag, IDS_BAG}, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, gzip, gzip_normal, make_reqwest, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{aps::get_message, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, get_reqwest, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,7 +31,7 @@ async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> 
         password: pet.to_string()
     };
 
-    let client = make_reqwest();
+    let client = get_reqwest();
     let resp = client.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_icloud_ua())
@@ -98,9 +98,9 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
         realm_user_id: user_id.to_string(),
     };
 
-    let bag = get_bag(IDS_BAG).await?;
+    let url = get_bag(IDS_BAG, user_type.auth_endpoint()).await?.into_string().unwrap();
 
-    let resp = make_reqwest().post(bag.get(user_type.auth_endpoint()).unwrap().as_string().unwrap())
+    let resp = get_reqwest().post(url)
         .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("x-protocol-version", os_config.get_protocol_version())
         .header("content-encoding", "gzip")
@@ -248,15 +248,15 @@ impl SignedRequest {
     }
 
     pub async fn send(self, client: &Client) -> Result<Response, PushError> {
-        let ids_bag = get_bag(IDS_BAG).await?;
-        Ok(client.request(self.method, ids_bag[self.bag].as_string().unwrap())
+        let url = get_bag(IDS_BAG, self.bag).await?;
+        Ok(client.request(self.method, url.as_string().unwrap())
             .headers(self.headers)
             .body(self.body)
             .send().await?)
     }
 
     pub async fn send_apns(self, aps: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
-        let ids_bag = get_bag(IDS_BAG).await?;
+        let url = get_bag(IDS_BAG, self.bag).await?;
 
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();
 
@@ -264,7 +264,7 @@ impl SignedRequest {
             ("cT", Value::String("application/x-apple-plist".to_string())),
             ("U", Value::Data(msg_id.to_vec())),
             ("c", 96.into()),
-            ("u", ids_bag[self.bag].as_string().unwrap().into()),
+            ("u", url.as_string().unwrap().into()),
             ("h", Value::Dictionary(Dictionary::from_iter(
                     self.headers.into_iter().map(|(a, b)| 
                         (a.unwrap().to_string(), b.to_str().unwrap().to_string()))))),

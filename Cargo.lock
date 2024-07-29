@@ -2149,7 +2149,6 @@ dependencies = [
  "flume",
  "html-escape",
  "icloud_auth",
- "lazy_static",
  "libflate",
  "log",
  "open-absinthe",
