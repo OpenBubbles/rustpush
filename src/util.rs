@@ -275,6 +275,13 @@ pub fn encode_hex(bytes: &[u8]) -> String {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
+struct MasterList {
+    mobile_device_carriers_by_mcc_mnc: HashMap<String, MobileCarrier>,
+    mobile_device_carrier_bundles_by_product_version: HashMap<String, Value>
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
 struct MobileCarrier {
     bundle_name: Option<String>,
     #[serde(rename = "MVNOs")]
@@ -293,18 +300,10 @@ impl MobileCarrier {
     }
 }
 
-
 #[derive(Deserialize, Debug)]
 struct MobileCarrierBundle {
     #[serde(rename = "BundleURL")]
     bundle_url: Option<String>
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct MasterList {
-    mobile_device_carriers_by_mcc_mnc: HashMap<String, MobileCarrier>,
-    mobile_device_carrier_bundles_by_product_version: HashMap<String, Value>
 }
 
 #[derive(Deserialize)]
@@ -317,34 +316,31 @@ const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
     let client = get_reqwest_system();
-    let data = client.get(CARRIER_CONFIG).send().await?.text().await?;
+    let data = client.get(CARRIER_CONFIG)
+        .send().await?;
     
-    let parsed: MasterList = plist::from_reader_xml(Cursor::new(data))?;
+    let master: MasterList = plist::from_bytes(&data.bytes().await?)?;
+    let my_carrier = master.mobile_device_carriers_by_mcc_mnc.get(mccmnc).ok_or(PushError::CarrierNotFound)?;
 
-    let carrier = parsed.mobile_device_carriers_by_mcc_mnc.get(mccmnc).ok_or(PushError::CarrierNotFound)?;
+    let mut my_bundles = my_carrier.get_bundles();
+    my_bundles.shuffle(&mut thread_rng());
+    for my_bundle in my_bundles {
+        let Some(bundle) = master.mobile_device_carrier_bundles_by_product_version.get(my_bundle) else { continue };
 
-    let mut bundles = carrier.get_bundles();
-    bundles.shuffle(&mut thread_rng());
+        let bundles_by_version: HashMap<String, MobileCarrierBundle> = plist::from_value(bundle)?;
+        let Some(latest) = bundles_by_version.keys().max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0)) else { continue };
+        let Some(latest_url) = &bundles_by_version[latest].bundle_url else { continue };
 
-    for bundle in bundles {
-        let Some(bundle) = parsed.mobile_device_carrier_bundles_by_product_version.get(bundle) else { continue };
-        let bundle: HashMap<String, MobileCarrierBundle> = plist::from_value(bundle)?;
-        let Some(latest) = bundle.keys().max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0)) else { continue };
+        let zipped = client.get(latest_url)
+            .send().await?;
+        let mut cursor = Cursor::new(zipped.bytes().await?);
+        let mut archive = zip::ZipArchive::new(&mut cursor)?;
 
-        let Some(url) = &bundle.get(latest).unwrap().bundle_url else { continue };
-
-        info!("Fetching carrier config from {url}");
-
-        let data = client.get(url).send().await?.bytes().await?;
-        let mut reader = Cursor::new(data);
-        let mut zip = zip::ZipArchive::new(&mut reader)?;
-
-        let Some(carrier) = zip.file_names().find(|name| name.starts_with("Payload/") && name.ends_with("/carrier.plist")) else { continue };
-        
+        let Some(carrier) = archive.file_names().find(|name| name.starts_with("Payload/") && name.ends_with("/carrier.plist")) else { continue };
         let mut out = vec![];
-        zip.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
-        let parsed_file: Carrier = plist::from_bytes(&out)?;
+        archive.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
 
+        let parsed_file: Carrier = plist::from_bytes(&out)?;
         return Ok(parsed_file.phone_number_registration_gateway_address)
     }
 
