@@ -97,12 +97,12 @@ pub fn get_reqwest() -> &'static Client {
             builder = builder.add_root_certificate(certificate);
         }
     
-        let builder = reqwest::Client::builder()
-            .use_rustls_tls()
-            .proxy(Proxy::https("https://localhost:8080").unwrap())
-            .default_headers(headers)
-            .http1_title_case_headers()
-            .danger_accept_invalid_certs(true);
+        // let builder = reqwest::Client::builder()
+        //     .use_rustls_tls()
+        //     .proxy(Proxy::https("https://localhost:8080").unwrap())
+        //     .default_headers(headers)
+        //     .http1_title_case_headers()
+        //     .danger_accept_invalid_certs(true);
         
         builder.build().unwrap()
     })

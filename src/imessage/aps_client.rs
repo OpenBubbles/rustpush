@@ -1,6 +1,6 @@
 use std::{path::PathBuf, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use plist::{Data, Value};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
@@ -21,11 +21,11 @@ pub struct MadridRecvMessage {
     #[serde(rename = "e")]
     pub ns_since_epoch: u64,
 
-    #[serde(rename = "U", deserialize_with = "bin_deserialize_opt_vec")]
+    #[serde(default, rename = "U", deserialize_with = "bin_deserialize_opt_vec")]
     pub uuid: Option<Vec<u8>>,
     #[serde(rename = "sP")]
     pub sender: Option<String>,
-    #[serde(rename = "t", deserialize_with = "bin_deserialize_opt_vec")]
+    #[serde(default, rename = "t", deserialize_with = "bin_deserialize_opt_vec")]
     pub token: Option<Vec<u8>>,
     #[serde(rename = "tP")]
     pub target: Option<String>,
@@ -42,7 +42,7 @@ pub struct MadridRecvMessage {
     #[serde(rename = "p")]
     message_unenc: Option<Value>,
 
-    #[serde(rename = "P", deserialize_with = "bin_deserialize_opt_vec")]
+    #[serde(default, rename = "P", deserialize_with = "bin_deserialize_opt_vec")]
     message: Option<Vec<u8>>,
 
     // for confirm
@@ -291,11 +291,15 @@ impl IMClient {
 
         let handle = message.sender.as_ref().unwrap().to_string();
         let ident_cache = self.identity.cache.lock().await;
-        let message_targets = if let Some(message_targets) = &message.target {
+        let mut message_targets = if let Some(message_targets) = &message.target {
             ident_cache.get_targets(&handle, &targets, message_targets)?
         } else {
             ident_cache.get_participants_targets(&handle, &targets)
         };
+
+        // do not send to self
+        let my_token = self.conn.get_token().await;
+        message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
         
         self.send_targets(message, &message_targets).await
     }
