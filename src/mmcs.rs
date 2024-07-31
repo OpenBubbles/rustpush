@@ -1,7 +1,7 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
-use log::{info, warn};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{encode_hex, get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
+use log::{debug, info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
 use prost::Message;
@@ -200,6 +200,7 @@ impl Container for MMCSPutContainer {
         let result = self.hasher.finish()?;
         
         return Ok(if complete_req_at_edge(self.target.request.as_ref().unwrap()) {
+            debug!("MMCS complete at edge");
             let footer = mmcsp::PutFooter {
                 md5_sum: result.to_vec(),
                 confirm_data: self.finish_binary.clone()
@@ -218,10 +219,12 @@ impl Container for MMCSPutContainer {
             }
             self.sender = None;
             let reader = self.finalize.take().unwrap().await.unwrap()?;
-            reader.bytes().await?;
+
+            debug!("mmcs response {}", encode_hex(&reader.bytes().await?));
 
             None
         } else {
+            debug!("MMCS complete normal");
             self.sender = None;
             let reader = self.finalize.take().unwrap().await.unwrap()?;
             let confirmed = confirm_for_resp(&reader, &get_container_url(&self.target.request.as_ref().unwrap()), &self.target.cl_auth_p2, Some(&result));
@@ -238,6 +241,8 @@ impl Container for MMCSPutContainer {
             if !resp.status().is_success() {
                 return Err(PushError::MMCSUploadFailed(resp.status().as_u16()));
             }
+
+            debug!("mmcs response {}", encode_hex(&resp.bytes().await?));
 
             None
         })
@@ -656,6 +661,8 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnectionR
         i: msg_id,
         signature: sig.to_vec().into()
     };
+
+    info!("mmcs obj {} sig {}", object, encode_hex(sig));
     
     let binary = plist_to_bin(&request_download)?;
     let recv = apns.subscribe().await;
@@ -675,9 +682,19 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnectionR
     let apns_response: MMCSDownloadResponse = plist::from_value(&reader).unwrap();
 
     let data: Vec<u8> = apns_response.response.clone().into();
+    debug!("get response hex {}", encode_hex(&data));
     let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(data)).unwrap();
 
-    let total_bytes = response.f1.as_ref().unwrap().containers.iter()
+    if response.f1.is_none() {
+        let Some(authorize_get_response::Error { 
+            f2: Some(authorize_get_response::error::F2 { reason })
+        }) = response.error else {
+            return Err(PushError::MMCSGetFailed(None))
+        };
+        return Err(PushError::MMCSGetFailed(Some(reason)))
+    }
+
+    let total_bytes = response.f1.as_ref().expect("no container list?").containers.iter()
         .fold(0, |acc, container| acc + 
                 container.chunks.iter().fold(0, |acc, chunk| acc + chunk.meta.as_ref().unwrap().size)) as usize;
     

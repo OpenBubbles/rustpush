@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, init_logger, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MessageInst, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MessageInst, MacOSConfig, Message, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -41,7 +41,10 @@ async fn read_input() -> String {
 
 #[tokio::main(worker_threads = 1)]
 async fn main() {
-    init_logger();
+    if let Err(_) = std::env::var("RUST_LOG") {
+        std::env::set_var("RUST_LOG", "debug");
+    }
+    pretty_env_logger::try_init().unwrap();
 
     // info!("here {}", get_gateways_for_mccmnc("310160").await.unwrap());
 

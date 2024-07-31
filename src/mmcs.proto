@@ -89,7 +89,14 @@ message AuthorizeGetResponse {
         repeated Container containers = 1;
         ChunkReferences references = 2;
     }
+    message Error {
+        message F2 {
+            string reason = 3;
+        }
+        F2 f2 = 2;
+    }
     F1 f1 = 1;
+    Error error = 2;
     uint32 f = 4;
 }
 

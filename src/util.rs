@@ -72,6 +72,19 @@ pub fn get_reqwest_system() -> &'static Client {
     })
 }
 
+fn build_proxy() -> Client {
+    let mut headers = HeaderMap::new();
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .proxy(Proxy::https("https://192.168.99.43:8080").unwrap())
+        .default_headers(headers)
+        .http1_title_case_headers()
+        .danger_accept_invalid_certs(true)
+        .build().unwrap()
+}
+
 pub fn get_reqwest() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
 
@@ -96,14 +109,7 @@ pub fn get_reqwest() -> &'static Client {
         for certificate in certificates.into_iter() {
             builder = builder.add_root_certificate(certificate);
         }
-    
-        // let builder = reqwest::Client::builder()
-        //     .use_rustls_tls()
-        //     .proxy(Proxy::https("https://localhost:8080").unwrap())
-        //     .default_headers(headers)
-        //     .http1_title_case_headers()
-        //     .danger_accept_invalid_certs(true);
-        
+
         builder.build().unwrap()
     })
 }

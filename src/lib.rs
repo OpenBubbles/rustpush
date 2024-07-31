@@ -69,15 +69,3 @@ pub trait OSConfig: Sync + Send {
 
 extern crate pretty_env_logger;
 extern crate log;
-
-//not sure if this can be called outside of this library and still have it work
-pub fn init_logger() {
-    // default WARN level
-    if let Err(_) = std::env::var("RUST_LOG") {
-        std::env::set_var("RUST_LOG", "debug");
-    }
-    let res = pretty_env_logger::try_init();
-    if res.is_err() {
-        println!("{}", res.unwrap_err())
-    }
-}

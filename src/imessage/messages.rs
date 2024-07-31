@@ -795,7 +795,6 @@ pub enum AttachmentType {
 }
 
 #[repr(C)]
-
 pub struct Attachment {
     a_type: AttachmentType,
     part: u64,

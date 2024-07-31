@@ -52,6 +52,8 @@ pub enum PushError {
     BadMsg,
     #[error("MMCS Upload failed {0}")]
     MMCSUploadFailed(u16),
+    #[error("MMCS GET failed {0:?}")]
+    MMCSGetFailed(Option<String>),
     #[error("Failed to authenticate. Try logging in to appleid.apple.com to fix your Apple ID or create a new one.")]
     LoginUnauthorized,
     #[error("Bad auth cert {0}")]
