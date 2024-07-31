@@ -154,7 +154,7 @@ impl IMClient {
 
     pub async fn receive_wait(&self) -> Result<Option<MessageInst>, PushError> {
         let mut filter = get_message(|load| {
-            println!("recv {:?}", load);
+            debug!("recv {:?}", load);
             let parsed: MadridRecvMessage = plist::from_value(&load).ok()?;
             if SUPPORTED_COMMANDS.contains(&parsed.command) {
                     Some(parsed)

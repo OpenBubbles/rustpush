@@ -141,8 +141,8 @@ pub trait IDSIdentity<T>
 
     fn hash(&self) -> Result<[u8; 32], PushError> {
         Ok(sha256(&[
-            self.encode_enc()?,
             self.encode_sig()?,
+            self.encode_enc()?,
         ].concat()))
     }
 }
