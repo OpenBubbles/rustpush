@@ -134,8 +134,8 @@ struct AuthApple {
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AuthPhone {
-    push_token: Data,
-    sigs: Vec<Data>
+    pub push_token: Data,
+    pub sigs: Vec<Data>
 }
 
 pub async fn authenticate_apple(username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {

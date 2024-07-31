@@ -258,6 +258,7 @@ impl Resource for IdentityResource {
             
             let needs_relog = matches!(err, PushError::AuthInvalid(6005));
             return Err(if needs_relog {
+                info!("Auth returns 6005, relog required!");
                 PushError::DoNotRetry(Box::new(err))
             } else {
                 err

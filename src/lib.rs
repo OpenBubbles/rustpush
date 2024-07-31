@@ -25,7 +25,7 @@ pub use imessage::messages::{MessageInst, ConversationData, Message, MessageType
 pub use imessage::aps_client::IMClient;
 pub use util::ResourceState;
 pub use imessage::user::{IDSUser, register};
-pub use auth::authenticate_apple;
+pub use auth::{authenticate_apple, authenticate_phone, AuthPhone};
 pub use error::PushError;
 #[cfg(feature = "macOS")]
 pub use macos::MacOSConfig;

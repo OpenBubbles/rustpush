@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, time::{SystemTime, UNIX_EPOCH}};
 
-use log::{debug, error};
+use log::{debug, error, info};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey}, error::ErrorStack, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::{self, Rsa}, sha::sha256, x509::X509};
 use plist::{Data, Dictionary, Value};
 use rasn::{AsnType, Decode, Encode};
@@ -373,6 +373,7 @@ impl IDSUser {
 }
 
 pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUser]) -> Result<(), PushError> {
+    info!("registering!");
     let mut user_handles = HashMap::new();
     let mut user_list = vec![];
     for user in users.iter() {
@@ -487,14 +488,16 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
 
     // update registrations
     let users_list = resp.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap()
-        .get(0).unwrap().as_dictionary().unwrap().get("users").unwrap().as_array().unwrap();
+        .get(0).unwrap().as_dictionary().unwrap().get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
     for user in users_list {
         let user_dict = user.as_dictionary().unwrap();
-        let status = user_dict.get("status").unwrap().as_signed_integer().unwrap();
+        let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
         if status == 6009 {
-            let alert = user_dict.get("alert").unwrap();
-            return Err(PushError::CustomerMessage(plist::from_value(alert)?))
+            if let Some(alert) = user_dict.get("alert") {
+                return Err(PushError::CustomerMessage(plist::from_value(alert)?))
+            }
+            return Err(PushError::RegisterFailed(status));
         }
 
         let cert = user_dict.get("cert").unwrap().as_data().unwrap();

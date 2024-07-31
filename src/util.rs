@@ -65,6 +65,7 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 pub fn get_reqwest_system() -> &'static Client {
     static SYSTEM_CLIENT: OnceLock<Client> = OnceLock::new();
     SYSTEM_CLIENT.get_or_init(|| {
+        return build_proxy();
         reqwest::Client::builder()
             .use_rustls_tls()
             .build()
@@ -89,6 +90,7 @@ pub fn get_reqwest() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
 
     CLIENT.get_or_init(|| {
+        return build_proxy();
         let certificates = vec![
             Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
             Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
@@ -370,7 +372,7 @@ pub struct ResourceManager<T: Resource> {
     refreshed_at: Mutex<SystemTime>,
     request_retries: mpsc::Sender<oneshot::Sender<Result<(), Arc<PushError>>>>,
     retry_signal: mpsc::Sender<()>,
-    death_signal: mpsc::Sender<()>,
+    death_signal: Option<mpsc::Sender<()>>,
     pub generated_signal: broadcast::Sender<()>,
     pub resource_state: Mutex<ResourceState>,
 }
@@ -385,7 +387,10 @@ impl<T: Resource> Deref for ResourceManager<T> {
 
 impl<T: Resource> Drop for ResourceManager<T> {
     fn drop(&mut self) {
-        self.death_signal.blocking_send(()).unwrap()
+        let my_ref = self.death_signal.take().expect("Death empty; already dropped?");
+        tokio::spawn(async move {
+            my_ref.send(()).await.unwrap()
+        });
     }
 }
 
@@ -422,7 +427,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             refreshed_at: Mutex::new(SystemTime::UNIX_EPOCH),
             request_retries: retry_send,
             retry_signal: sig_send,
-            death_signal: death_send,
+            death_signal: Some(death_send),
             generated_signal: generated_send.clone(),
             resource_state: Mutex::new(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }),
         });

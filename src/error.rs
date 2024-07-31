@@ -78,7 +78,7 @@ pub enum PushError {
     ResourceTimeout,
     #[error("Resource Failure")]
     ResourceFailure(#[from] Arc<PushError>),
-    #[error("Final error {0}")]
+    #[error("Do not retry {0}")]
     DoNotRetry(Box<PushError>),
     #[error("Verification Failed")]
     VerificationFailed,
