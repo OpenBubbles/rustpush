@@ -327,6 +327,12 @@ impl IDSUser {
             .bytes().await?;
 
         let parsed: Value = plist::from_bytes(&request)?;
+
+        let status = parsed.as_dictionary().unwrap()["status"].as_unsigned_integer().unwrap();
+        if status != 0 {
+            return Err(PushError::AuthInvalid(status))
+        }
+
         let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
 
         Ok(devices.iter().filter_map(|dev| {

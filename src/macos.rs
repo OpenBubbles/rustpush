@@ -131,6 +131,10 @@ impl OSConfig for MacOSConfig {
         }
     }
 
+    fn get_serial_number(&self) -> String {
+        self.inner.platform_serial_number.clone()
+    }
+
     fn get_login_url(&self) -> &'static str {
         "https://setup.icloud.com/setup/prefpane/loginDelegates"
     }

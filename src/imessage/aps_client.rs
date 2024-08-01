@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{plist_to_bin, ungzip, bin_deserialize_opt_vec}, APSMessage, ConversationData, IDSUser, MessageInst, Message, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
 
 use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::SUPPORTED_COMMANDS, user::QueryOptions};
 use std::str::FromStr;
@@ -19,7 +19,7 @@ pub struct MadridRecvMessage {
     #[serde(rename = "c")]
     pub command: u8,
     #[serde(rename = "e")]
-    pub ns_since_epoch: u64,
+    pub ns_since_epoch: Option<u64>,
 
     #[serde(default, rename = "U", deserialize_with = "bin_deserialize_opt_vec")]
     pub uuid: Option<Vec<u8>>,
@@ -55,7 +55,7 @@ impl MadridRecvMessage {
         let Self {
             sender,
             uuid: Some(uuid),
-            ns_since_epoch,
+            ns_since_epoch: Some(ns_since_epoch),
             token,
             send_delivered,
             ..
@@ -336,6 +336,7 @@ impl IMClient {
 
         let msg_id = rand::thread_rng().next_u32();
         let uuid = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
+        debug!("send_uuid {}", encode_hex(&uuid));
         for (batch, group) in groups.into_iter().enumerate() {
             let complete = SendMessage {
                 batch: batch as u8 + 1,
@@ -364,7 +365,9 @@ impl IMClient {
                 let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.50f32;
 
                 let filter = get_message(|load| {
+                    debug!("got {:?}", load);
                     let result: MadridRecvMessage = plist::from_value(&load).ok()?;
+                    debug!("parsed");
                     if result.command != 255 {
                         return None
                     }
@@ -375,7 +378,7 @@ impl IMClient {
                 let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
                     250 // wait max 250ms after "good enough" to catch any stray 5032s, to prevent a network race condition
                 } else {
-                    15000 // 15 seconds wait
+                    14000 // 14 seconds wait, to cutoff inner timeout
                 }), self.conn.wait_for_timeout(&mut messages, filter)).await else {
                     if is_good_enough {
                         warn!("timeout with {_i}/{payloads_cnt}");

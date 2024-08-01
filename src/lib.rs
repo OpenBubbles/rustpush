@@ -65,6 +65,7 @@ pub trait OSConfig: Sync + Send {
     fn get_private_data(&self) -> Dictionary;
     fn get_debug_meta(&self) -> DebugMeta;
     fn get_login_url(&self) -> &'static str;
+    fn get_serial_number(&self) -> String;
 }
 
 extern crate pretty_env_logger;

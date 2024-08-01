@@ -76,6 +76,10 @@ impl OSConfig for RelayConfig {
         self.icloud_ua.clone()
     }
 
+    fn get_serial_number(&self) -> String {
+        self.version.serial_number.clone()
+    }
+
     fn get_albert_ua(&self) -> String {
         "ApplePushService/4.0 CFNetwork/1492.0.1 Darwin/23.3.0".to_string()
     }
