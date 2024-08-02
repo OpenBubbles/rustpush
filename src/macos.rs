@@ -142,6 +142,8 @@ impl OSConfig for MacOSConfig {
         config.extra_headers.extend_from_slice(&[
             ("x-apple-client-app-name".to_string(), "Messages".to_string()),
             ("x-apple-i-client-bundle-id".to_string(), "com.apple.MobileSMS".to_string()),
+            ("x-apple-ak-context-type".to_string(), "imessage".to_string()),
+            ("x-mme-client-info".to_string(), self.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.akd/1.0)")),
         ]);
         config.extra_2fa_headers.extend_from_slice(&[
             ("x-apple-i-mlb".to_string(), self.inner.mlb.to_string()),
@@ -163,7 +165,6 @@ impl OSConfig for MacOSConfig {
             ("x-mme-country".to_string(), "US".to_string()),
             ("x-apple-i-cdp-status".to_string(), "false".to_string()),
             ("x-apple-i-device-configuration-mode".to_string(), "0".to_string()),
-            ("x-apple-ak-context-type".to_string(), "imessage".to_string()),
             ("x-apple-i-cfu-state".to_string(), "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPgo8YXJyYXkvPgo8L3BsaXN0Pgo=".to_string()),
         ]);
         config

@@ -127,27 +127,28 @@ async fn main() {
         print!("Username: ");
         std::io::stdout().flush().unwrap();
         let username = read_input().await;
-        print!("Password: ");
-        std::io::stdout().flush().unwrap();
-        let password = read_input().await;
+        // print!("Password: ");
+        // std::io::stdout().flush().unwrap();
+        // let password = read_input().await;
 
         let user_trimmed = username.trim().to_string();
-        let pw_trimmed = password.trim().to_string();
+        // let pw_trimmed = password.trim().to_string();
 
-        let user_two = user_trimmed.clone();
-        let appleid_closure = move || (user_two.clone(), pw_trimmed.clone());
-        // ask console for 2fa code, make sure it is only 6 digits, no extra characters
-        let tfa_closure = || {
-            println!("Enter 2FA code: ");
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input).unwrap();
-            input.trim().to_string()
-        };
-        let acc = AppleAccount::login(appleid_closure, tfa_closure, config.get_anisette_config()
-            .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
+        // let user_two = user_trimmed.clone();
+        // let appleid_closure = move || (user_two.clone(), pw_trimmed.clone());
+        // // ask console for 2fa code, make sure it is only 6 digits, no extra characters
+        // let tfa_closure = || {
+        //     println!("Enter 2FA code: ");
+        //     let mut input = String::new();
+        //     std::io::stdin().read_line(&mut input).unwrap();
+        //     input.trim().to_string()
+        // };
+        // let acc = AppleAccount::login(appleid_closure, tfa_closure, config.get_anisette_config()
+        //     .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
 
-        let account = acc.unwrap();
-        let pet = account.get_pet().unwrap();
+        // let account = acc.unwrap();
+        // let pet = account.get_pet().unwrap();
+        let pet = "GTuBK8IqQsTtWlVcQEYll+CcA7DhCvUycvy4PkW4/W8xbtNpJ8ZSWktKC6pTYgA7i6IPVMmbfWWQfvHZpw/xmg0UyTSIwvFtxM+fu3HDyTW4HvLwatOw1oiKDsxTFmHSK2hRYdAkamG1pBhwITzVxvoy5b2/oBbNfXs6ZiAw614oS9e4ZmnwzgHQUeRZDv1+AymG5R9MI0NXiWWeXknKqNNRTTewwhyqHNkI9VQYbkpDSW0Su9VeHmlBdw/4fatLTRKATVU45x04llskMso2Tn2pcHZ82u2fZxa3GieLgSkvP1rne0XpIQv5eT98LXPbpjSGCgw4bzT9H5or0bcGFwZzaStFz0lMpP//fDk1QLFr2msmckq8izXu8VlXBzBlM6EcOPEInwwhZO5+37k0yleyUtAhxOMWHT/so2W1nOOG+oYdTy9mBADv3C+vdVT2aj4zKfS1ITc33eq0050eLe2hQ7nrPET".to_string();
 
         let user = authenticate_apple(&user_trimmed, &pet, config.as_ref()).await.unwrap();
 

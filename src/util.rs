@@ -65,7 +65,7 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 pub fn get_reqwest_system() -> &'static Client {
     static SYSTEM_CLIENT: OnceLock<Client> = OnceLock::new();
     SYSTEM_CLIENT.get_or_init(|| {
-        return build_proxy();
+        // return build_proxy();
         reqwest::Client::builder()
             .use_rustls_tls()
             .build()
@@ -90,7 +90,7 @@ pub fn get_reqwest() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
 
     CLIENT.get_or_init(|| {
-        return build_proxy();
+        // return build_proxy();
         let certificates = vec![
             Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
             Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
