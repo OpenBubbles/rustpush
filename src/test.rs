@@ -13,6 +13,7 @@ use serde::{Serialize, Deserialize};
 use std::io::Write;
 use base64::Engine;
 use std::str::FromStr;
+use rustpush::OSConfig;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -142,7 +143,7 @@ async fn main() {
             std::io::stdin().read_line(&mut input).unwrap();
             input.trim().to_string()
         };
-        let acc = AppleAccount::login(appleid_closure, tfa_closure, AnisetteConfiguration::new()
+        let acc = AppleAccount::login(appleid_closure, tfa_closure, config.get_anisette_config()
             .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
 
         let account = acc.unwrap();

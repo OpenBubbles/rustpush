@@ -35,7 +35,7 @@ async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> 
     let resp = client.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_icloud_ua())
-            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo())
+            .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
             .basic_auth(username, Some(pet))
             .body(plist_to_string(&request)?)
             .send()

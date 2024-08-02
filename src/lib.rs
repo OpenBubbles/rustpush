@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
+use icloud_auth::AnisetteConfiguration;
 pub use imessage::messages::{MessageInst, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::IMClient;
 pub use util::ResourceState;
@@ -58,7 +59,7 @@ pub trait OSConfig: Sync + Send {
     fn get_register_meta(&self) -> RegisterMeta;
     fn get_icloud_ua(&self) -> String;
     fn get_albert_ua(&self) -> String;
-    fn get_mme_clientinfo(&self) -> String;
+    fn get_mme_clientinfo(&self, for_item: &str) -> String;
     fn get_version_ua(&self) -> String;
     fn get_device_name(&self) -> String;
     fn get_device_uuid(&self) -> String;
@@ -66,6 +67,8 @@ pub trait OSConfig: Sync + Send {
     fn get_debug_meta(&self) -> DebugMeta;
     fn get_login_url(&self) -> &'static str;
     fn get_serial_number(&self) -> String;
+    fn get_anisette_config(&self) -> AnisetteConfiguration;
+    fn get_aoskit_version(&self) -> String;
 }
 
 extern crate pretty_env_logger;

@@ -131,6 +131,8 @@ impl IMClient {
 
         if let Err(_) = tokio::time::timeout(Duration::from_millis(500), conn.wait_for_timeout(conn.subscribe().await,
             |msg| if let APSMessage::NoStorage = msg { Some(()) } else { None })).await {
+
+            debug!("Flushing cache!");
             
             #[derive(Serialize)]
             struct FlushCacheMsg {
