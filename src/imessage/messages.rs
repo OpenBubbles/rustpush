@@ -376,7 +376,8 @@ pub struct NormalMessage {
     pub effect: Option<String>,
     pub reply_guid: Option<String>,
     pub reply_part: Option<String>,
-    pub service: MessageType
+    pub service: MessageType,
+    pub subject: Option<String>,
 }
 
 impl NormalMessage {
@@ -390,7 +391,8 @@ impl NormalMessage {
             effect: None,
             reply_guid: None,
             reply_part: None,
-            service
+            service,
+            subject: None,
         }
     }
 }
@@ -1184,7 +1186,8 @@ impl MessageInst {
                     reply: None,
                     inline0: None,
                     inline1: None,
-                    live_xml: None
+                    live_xml: None,
+                    subject: None,
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -1244,7 +1247,8 @@ impl MessageInst {
                             reply: normal.reply_guid.as_ref().map(|guid| format!("r:{}:{}", normal.reply_part.as_ref().unwrap(), guid)),
                             inline0: None,
                             inline1: None,
-                            live_xml: None
+                            live_xml: None,
+                            subject: normal.subject.clone(),
                         };
         
                         if normal.parts.is_multipart() {
@@ -1548,7 +1552,8 @@ impl MessageInst {
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
                         using_number: format!("tel:{}", loaded.recieved_number),
                         from_handle: Some(loaded.sender.clone()),
-                    }
+                    },
+                    subject: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -1573,7 +1578,8 @@ impl MessageInst {
                     is_phone: false, // if we are recieving a outgoing message, we must not be the phone
                     using_number: wrapper.sender.clone().unwrap(),
                     from_handle: None,
-                }
+                },
+                subject: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -1600,7 +1606,8 @@ impl MessageInst {
                 effect: loaded.effect.clone(),
                 reply_guid: replies.as_ref().map(|r| r.0.clone()),
                 reply_part: replies.as_ref().map(|r| r.1.clone()),
-                service: MessageType::IMessage
+                service: MessageType::IMessage,
+                subject: loaded.subject.clone(),
             }))
         }
         Err(PushError::BadMsg)

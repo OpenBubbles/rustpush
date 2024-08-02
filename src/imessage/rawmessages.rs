@@ -288,6 +288,8 @@ struct RawIMessage {
     inline0: Option<Data>,
     #[serde(rename = "ia-1")]
     inline1: Option<Data>,
+    #[serde(rename = "s")]
+    subject: Option<String>,
 }
 
 
