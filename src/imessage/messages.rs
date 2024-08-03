@@ -1476,7 +1476,7 @@ impl MessageInst {
         }
         if let Ok(loaded) = plist::from_value::<RawReactMessage>(&value) {
             let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
-                .captures(&loaded.amk).unwrap();
+                .captures(&loaded.amk).ok_or(PushError::BadMsg)?;
             
             let msg = match loaded.amt {
                 1000 => {
