@@ -380,7 +380,6 @@ impl IDSUser {
 
 pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUser]) -> Result<(), PushError> {
     info!("registering!");
-    let mut user_handles = HashMap::new();
     let mut user_list = vec![];
     for user in users.iter() {
         let handles = user.get_possible_handles(aps).await?;
@@ -439,7 +438,6 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             user_data.insert("tag".to_string(), Value::String("SIM".to_string()));
         }
         user_list.push(Value::Dictionary(user_data));
-        user_handles.insert(user.user_id.clone(), handles);
     }
 
     let register_meta = config.get_register_meta();
@@ -506,21 +504,24 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             return Err(PushError::RegisterFailed(status));
         }
 
+        let mut my_handles = vec![];
+
         let cert = user_dict.get("cert").unwrap().as_data().unwrap();
         for uri in user_dict.get("uris").unwrap().as_array().unwrap() {
             let status = uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
+            let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
             if status != 0 {
-                let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
                 error!("Failed to register {uri} status {}", status);
                 return Err(PushError::RegisterFailed(status));
             }
+            my_handles.push(uri.to_string());
         }
         
         let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
         let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
         let registration = IDSRegistration {
             id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
-            handles: user_handles.remove(user_id).unwrap(),
+            handles: my_handles,
         };
 
         user.registration = Some(registration);
