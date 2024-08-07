@@ -84,4 +84,6 @@ pub enum PushError {
     VerificationFailed,
     #[error("Bag key not found")]
     BagKeyNotFound,
+    #[error("Keyed archive error {0}")]
+    KeyedArchiveError(String),
 }

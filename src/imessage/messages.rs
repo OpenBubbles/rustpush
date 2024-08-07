@@ -1,6 +1,6 @@
 
 
-use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, info, warn};
 use openssl::symm::{Cipher, Crypter};
@@ -12,7 +12,7 @@ use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
-use crate::imessage::aps_client::MadridRecvMessage;
+use crate::{imessage::aps_client::MadridRecvMessage, util::{KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -43,6 +43,7 @@ pub enum MessagePart {
     Text(String),
     Attachment(Attachment),
     Mention(String, String),
+    Object(String),
 }
 
 #[repr(C)]
@@ -157,6 +158,11 @@ impl MessageParts {
                     writer.write(XmlEvent::start_element("mention").attr("uri", uri)).unwrap();
                     writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
                     writer.write(XmlEvent::end_element()).unwrap();
+                },
+                MessagePart::Object(breadcrumb) => {
+                    let element = XmlEvent::start_element("object").attr("breadcrumbText", &breadcrumb)
+                        .attr("breadcrumbOptions", "0");
+                    writer.write(element).unwrap();
                 }
             }
             writer.write(XmlEvent::end_element()).unwrap();
@@ -210,6 +216,9 @@ impl MessageParts {
                     },
                     MessagePart::Mention(_uri, _text) => {
                         panic!("SMS doesn't support mentions!")
+                    },
+                    MessagePart::Object(_) => {
+                        panic!("SMS doesn't support balloons!")
                     }
                 })
             }
@@ -328,6 +337,21 @@ impl MessageParts {
                             });
                         }
                         staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
+                    } else if name.local_name == "object" {
+                        if staging_item.is_some() {
+                            data.push(IndexedMessagePart {
+                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
+                                idx: text_part_idx,
+                                ext: text_meta.take(),
+                            });
+                            text_part_idx = None; // objects are always top-level, so reset the thing
+                            text_meta = None;
+                        }
+                        data.push(IndexedMessagePart {
+                            part: MessagePart::Object(get_attr("breadcrumbText", None)),
+                            idx: part_idx,
+                            ext: None,
+                        })
                     }
                 },
                 Ok(reader::XmlEvent::Characters(data)) => {
@@ -354,6 +378,7 @@ impl MessageParts {
             MessagePart::Text(text) => Some(text.clone()),
             MessagePart::Attachment(_) => None,
             MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
+            MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()) // two object replacements
         }).collect::<Vec<String>>().join("")
     }
 }
@@ -369,6 +394,126 @@ pub enum MessageType {
     }
 }
 
+// defined in rawmessages.rs
+impl ExtensionApp {
+    fn from_ati(ati: &[u8], bp: Option<&[u8]>) -> Result<ExtensionApp, PushError> {
+        let raw_ext: NSArray<NSDictionary<ExtensionApp>> = plist::from_value(&KeyedArchive::expand(&ungzip(&ati)?)?)?;
+        let mut ext = raw_ext.objects.into_iter().next().unwrap().item;
+
+        if let Some(bp) = bp {
+            ext.balloon = Some(Balloon::from_raw(Balloon::unpack_raw(bp)?)?);
+        }
+
+        Ok(ext)
+    }
+
+    fn from_bp(bp: &[u8], bid: &str) -> Result<ExtensionApp, PushError> {
+        let raw = Balloon::unpack_raw(bp)?;
+
+        Ok(ExtensionApp {
+            name: raw.app_name.clone(),
+            app_id: raw.appid.clone(),
+            bundle_id: bid.to_string(),
+            balloon: Some(Balloon::from_raw(raw)?)
+        })
+    }
+
+    fn to_raw(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
+        let arr = NSArray {
+            objects: vec![NSDictionary {
+                class: NSDictionaryClass::NSDictionary,
+                item: self
+            }],
+            class: NSArrayClass::NSMutableArray,
+        };
+        let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?)?;
+        let mut balloon = None;
+        if let Some(balloon_obj) = &self.balloon {
+            balloon = Some(balloon_obj.to_raw(self)?)
+        }
+
+        Ok((collapse, balloon))
+    }
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all_fields = "kebab-case", tag = "layoutClass", content = "userInfo")]
+pub enum BalloonLayout {
+    #[serde(rename = "MSMessageTemplateLayout")]
+    TemplateLayout {
+        image_subtitle: String,
+        image_title: String,
+        caption: String,
+        secondary_subcaption: String,
+        tertiary_subcaption: String,
+        subcaption: String,
+        #[serde(rename = "$class")]
+        class: NSDictionaryClass,
+    }
+}
+
+#[repr(C)]
+pub struct Balloon {
+    url: String,
+    session: Option<String>, // UUID
+    layout: BalloonLayout,
+    ld_text: Option<String>,
+    is_live: bool,
+
+    icon: Vec<u8>,
+}
+
+impl Balloon {
+
+    fn unpack_raw(bp: &[u8]) -> Result<RawBalloonData, PushError> {
+        let unpacked: NSDictionary<RawBalloonData> = plist::from_value(&KeyedArchive::expand(&ungzip(&bp)?)?)?;
+        let NSDictionary { class: _, item: unpacked } = unpacked;
+        Ok(unpacked)
+    }
+
+    fn from_raw(unpacked: RawBalloonData) -> Result<Balloon, PushError> {
+        let uuid: Option<Uuid> = unpacked.session_identifier.map(|i| i.into());
+        Ok(Balloon {
+            url: unpacked.url.into(),
+            session: uuid.map(|u| u.to_string()),
+            layout: unpacked.layout,
+            ld_text: unpacked.ldtext,
+            is_live: unpacked.live_layout_info.is_some(),
+            icon: ungzip(&*unpacked.app_icon)?,
+        })
+    }
+
+    fn to_raw(&self, app: &ExtensionApp) -> Result<Vec<u8>, PushError> {
+        let raw = NSDictionary {
+            item: RawBalloonData {
+                ldtext: self.ld_text.clone(),
+                layout: self.layout.clone(),
+                app_icon: NSData {
+                    data: gzip(&self.icon)?.into(),
+                    class: NSDataClass::NSMutableData
+                },
+                app_name: app.name.clone(),
+                session_identifier: self.session.as_ref().map(|session| Uuid::from_str(&session).unwrap().into()),
+                live_layout_info: if self.is_live {
+                    Some(NSData {
+                        data: include_bytes!("livelayout.bplist").to_vec().into(),
+                        class: NSDataClass::NSMutableData
+                    })
+                } else { None },
+                url: NSURL {
+                    base: "$null".to_string(),
+                    relative: self.url.clone()
+                },
+                appid: app.app_id.clone(),
+            },
+            class: NSDictionaryClass::NSMutableDictionary
+        };
+
+        Ok(gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&raw)?)?)?)?)
+    }
+}
+
 // a "normal" imessage, containing multiple parts and text
 #[repr(C)]
 pub struct NormalMessage {
@@ -378,6 +523,7 @@ pub struct NormalMessage {
     pub reply_part: Option<String>,
     pub service: MessageType,
     pub subject: Option<String>,
+    pub app: Option<ExtensionApp>,
 }
 
 impl NormalMessage {
@@ -393,6 +539,7 @@ impl NormalMessage {
             reply_part: None,
             service,
             subject: None,
+            app: None,
         }
     }
 }
@@ -506,7 +653,7 @@ pub enum ReactMessageType {
         enable: bool,
     },
     Extension {
-        spec: Value,
+        spec: ExtensionApp,
         body: MessageParts
     },
 }
@@ -541,8 +688,12 @@ impl ReactMessageType {
                     )
                 }
             },
-            Self::Extension { spec: _, body } => {
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body } => {
                 body.raw_text()
+            }
+            ,
+            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body } => {
+                "\u{fffd}".to_string() // replacement character
             }
         }
     }
@@ -554,7 +705,8 @@ impl ReactMessageType {
             } else {
                 reaction.get_idx() + 3000
             },
-            Self::Extension { spec: _, body: _ } => 1000
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _ } => 1000,
+            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _ } => 2,
         }
     }
 
@@ -567,15 +719,8 @@ impl ReactMessageType {
 
     fn prid(&self) -> Option<String> {
         match self {
-            Self::React { reaction: _, enable: _ } => None,
-            Self::Extension { spec: _, body: _ } => Some("3cN".to_string()),
-        }
-    }
-
-    fn get_spec(&self) -> Option<Data> {
-        match self {
-            Self::React { reaction: _, enable: _ } => None,
-            Self::Extension { spec, body: _ } => Some(gzip(&plist_to_bin(spec).unwrap()).unwrap().into()),
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _ } => Some("3cN".to_string()),
+            _ => None,
         }
     }
 
@@ -587,12 +732,16 @@ impl ReactMessageType {
             },
         }
     }
+
+    fn is_balloon(&self) -> bool {
+        matches!(self, Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _ })
+    }
 }
 
 #[repr(C)]
 pub struct ReactMessage {
     pub to_uuid: String,
-    pub to_part: u64,
+    pub to_part: Option<u64>,
     pub reaction: ReactMessageType,
     pub to_text: String,
 }
@@ -1188,6 +1337,9 @@ impl MessageInst {
                     inline1: None,
                     live_xml: None,
                     subject: None,
+                    balloon_id: None,
+                    balloon_part: None,
+                    app_info: None,
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -1207,9 +1359,20 @@ impl MessageInst {
             },
             Message::React(react) => {
                 let text = react.get_text();
+
+                let mut balloon_id: Option<String> = None;
+                let mut balloon_part: Option<Data> = None;
+                let mut app_info: Option<Data> = None;
+                if let ReactMessageType::Extension { spec: app_obj, body: _ } = &react.reaction {
+                    let (app, balloon) = app_obj.to_raw()?;
+                    app_info = if balloon.is_none() { Some(app.into()) } else { None };
+                    balloon_part = balloon.map(|b| b.into());
+                    balloon_id = Some(app_obj.bundle_id.clone());
+                }
+
                 let raw = RawReactMessage {
                     text: text,
-                    amrln: react.to_text.len() as u64,
+                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
                     amrlc: 0,
                     amt: react.reaction.get_cmd(),
                     participants: conversation.participants.clone(),
@@ -1223,16 +1386,29 @@ impl MessageInst {
                         ams: react.to_text.clone(),
                         amc: 1
                     }).unwrap().into()) } else { None },
-                    amk: format!("p:{}/{}", react.to_part, react.to_uuid),
-                    type_spec: react.reaction.get_spec(),
+                    amk: if let Some(part) = react.to_part { format!("p:{}/{}", part, react.to_uuid) } else { react.to_uuid.clone() },
+                    type_spec: app_info,
                     xml: react.reaction.get_xml(),
                     prid: react.reaction.prid(),
+                    balloon_id,
+                    balloon_part,
+                    are: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
+                    arc: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
                 };
                 plist_to_bin(&raw).unwrap()
             },
             Message::Message (normal) => {
                 match &normal.service {
                     MessageType::IMessage => {
+                        let mut balloon_id: Option<String> = None;
+                        let mut balloon_part: Option<Data> = None;
+                        let mut app_info: Option<Data> = None;
+                        if let Some(app_obj) = &normal.app {
+                            let (app, balloon) = app_obj.to_raw()?;
+                            app_info = Some(app.into());
+                            balloon_part = balloon.map(|b| b.into());
+                            balloon_id = Some(app_obj.bundle_id.clone());
+                        }
                         let mut raw = RawIMessage {
                             text: Some(normal.parts.raw_text()),
                             xml: None,
@@ -1249,6 +1425,9 @@ impl MessageInst {
                             inline1: None,
                             live_xml: None,
                             subject: normal.subject.clone(),
+                            app_info,
+                            balloon_id,
+                            balloon_part,
                         };
         
                         if normal.parts.is_multipart() {
@@ -1475,17 +1654,33 @@ impl MessageInst {
             }), Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }));
         }
         if let Ok(loaded) = plist::from_value::<RawReactMessage>(&value) {
-            let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
-                .captures(&loaded.amk).ok_or(PushError::BadMsg)?;
+            let (to_uuid, to_part) = if loaded.amt == 2 {
+                (loaded.amk, None)
+            } else {
+                let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
+                    .captures(&loaded.amk).ok_or(PushError::BadMsg)?;
+                (target_msg_data.get(2).unwrap().as_str().to_string(), Some(target_msg_data.get(1).unwrap().as_str().parse().unwrap()))
+            };
             
             let msg = match loaded.amt {
+                2 => {
+                    let (Some(xml), Some(balloon), Some(balloon_id)) = (&loaded.xml, &loaded.balloon_part, &loaded.balloon_id) else {
+                        return Err(PushError::BadMsg)
+                    };
+                    
+                    let data = ExtensionApp::from_bp(balloon.as_ref(), balloon_id)?;
+                    ReactMessageType::Extension {
+                        spec: data,
+                        body: MessageParts::parse_parts(xml, None),
+                    }
+                },
                 1000 => {
                     let (Some(xml), Some(spec)) = (&loaded.xml, &loaded.type_spec) else {
                         return Err(PushError::BadMsg)
                     };
-                    let data: Vec<u8> = spec.clone().into();
+                    let data = ExtensionApp::from_ati(spec.as_ref(), None)?;
                     ReactMessageType::Extension {
-                        spec: plist::from_bytes(&ungzip(&data)?)?,
+                        spec: data,
                         body: MessageParts::parse_parts(xml, None),
                     }
                 },
@@ -1505,8 +1700,8 @@ impl MessageInst {
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: loaded.after_guid.clone(),
             }), Message::React(ReactMessage {
-                to_uuid: target_msg_data.get(2).unwrap().as_str().to_string(),
-                to_part: target_msg_data.get(1).unwrap().as_str().parse().unwrap(),
+                to_uuid,
+                to_part,
                 to_text: "".to_string(),
                 reaction: msg,
             }))
@@ -1554,6 +1749,7 @@ impl MessageInst {
                         from_handle: Some(loaded.sender.clone()),
                     },
                     subject: None,
+                    app: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -1580,6 +1776,7 @@ impl MessageInst {
                     from_handle: None,
                 },
                 subject: None,
+                app: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -1596,6 +1793,10 @@ impl MessageInst {
             }, |xml| {
                 MessageParts::parse_parts(xml, Some(&loaded))
             });
+            let mut app = None;
+            if let Some(app_info) = &loaded.app_info {
+                app = Some(ExtensionApp::from_ati(app_info.as_ref(), loaded.balloon_part.as_ref().map(|i| i.as_ref()))?);
+            }
             return wrapper.to_message(Some(ConversationData {
                 participants: loaded.participants.clone(),
                 cv_name: loaded.cv_name.clone(),
@@ -1608,6 +1809,7 @@ impl MessageInst {
                 reply_part: replies.as_ref().map(|r| r.1.clone()),
                 service: MessageType::IMessage,
                 subject: loaded.subject.clone(),
+                app,
             }))
         }
         Err(PushError::BadMsg)

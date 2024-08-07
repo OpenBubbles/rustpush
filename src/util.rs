@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::Deref;
@@ -12,16 +12,18 @@ use log::{debug, info};
 use openssl::ec::EcKey;
 use openssl::pkey::{Private, Public};
 use openssl::rsa::Rsa;
-use plist::{Data, Dictionary, Error, Value};
+use plist::{Data, Dictionary, Error, Uid, Value};
 use base64::Engine;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
+use serde::de::value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::select;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_rustls::client;
+use uuid::Uuid;
 use std::io::{Write, Read};
 use std::fmt::{Display, Write as FmtWrite};
 
@@ -513,4 +515,375 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
 }
+
+
+#[derive(Serialize, Deserialize)]
+struct KeyedArchiveTop {
+    root: Uid,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyedArchiveClass {
+    #[serde(rename = "$classname")]
+    classname: String,
+    #[serde(rename = "$classes")]
+    classes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct KeyedArchive {
+    #[serde(rename = "$version")]
+    version: u64,
+    #[serde(rename = "$objects")]
+    objects: Vec<Value>,
+    #[serde(rename = "$archiver")]
+    archiver: String,
+    #[serde(rename = "$top")]
+    top: KeyedArchiveTop,
+
+    #[serde(skip)]
+    class_uids: HashMap<String, (Uid, &'static ClassData)>,
+}
+
+struct ClassData {
+    name: &'static str,
+    classes: &'static [&'static str],
+    uid_fields: &'static [&'static str],
+}
+
+const CLASS_SPECS: &[ClassData] = &[
+    ClassData {
+        name: "NSMutableDictionary",
+        classes: &["NSMutableDictionary", "NSDictionary", "NSObject"],
+        uid_fields: &[],
+    },
+    ClassData {
+        name: "NSDictionary",
+        classes: &["NSDictionary", "NSObject"],
+        uid_fields: &[],
+    },
+    ClassData {
+        name: "NSURL",
+        classes: &["NSURL", "NSObject"],
+        uid_fields: &["NS.base", "NS.relative"],
+    },
+    ClassData {
+        name: "NSMutableData",
+        classes: &["NSMutableData", "NSData", "NSObject"],
+        uid_fields: &[],
+    },
+    ClassData {
+        name: "NSUUID",
+        classes: &["NSUUID", "NSObject"],
+        uid_fields: &[],
+    },
+    ClassData {
+        name: "NSMutableArray",
+        classes: &["NSMutableArray", "NSArray", "NSObject"],
+        uid_fields: &["NS.objects"],
+    },
+];
+
+impl Default for KeyedArchive {
+    fn default() -> Self {
+        KeyedArchive {
+            version: 100000,
+            objects: vec![Value::String("$null".to_string())],
+            archiver: "NSKeyedArchiver".to_string(),
+            top: KeyedArchiveTop {
+                root: Uid::new(0)
+            },
+            class_uids: HashMap::new(),
+        }
+    }
+}
+
+impl KeyedArchive {
+    pub fn expand(archive: &[u8]) -> Result<Value, PushError> {
+        let parsed: KeyedArchive = plist::from_bytes(archive)?;
+
+        parsed.expand_key(parsed.top.root)
+    }
+
+    fn expand_dict(&self, value: &Value) -> Result<Dictionary, PushError> {
+        #[derive(Serialize, Deserialize, Default)]
+        struct ArchiveDict {
+            #[serde(rename = "NS.keys")]
+            keys: Vec<String>,
+            #[serde(rename = "NS.objects")]
+            objects: Vec<Value>,
+        }
+        
+        let dict: ArchiveDict = plist::from_value(&value)?;
+        
+        let mut second = dict.objects.into_iter();
+        let mut dict_result = Dictionary::new();
+        for key in dict.keys.into_iter() {
+            dict_result.insert(key, second.next().expect("different lengths?"));
+        }
+
+        Ok(dict_result)
+    }
+
+    fn expand_obj(&self, obj: &mut Value) -> Result<(), PushError> {
+        let mut my_class = None;
+        match obj {
+            Value::Array(items) => {
+                for item in items {
+                    self.expand_obj(item)?
+                }
+            },
+            Value::Dictionary(dict) => {
+                for (key, item) in dict.iter_mut() {
+                    if let ("$class", Value::Uid(uid)) = (key.as_str(), &item) {
+                        let class: KeyedArchiveClass = plist::from_value(&self.objects[uid.get() as usize])?;
+                        my_class = Some(class.classname.clone());
+                        *item = Value::String(class.classname);
+                        continue;
+                    }
+                    self.expand_obj(item)?
+                }
+            },
+            Value::Uid(uid) => {
+                *obj = self.expand_key(*uid)?;
+            },
+            _ => { /* nothing to do */ }
+        }
+
+        match my_class.as_ref().map(|i| i.as_str()) {
+            Some("NSMutableDictionary") | Some("NSDictionary") => {
+                let mut dict = self.expand_dict(obj)?;
+                dict.insert("$class".to_string(), Value::String(my_class.clone().unwrap()));
+                *obj = Value::Dictionary(dict);
+            },
+            _ => { /* nothing to do */ }
+        }
+
+        Ok(())
+    }
+
+    fn expand_key(&self, key: Uid) -> Result<Value, PushError> {
+        let mut obj = self.objects[key.get() as usize].clone();
+
+        self.expand_obj(&mut obj)?;
+
+        Ok(obj)
+    }
+
+    fn archive_dict(&mut self, dict: Dictionary, class: &str) -> Result<Value, PushError> {
+        #[derive(Serialize, Deserialize, Default)]
+        struct ArchiveDict {
+            #[serde(rename = "NS.keys")]
+            keys: Vec<Uid>,
+            #[serde(rename = "NS.objects")]
+            objects: Vec<Uid>,
+            #[serde(rename = "$class")]
+            class: Option<Uid>,
+        }
+        let mut archive = ArchiveDict::default();
+
+        for (key, item) in dict {
+            if key == "$class" {
+                continue
+            }
+            archive.keys.push(self.archive_key(Value::String(key), true)?);
+            archive.objects.push(self.archive_key(item, true)?);
+        }
+
+        archive.class = Some(self.get_class_key(class)?.0);
+
+        Ok(plist::to_value(&archive)?)
+    }
+
+    fn archive_key(&mut self, mut item: Value, archive: bool) -> Result<Uid, PushError> {
+        match &item {
+            Value::String(str) if str == "$null" => {
+                return Ok(Uid::new(0))
+            },
+            _ => {}
+        }
+        if archive {
+            self.archive_obj(&mut item)?;
+        }
+        let new_id = self.objects.len();
+        self.objects.push(item);
+        Ok(Uid::new(new_id as u64))
+    }
+
+    fn get_class_key(&mut self, class_name: &str) -> Result<(Uid, &'static ClassData), PushError> {
+        if let Some(uid) = self.class_uids.get(class_name) {
+            return Ok(*uid);
+        }
+        let spec = CLASS_SPECS.iter().find(|spec| spec.name == class_name).ok_or(PushError::KeyedArchiveError(format!("No spec found for {class_name}!")))?;
+        let class = KeyedArchiveClass {
+            classes: spec.classes.iter().map(|i| i.to_string()).collect(),
+            classname: spec.name.to_string(),
+        };
+        let key = self.archive_key(plist::to_value(&class)?, false)?;
+        self.class_uids.insert(class_name.to_string(), (key, spec));
+        Ok((key, spec))
+    }
+
+    fn archive_obj(&mut self, item: &mut Value) -> Result<(), PushError> {
+        match item {
+            Value::Dictionary(dict) => {
+                let Some(Value::String(class)) = dict.get("$class") else { panic!("No class?") };
+                match class.as_str() {
+                    "NSMutableDictionary" | "NSDictionary" => {
+                        *item = self.archive_dict(dict.clone(), class)?;
+                    },
+                    _class => {
+                        let (uid, class) = self.get_class_key(&_class)?;
+                        dict.insert("$class".to_string(), Value::Uid(uid));
+                        for item in class.uid_fields {
+                            let Some(item_value) = dict.get(*item) else { continue };
+                            dict.insert(item.to_string(), Value::Uid(self.archive_key(item_value.clone(), true)?));
+                        }
+                    }
+                }
+            },
+            Value::Array(arr) => {
+                for item in arr {
+                    self.archive_obj(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn archive_item(item: Value) -> Result<Value, PushError> {
+        if let Ok(archive) = plist_to_string(&item) { debug!("archiving {}", archive); }
+        let mut archive = KeyedArchive::default();
+
+        let key = archive.archive_key(item, true)?;
+        archive.top.root = key;
+
+        Ok(plist::to_value(&archive)?)
+    }
+
+}
+
+
+#[derive(Serialize, Deserialize)]
+pub enum NSArrayClass {
+    NSArray,
+    NSMutableArray,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct NSArray<T> {
+    #[serde(rename = "NS.objects")]
+    pub objects: Vec<T>,
+    #[serde(rename = "$class")]
+    pub class: NSArrayClass,
+}
+
+impl<T> Deref for NSArray<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.objects
+    }
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+pub enum NSDictionaryClass {
+    NSDictionary,
+    NSMutableDictionary,
+}
+
+#[derive(Deserialize)]
+pub struct NSDictionary<T> {
+    #[serde(rename = "$class")]
+    pub class: NSDictionaryClass,
+    #[serde(flatten)]
+    pub item: T,
+}
+
+impl<T: Serialize> Serialize for NSDictionary<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer {
+        let mut serialized = plist::to_value(&self.item).map_err(serde::ser::Error::custom)?;
+        let Some(dict) = serialized.as_dictionary_mut() else { panic!("not a dictionary!") };
+
+        dict.insert("$class".to_string(), plist::to_value(&self.class).map_err(serde::ser::Error::custom)?);
+        
+        serialized.serialize(serializer)
+    }
+}
+
+impl<T> Deref for NSDictionary<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum NSDataClass {
+    NSMutableData,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct NSData {
+    #[serde(rename = "NS.data")]
+    pub data: Data,
+    #[serde(rename = "$class")]
+    pub class: NSDataClass,
+}
+
+impl Deref for NSData {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.data.as_ref()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "$class")]
+pub struct NSUUID {
+    #[serde(rename = "NS.uuidbytes")]
+    data: Data,
+}
+
+impl From<Uuid> for NSUUID {
+    fn from(value: Uuid) -> Self {
+        NSUUID { data: value.into_bytes().to_vec().into() }
+    }
+}
+
+impl Into<Uuid> for NSUUID {
+    fn into(self) -> Uuid {
+        Uuid::from_bytes((*self).try_into().unwrap())
+    }
+}
+
+impl Deref for NSUUID {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.data.as_ref()
+    }
+}
+
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "$class")]
+pub struct NSURL {
+    #[serde(rename = "NS.base")]
+    pub base: String,
+    #[serde(rename = "NS.relative")]
+    pub relative: String,
+}
+
+impl Into<String> for NSURL {
+    fn into(mut self) -> String {
+        if self.base == "$null" {
+            self.base = "".to_string();
+        }
+        format!("{}{}", self.base, self.relative)
+    }
+}
+
 

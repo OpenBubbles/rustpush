@@ -1,5 +1,6 @@
-use serde::{Serialize, Deserialize};
+use serde::{Serialize, Deserialize, ser::Serializer};
 use crate::mmcs::MMCSTransferData;
+use crate::util::{NSData, NSUUID, NSURL};
 
 // raw messages used for communicating with APNs
 
@@ -103,6 +104,12 @@ struct RawReactMessage {
     xml: Option<String>,
     #[serde(rename = "pRID")]
     prid: Option<String>,
+    #[serde(rename = "bp")]
+    balloon_part: Option<Data>,
+    #[serde(rename = "bid")]
+    balloon_id: Option<String>,
+    are: Option<String>,
+    arc: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -290,6 +297,73 @@ struct RawIMessage {
     inline1: Option<Data>,
     #[serde(rename = "s")]
     subject: Option<String>,
+    #[serde(rename = "bid")]
+    balloon_id: Option<String>,
+    #[serde(rename = "bp")]
+    balloon_part: Option<Data>,
+    #[serde(rename = "ati")]
+    app_info: Option<Data>,
+}
+
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawBalloonData {
+    ldtext: Option<String>,
+    #[serde(flatten)]
+    layout: BalloonLayout,
+    #[serde(rename = "an")]
+    app_name: String,
+    #[serde(rename = "ai")]
+    app_icon: NSData,
+    session_identifier: Option<NSUUID>,
+    live_layout_info: Option<NSData>,
+    #[serde(rename = "URL")]
+    url: NSURL,
+    appid: u64,
+}
+
+impl Serialize for RawBalloonData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer {
+        let mut serialized = plist::to_value(&self.layout).map_err(serde::ser::Error::custom)?;
+        let Some(dict) = serialized.as_dictionary_mut() else { panic!("not a dictionary!") };
+
+        dict.extend([
+            ("an".to_string(), self.app_name.clone().into()),
+            ("ai".to_string(), plist::to_value(&self.app_icon).map_err(serde::ser::Error::custom)?),
+            ("URL".to_string(), plist::to_value(&self.url).map_err(serde::ser::Error::custom)?),
+            ("appid".to_string(), self.appid.into())
+        ].into_iter());
+
+        if let Some(ldtext) = &self.ldtext {
+            dict.insert("ldtext".to_string(), ldtext.clone().into());
+        }
+
+        if let Some(session_identifier) = &self.session_identifier {
+            dict.insert("sessionIdentifier".to_string(), plist::to_value(&session_identifier).map_err(serde::ser::Error::custom)?);
+        }
+
+        if let Some(live_layout_info) = &self.live_layout_info {
+            dict.insert("liveLayoutInfo".to_string(), plist::to_value(&live_layout_info).map_err(serde::ser::Error::custom)?);
+        }
+        
+        serialized.serialize(serializer)
+    }
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ExtensionApp {
+    name: String,
+    #[serde(rename = "adam-id")]
+    app_id: u64,
+    bundle_id: String,
+
+    #[serde(skip)]
+    balloon: Option<Balloon>,
 }
 
 
