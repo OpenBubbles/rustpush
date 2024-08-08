@@ -220,6 +220,12 @@ impl Container for MMCSPutContainer {
             self.sender = None;
             let reader = self.finalize.take().unwrap().await.unwrap()?;
 
+            if !reader.status().is_success() {
+                let status = reader.status().as_u16();
+                debug!("mmcs failed {status} {}", encode_hex(&reader.bytes().await?));
+                return Err(PushError::MMCSUploadFailed(status));
+            }
+
             debug!("mmcs response {}", encode_hex(&reader.bytes().await?));
 
             None
