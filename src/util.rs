@@ -317,9 +317,25 @@ struct MobileCarrierBundle {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum CarrierAddress {
+    Gateway(String),
+    GatewayList(Vec<String>),
+}
+
+impl CarrierAddress {
+    fn vec(self) -> Vec<String> {
+        match self {
+            Self::Gateway(g) => vec![g],
+            Self::GatewayList(g) => g,
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Carrier {
-    phone_number_registration_gateway_address: String,
+    phone_number_registration_gateway_address: CarrierAddress,
 }
 
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
@@ -351,13 +367,11 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
         archive.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
 
         let parsed_file: Carrier = plist::from_bytes(&out)?;
-        return Ok(parsed_file.phone_number_registration_gateway_address)
+        return Ok(parsed_file.phone_number_registration_gateway_address.vec().choose(&mut thread_rng()).ok_or(PushError::CarrierNotFound)?.clone())
     }
 
     Err(PushError::CarrierNotFound)
 }
-
-
 
 
 

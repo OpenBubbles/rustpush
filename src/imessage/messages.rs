@@ -1546,7 +1546,7 @@ impl MessageInst {
                     et: 1,
                     part_index: msg.edit_part,
                     message: msg.tuuid.clone(),
-                    new_text: msg.new_parts.raw_text()
+                    new_text: Some(msg.new_parts.raw_text()),
                 };
 
                 plist_to_bin(&raw).unwrap()

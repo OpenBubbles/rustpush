@@ -118,7 +118,7 @@ struct RawEditMessage {
     new_html_body: String,
     et: u64,
     #[serde(rename = "t")]
-    new_text: String,
+    new_text: Option<String>,
     #[serde(rename = "epi")]
     part_index: u64,
     #[serde(rename = "emg")]
