@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{encode_hex, get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{decode_hex, encode_hex, get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
 use log::{debug, info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -338,7 +338,7 @@ pub async fn put_mmcs(source: &mut (dyn Container + Send + Sync), prepared: &Pre
             Some(loaded)
         } else { None }
     }, &["com.apple.madrid"])).await?;
-    let apns_response: MMCSUploadResponse = plist::from_value(&reader).unwrap();
+    let apns_response: MMCSUploadResponse = plist::from_value(&reader)?;
 
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(apns_response.response)).unwrap();
     let sources = vec![ChunkedContainer::new(prepared.chunk_sigs.clone(), source)];
@@ -580,19 +580,20 @@ impl MMCSGetContainer {
     }
 
     // opens an HTTP stream if not already open
-    async fn ensure_stream(&mut self) {
+    async fn ensure_stream(&mut self) -> Result<(), PushError> {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(&get_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await.unwrap();
+            let response = transfer_mmcs_container(&get_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await?;
             self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None));
             self.response = Some(response);
         }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Container for MMCSGetContainer {
     async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
-        self.ensure_stream().await;
+        self.ensure_stream().await?;
 
         let mut received = self.cacher.read_exact(len);
         while received.is_none() {
@@ -685,7 +686,7 @@ pub async fn get_mmcs(sig: &[u8], url: &str, object: &str, apns: &APSConnectionR
             Some(loaded)
         } else { None }
     }, &["com.apple.madrid"])).await?;
-    let apns_response: MMCSDownloadResponse = plist::from_value(&reader).unwrap();
+    let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
 
     let data: Vec<u8> = apns_response.response.clone().into();
     debug!("get response hex {}", encode_hex(&data));
