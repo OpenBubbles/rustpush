@@ -1,14 +1,14 @@
 
-use std::time::{Duration, SystemTime};
+use std::{collections::HashMap, time::{Duration, SystemTime}};
 
 use async_trait::async_trait;
-use icloud_auth::AnisetteConfiguration;
+use icloud_auth::{AnisetteConfiguration, LoginClientInfo};
 use open_absinthe::nac::{HardwareConfig, ValidationCtx};
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{activation::ActivationInfo, util::{get_bag, get_reqwest, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, get_reqwest, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -136,38 +136,12 @@ impl OSConfig for MacOSConfig {
         }
     }
 
-    fn get_anisette_config(&self) -> AnisetteConfiguration {
-        let mut config = AnisetteConfiguration::new()
-            .set_macos_serial(self.inner.platform_serial_number.clone());
-        config.extra_headers.extend_from_slice(&[
-            ("x-apple-client-app-name".to_string(), "Messages".to_string()),
-            ("x-apple-i-client-bundle-id".to_string(), "com.apple.MobileSMS".to_string()),
-            ("x-apple-ak-context-type".to_string(), "imessage".to_string()),
-            ("x-mme-client-info".to_string(), self.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.akd/1.0)")),
-        ]);
-        config.extra_2fa_headers.extend_from_slice(&[
-            ("x-apple-i-mlb".to_string(), self.inner.mlb.to_string()),
-            ("x-mme-client-info".to_string(), self.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)")),
-            ("x-apple-i-cdp-circle-status".to_string(), "false".to_string()),
-            ("x-apple-i-icscrec".to_string(), "true".to_string()),
-            ("user-agent".to_string(), "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string()),
-            ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
-            ("sec-fetch-site".to_string(), "same-origin".to_string()),
-            ("x-apple-requested-partition".to_string(), "0".to_string()),
-            ("x-apple-i-deviceusermode".to_string(), "0".to_string()),
-            ("x-apple-i-locale".to_string(), "en_US".to_string()),
-            ("referer".to_string(), "https://gsa.apple.com/".to_string()),
-            ("x-apple-security-upgrade-context".to_string(), "com.apple.authkit.generic".to_string()),
-            ("origin".to_string(), "https://gsa.apple.com".to_string()),
-            ("x-apple-i-prk-gen".to_string(), "true".to_string()),
-            ("sec-fetch-mode".to_string(), "cors".to_string()),
-            ("x-apple-i-ot-status".to_string(), "false".to_string()),
-            ("x-mme-country".to_string(), "US".to_string()),
-            ("x-apple-i-cdp-status".to_string(), "false".to_string()),
-            ("x-apple-i-device-configuration-mode".to_string(), "0".to_string()),
-            ("x-apple-i-cfu-state".to_string(), "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPgo8YXJyYXkvPgo8L3BsaXN0Pgo=".to_string()),
-        ]);
-        config
+    fn get_gsa_hardware_headers(&self) -> HashMap<String, String> {
+        [
+            ("X-Apple-I-MLB", self.inner.mlb.as_str()),
+            ("X-Apple-I-ROM", &encode_hex(&self.inner.rom)), // intentional lowercase
+            ("X-Apple-I-SRL-NO", &self.inner.platform_serial_number),
+        ].into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
     fn get_serial_number(&self) -> String {

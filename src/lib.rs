@@ -16,14 +16,17 @@ pub mod mmcsp {
     include!(concat!(env!("OUT_DIR"), "/mmcsp.rs"));
 }
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
-use icloud_auth::AnisetteConfiguration;
+use icloud_auth::{AnisetteConfiguration, LoginClientInfo};
 pub use imessage::messages::{MessageInst, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::IMClient;
+use openssl::conf;
+use util::encode_hex;
 pub use util::ResourceState;
 pub use imessage::user::{IDSUser, register};
 pub use auth::{authenticate_apple, authenticate_phone, AuthPhone};
@@ -67,8 +70,22 @@ pub trait OSConfig: Sync + Send {
     fn get_debug_meta(&self) -> DebugMeta;
     fn get_login_url(&self) -> &'static str;
     fn get_serial_number(&self) -> String;
-    fn get_anisette_config(&self) -> AnisetteConfiguration;
+    fn get_gsa_hardware_headers(&self) -> HashMap<String, String>;
     fn get_aoskit_version(&self) -> String;
+}
+
+pub fn get_gsa_config(push: &APSState, config: &dyn OSConfig) -> LoginClientInfo {
+    LoginClientInfo {
+        ak_context_type: "imessage".to_string(),
+        client_app_name: "Messages".to_string(),
+        client_bundle_id: "com.apple.MobileSMS".to_string(),
+        mme_client_info_akd: config.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.akd/1.0)"),
+        mme_client_info: config.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)"),
+        akd_user_agent: "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
+        browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
+        hardware_headers: config.get_gsa_hardware_headers(),
+        push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
+    }
 }
 
 extern crate pretty_env_logger;
