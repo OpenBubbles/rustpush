@@ -483,7 +483,11 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             .sign(&user.auth_keypair, KeyType::Auth, aps, Some(idx))?;
     }
 
-    let resp: Value = plist::from_bytes(&request.send(&get_reqwest()).await?.bytes().await?)?;
+    let response = request.send(&get_reqwest()).await?.bytes().await?;
+
+    debug!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
+
+    let resp: Value = plist::from_bytes(&response)?;
 
     let status = resp.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {

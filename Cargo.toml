@@ -35,6 +35,7 @@ deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
 backon = "0.4.4"
+futures = "0.3.30"
 
 [features]
 default = ["macOS"]

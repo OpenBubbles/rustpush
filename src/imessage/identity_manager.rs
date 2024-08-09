@@ -253,7 +253,9 @@ impl Resource for IdentityResource {
 
         let mut users_lock = self.users.write().await;
         
+        debug!("User locked!");
         if let Err(err) = register(self.config.as_ref(), &*self.aps.state.read().await, &mut *users_lock).await {
+            debug!("Register failed {}!", err);
             drop(users_lock);
             
             let needs_relog = matches!(err, PushError::AuthInvalid(6005));
@@ -264,6 +266,7 @@ impl Resource for IdentityResource {
                 err
             })
         }
+        debug!("Register success!");
 
         self.cache.lock().await.verity(&self.aps, &users_lock).await;
 

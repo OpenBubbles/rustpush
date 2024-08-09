@@ -1,11 +1,11 @@
-use std::{io, sync::Arc, time::SystemTimeError};
+use std::{any::Any, io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
 #[cfg(feature = "macOS")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
-use tokio::sync::broadcast::{self, error::SendError};
+use tokio::sync::{broadcast::{self, error::SendError}, Mutex};
 
 use crate::{aps::APSMessage, imessage::user::SupportAlert, util::ResourceFailure};
 
@@ -78,6 +78,8 @@ pub enum PushError {
     ResourceTimeout,
     #[error("Resource Failure")]
     ResourceFailure(#[from] Arc<PushError>),
+    #[error("Resource Panic {0}")]
+    ResourcePanic(String),
     #[error("Do not retry {0}")]
     DoNotRetry(Box<PushError>),
     #[error("Verification Failed")]

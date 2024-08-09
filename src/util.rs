@@ -29,6 +29,7 @@ use std::fmt::{Display, Write as FmtWrite};
 
 use rand::thread_rng;
 use rand::seq::SliceRandom;
+use futures::FutureExt;
 
 use crate::PushError;
 
@@ -378,6 +379,18 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
 pub trait Resource: Send + Sync + Sized {
     // resolve when resource is done
     fn generate(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send;
+
+    fn generate_unwind_safe(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send {
+        async {
+            std::panic::AssertUnwindSafe(self.generate())
+                .catch_unwind().await
+                .map_err(|e| {
+                    println!("paniced with {:?}", e.downcast_ref::<&str>());
+                    PushError::ResourcePanic(e.downcast_ref::<&str>().unwrap_or(&"failed to str!").to_string())
+                })
+                .and_then(|a| a)
+        }
+    }
 }
 
 const MAX_RESOURCE_REGEN: Duration = Duration::from_secs(15);
@@ -470,7 +483,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 current_resource.abort();
                 let mut backoff = backoff.build();
                 *loop_manager.resource_state.lock().await = ResourceState::Generating;
-                let mut result = loop_manager.resource.generate().await;
+                let mut result = loop_manager.resource.generate_unwind_safe().await;
                 while let Err(e) = result {
                     let shared_err = Arc::new(e);
                     resolve_items(Err(shared_err.clone()), &mut sig_recv);
@@ -492,7 +505,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                         }
                     };
                     *loop_manager.resource_state.lock().await = ResourceState::Generating;
-                    result = loop_manager.resource.generate().await;
+                    result = loop_manager.resource.generate_unwind_safe().await;
                 }
                 current_resource = result.unwrap();
                 *loop_manager.refreshed_at.lock().await = SystemTime::now();
