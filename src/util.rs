@@ -401,6 +401,7 @@ pub struct ResourceManager<T: Resource> {
     refreshed_at: Mutex<SystemTime>,
     request_retries: mpsc::Sender<oneshot::Sender<Result<(), Arc<PushError>>>>,
     retry_signal: mpsc::Sender<()>,
+    retry_now_signal: mpsc::Sender<()>,
     death_signal: Option<mpsc::Sender<()>>,
     pub generated_signal: broadcast::Sender<()>,
     pub resource_state: Mutex<ResourceState>,
@@ -448,6 +449,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
     pub fn new<B: BackoffBuilder + 'static>(resource: Arc<T>, backoff: B, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
         let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), Arc<PushError>>>>(99999);
         let (sig_send, mut sig_recv) = mpsc::channel(99999);
+        let (retry_now_send, mut retry_now_recv) = mpsc::channel(99999);
         let (death_send, mut death_recv) = mpsc::channel(99999);
         let (generated_send, _) = broadcast::channel(99);
 
@@ -456,6 +458,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             refreshed_at: Mutex::new(SystemTime::UNIX_EPOCH),
             request_retries: retry_send,
             retry_signal: sig_send,
+            retry_now_signal: retry_now_send,
             death_signal: Some(death_send),
             generated_signal: generated_send.clone(),
             resource_state: Mutex::new(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }),
@@ -465,8 +468,9 @@ impl<T: Resource + 'static> ResourceManager<T> {
 
         let loop_manager = manager.clone();
         tokio::spawn(async move {
-            let mut resolve_items = move |result: Result<(), Arc<PushError>>, sig_recv: &mut mpsc::Receiver<()>| {
+            let mut resolve_items = move |result: Result<(), Arc<PushError>>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
                 while let Ok(_) = sig_recv.try_recv() { }
+                while let Ok(_) = sig_recv_now.try_recv() { }
                 while let Ok(item) = retry_recv.try_recv() {
                     let _ = item.send(result.clone());
                 }
@@ -476,6 +480,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 select! {
                     _ = &mut current_resource => {},
                     _ = sig_recv.recv() => {},
+                    _ = retry_now_recv.recv() => {},
                     _ = death_recv.recv() => {
                         break // no retries
                     },
@@ -486,7 +491,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let mut result = loop_manager.resource.generate_unwind_safe().await;
                 while let Err(e) = result {
                     let shared_err = Arc::new(e);
-                    resolve_items(Err(shared_err.clone()), &mut sig_recv);
+                    resolve_items(Err(shared_err.clone()), &mut sig_recv, &mut retry_now_recv);
                     let retry_in = backoff.next().unwrap();
 
                     let is_final = matches!(*shared_err, PushError::DoNotRetry(_));
@@ -500,6 +505,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                     }
                     select! {
                         _ = tokio::time::sleep(retry_in) => {},
+                        _ = retry_now_recv.recv() => {},
                         _ = death_recv.recv() => {
                             break 'stop;
                         }
@@ -511,7 +517,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 *loop_manager.refreshed_at.lock().await = SystemTime::now();
                 *loop_manager.resource_state.lock().await = ResourceState::Generated;
                 let _ = generated_send.send(());
-                resolve_items(Ok(()), &mut sig_recv);
+                resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
             }
             debug!("Resource task closed");
         });
@@ -531,13 +537,25 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     pub async fn refresh(&self) -> Result<(), PushError> {
+        self.refresh_option(false).await
+    }
+    
+    pub async fn refresh_now(&self) -> Result<(), PushError> {
+        self.refresh_option(true).await
+    }
+
+    async fn refresh_option(&self, now: bool) -> Result<(), PushError> {
         let elapsed = self.refreshed_at.lock().await.elapsed().unwrap();
         if elapsed < MAX_RESOURCE_REGEN {
             return Ok(())
         }
         let (send, confirm) = oneshot::channel();
         self.request_retries.send(send).await.unwrap();
-        self.retry_signal.send(()).await.unwrap();
+        if now {
+            self.retry_now_signal.send(()).await.unwrap();
+        } else {
+            self.retry_signal.send(()).await.unwrap();
+        }
         Ok(tokio::time::timeout(MAX_RESOURCE_WAIT, confirm).await.map_err(|_| PushError::ResourceTimeout)?.unwrap()?)
     }
 
@@ -839,7 +857,7 @@ impl KeyedArchive {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum NSArrayClass {
     NSArray,
     NSMutableArray,

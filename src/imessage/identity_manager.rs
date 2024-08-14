@@ -314,16 +314,16 @@ impl IdentityResource {
         users_locked.iter().flat_map(|user| user.registration.as_ref().unwrap().handles.clone()).collect::<Vec<String>>()
     }
 
-    async fn schedule_rereg(&self) {
+    pub async fn calculate_rereg_time_s(&self) -> i64 {
         let users_lock = self.users.read().await;
         // reregister 5 minutes before exp
-        let next_rereg_in = users_lock.iter()
+        users_lock.iter()
             .map(|user| user.registration.as_ref().unwrap().get_exp().unwrap() - 300)
-            .min().expect("No identities!");
+            .min().expect("No identities!")
+    }
 
-        // let next_rereg_in = 10;
-
-        drop(users_lock);
+    async fn schedule_rereg(&self) {
+        let next_rereg_in = self.calculate_rereg_time_s().await;
 
         info!("Reregistering in {} seconds", next_rereg_in);
         if next_rereg_in > 0 {
