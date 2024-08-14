@@ -88,4 +88,8 @@ pub enum PushError {
     BagKeyNotFound,
     #[error("Keyed archive error {0}")]
     KeyedArchiveError(String),
+    #[error("Fetching validation data failed ({0})")]
+    RelayError(u16),
+    #[error("Relay code not found!")]
+    DeviceNotFound,
 }

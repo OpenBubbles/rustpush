@@ -137,7 +137,19 @@ impl OSConfig for RelayConfig {
             data = data.header("X-Beeper-Access-Token", token.clone());
         }
 
-        let result: DataResp = data.send().await?.json().await?;
+        let result = data.send().await?;
+
+        match result.status().as_u16() {
+            200 => {},
+            404 => {
+                return Err(PushError::DeviceNotFound)
+            },
+            _status => {
+                return Err(PushError::RelayError(_status))
+            }
+        }
+
+        let result: DataResp = result.json().await?;
 
         Ok(base64_decode(result.data))
     }
