@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
 
-use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::SUPPORTED_COMMANDS, user::QueryOptions};
+use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::{ErrorMessage, SUPPORTED_COMMANDS}, user::QueryOptions};
 use std::str::FromStr;
 use rand::RngCore;
 use async_recursion::async_recursion;
@@ -48,6 +48,15 @@ pub struct MadridRecvMessage {
     // for confirm
     #[serde(rename = "s")]
     status: Option<i64>,
+
+    #[serde(default, rename = "fU", deserialize_with = "bin_deserialize_opt_vec")]
+    error_for: Option<Vec<u8>>,
+    #[serde(rename = "fRM")]
+    error_string: Option<String>,
+    #[serde(rename = "fR")]
+    error_status: Option<u64>,
+    #[serde(rename = "fM")]
+    error_for_str: Option<String>,
 }
 
 impl MadridRecvMessage {
@@ -204,6 +213,22 @@ impl IMClient {
             } else {
                 Message::Typing
             }).ok())
+        }
+
+        // errors
+        if let MadridRecvMessage {
+            command: 120,
+            error_for: Some(_),
+            error_status: Some(error_status),
+            error_string: Some(error_string),
+            error_for_str: Some(for_str),
+            ..
+        } = &payload {
+            return Ok(payload.to_message(None, Message::Error(ErrorMessage {
+                for_uuid: for_str.clone(),
+                status: *error_status,
+                status_str: error_string.clone(),
+            })).ok())
         }
 
         // TODO rewrite
@@ -400,6 +425,12 @@ impl IMClient {
                     },
                     0 | 5008 => { /* gtg */ },
                     _status => {
+                        if let Some(target) = targets.iter().find(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) {
+                            if target.participant == handle {
+                                warn!("Failed to deliver to self device; ignoring!");
+                                continue // ignore errors sending to self devices
+                            }
+                        }
                         return Err(PushError::SendErr(_status))
                     }
                 }

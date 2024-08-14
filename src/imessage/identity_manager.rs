@@ -316,9 +316,9 @@ impl IdentityResource {
 
     async fn schedule_rereg(&self) {
         let users_lock = self.users.read().await;
-        // reregister 3 minutes before exp
+        // reregister 5 minutes before exp
         let next_rereg_in = users_lock.iter()
-            .map(|user| user.registration.as_ref().unwrap().get_exp().unwrap() - 180)
+            .map(|user| user.registration.as_ref().unwrap().get_exp().unwrap() - 300)
             .min().expect("No identities!");
 
         // let next_rereg_in = 10;

@@ -553,7 +553,7 @@ struct KeyedArchiveTop {
 struct KeyedArchiveClass {
     #[serde(rename = "$classname")]
     classname: String,
-    #[serde(rename = "$classes")]
+    #[serde(rename = "$classes", default)]
     classes: Vec<String>,
 }
 
@@ -609,6 +609,47 @@ const CLASS_SPECS: &[ClassData] = &[
         classes: &["NSMutableArray", "NSArray", "NSObject"],
         uid_fields: &["NS.objects"],
     },
+    ClassData {
+        name: "LPLinkMetadata",
+        classes: &["LPLinkMetadata", "NSObject"],
+        uid_fields: &[
+            "imageMetadata",
+            "iconMetadata",
+            "originalURL",
+            "URL",
+            "title",
+            "summary",
+            "image",
+            "icon",
+            "images",
+            "icons"
+        ]
+    },
+    ClassData {
+        name: "RichLink",
+        classes: &["RichLink", "NSObject"],
+        uid_fields: &["richLinkMetadata"],
+    },
+    ClassData {
+        name: "LPImageMetadata",
+        classes: &["LPImageMetadata", "NSObject"],
+        uid_fields: &["size", "URL"],
+    },
+    ClassData {
+        name: "LPIconMetadata",
+        classes: &["LPIconMetadata", "NSObject"],
+        uid_fields: &["URL"],
+    },
+    ClassData {
+        name: "RichLinkImageAttachmentSubstitute",
+        classes: &["RichLinkImageAttachmentSubstitute", "LPImage", "NSObject"],
+        uid_fields: &["MIMEType"],
+    },
+    ClassData {
+        name: "NSArray",
+        classes: &["NSArray", "NSObject"],
+        uid_fields: &["NS.objects"],
+    }
 ];
 
 impl Default for KeyedArchive {
@@ -763,8 +804,14 @@ impl KeyedArchive {
                         let (uid, class) = self.get_class_key(&_class)?;
                         dict.insert("$class".to_string(), Value::Uid(uid));
                         for item in class.uid_fields {
-                            let Some(item_value) = dict.get(*item) else { continue };
-                            dict.insert(item.to_string(), Value::Uid(self.archive_key(item_value.clone(), true)?));
+                            let Some(item_value) = dict.get_mut(*item) else { continue };
+                            if let Value::Array(arr) = item_value {
+                                for item in arr {
+                                    *item = Value::Uid(self.archive_key(item.clone(), true)?)
+                                }
+                            } else {
+                                *item_value = Value::Uid(self.archive_key(item_value.clone(), true)?);
+                            }
                         }
                     }
                 }
@@ -798,7 +845,8 @@ pub enum NSArrayClass {
     NSMutableArray,
 }
 
-#[derive(Serialize, Deserialize)]
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NSArray<T> {
     #[serde(rename = "NS.objects")]
     pub objects: Vec<T>,
@@ -895,7 +943,8 @@ impl Deref for NSUUID {
 }
 
 
-#[derive(Serialize, Deserialize)]
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "$class")]
 pub struct NSURL {
     #[serde(rename = "NS.base")]

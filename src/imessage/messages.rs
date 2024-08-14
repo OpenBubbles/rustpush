@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use openssl::symm::{Cipher, Crypter};
 use plist::{Data, Value};
 use regex::Regex;
@@ -524,6 +524,14 @@ pub struct NormalMessage {
     pub service: MessageType,
     pub subject: Option<String>,
     pub app: Option<ExtensionApp>,
+    pub link_meta: Option<LinkMeta>,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct LinkMeta {
+    data: LPLinkMetadata,
+    attachments: Vec<Vec<u8>>,
 }
 
 impl NormalMessage {
@@ -540,6 +548,7 @@ impl NormalMessage {
             service,
             subject: None,
             app: None,
+            link_meta: None,
         }
     }
 }
@@ -744,6 +753,13 @@ pub struct ReactMessage {
     pub to_part: Option<u64>,
     pub reaction: ReactMessageType,
     pub to_text: String,
+}
+
+#[repr(C)]
+pub struct ErrorMessage {
+    pub for_uuid: String,
+    pub status: u64,
+    pub status_str: String,
 }
 
 impl ReactMessage {
@@ -1021,6 +1037,7 @@ pub enum Message {
     MarkUnread, // send for last message from other participant
     PeerCacheInvalidate,
     UpdateExtension(UpdateExtensionMessage),
+    Error(ErrorMessage),
 }
 
 pub const SUPPORTED_COMMANDS: &[u8] = &[
@@ -1059,6 +1076,7 @@ impl Message {
             Self::MarkUnread => 111,
             Self::PeerCacheInvalidate => 130,
             Self::UpdateExtension(_) => 122,
+            Self::Error(_) => 120,
         }
     }
 
@@ -1150,6 +1168,9 @@ impl fmt::Display for Message {
             },
             Message::UpdateExtension(_) => {
                 write!(f, "updated an extension")
+            },
+            Message::Error(_) => {
+                write!(f, "failed to receive our message")
             }
         }
     }
@@ -1173,6 +1194,52 @@ pub fn add_prefix(participants: &[String]) -> Vec<String> {
 pub enum MessageTarget {
     Token(Vec<u8>),
     Uuid(String),
+}
+
+// defined in rawmessages
+impl BaseBalloonBody {
+    fn to_bin(self) -> Result<Vec<u8>, PushError> {
+        if self.attachments.len() > 0 {
+            Ok(plist_to_bin(&self)?)
+        } else {
+            Ok(self.payload.into())
+        }
+    }
+
+    fn from_bin(bin: Vec<u8>) -> Self {
+        if let Ok(parsed) = plist::from_bytes::<BaseBalloonBody>(&bin) {
+            parsed
+        } else {
+            BaseBalloonBody {
+                payload: bin.into(),
+                attachments: vec![],
+            }
+        }
+    }
+}
+
+impl Into<MMCSFile> for RawMMCSBalloon {
+    fn into(self) -> MMCSFile {
+        MMCSFile {
+            signature: self.signature.into(),
+            object: self.object,
+            url: self.url,
+            key: self.key.as_ref()[1..].to_vec(),
+            size: self.size,
+        }
+    }
+}
+
+impl From<MMCSFile> for RawMMCSBalloon {
+    fn from(value: MMCSFile) -> Self {
+        Self {
+            signature: value.signature.into(),
+            object: value.object,
+            url: value.url,
+            key: [vec![0], value.key].concat().into(),
+            size: value.size,
+        }
+    }
 }
 
 // a message that can be sent to other iMessage users
@@ -1339,6 +1406,7 @@ impl MessageInst {
                     subject: None,
                     balloon_id: None,
                     balloon_part: None,
+                    balloon_part_mmcs: None,
                     app_info: None,
                 };
         
@@ -1361,14 +1429,20 @@ impl MessageInst {
                 let text = react.get_text();
 
                 let mut balloon_id: Option<String> = None;
-                let mut balloon_part: Option<Data> = None;
+                let mut balloon_part: Option<Vec<u8>> = None;
                 let mut app_info: Option<Data> = None;
                 if let ReactMessageType::Extension { spec: app_obj, body: _ } = &react.reaction {
                     let (app, balloon) = app_obj.to_raw()?;
                     app_info = if balloon.is_none() { Some(app.into()) } else { None };
-                    balloon_part = balloon.map(|b| b.into());
+                    balloon_part = balloon;
                     balloon_id = Some(app_obj.bundle_id.clone());
                 }
+
+                let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part {
+                    Self::put_balloon(balloon_part, apns).await?
+                } else {
+                    (None, None)
+                };
 
                 let raw = RawReactMessage {
                     text: text,
@@ -1392,6 +1466,7 @@ impl MessageInst {
                     prid: react.reaction.prid(),
                     balloon_id,
                     balloon_part,
+                    balloon_part_mmcs,
                     are: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
                     arc: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
                 };
@@ -1401,14 +1476,29 @@ impl MessageInst {
                 match &normal.service {
                     MessageType::IMessage => {
                         let mut balloon_id: Option<String> = None;
-                        let mut balloon_part: Option<Data> = None;
+                        let mut balloon_part: Option<Vec<u8>> = None;
                         let mut app_info: Option<Data> = None;
                         if let Some(app_obj) = &normal.app {
                             let (app, balloon) = app_obj.to_raw()?;
                             app_info = Some(app.into());
-                            balloon_part = balloon.map(|b| b.into());
+                            balloon_part = balloon;
                             balloon_id = Some(app_obj.bundle_id.clone());
                         }
+                        if let Some(link_meta) = &normal.link_meta {
+                            balloon_id = Some("com.apple.messages.URLBalloonProvider".to_string());
+                            balloon_part = Some(gzip(&BaseBalloonBody {
+                                attachments: link_meta.attachments.clone().into_iter().map(|i| i.into()).collect(),
+                                payload: plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&RichLink {
+                                    rich_link_is_placeholder: true,
+                                    rich_link_metadata: link_meta.data.clone(),
+                                })?)?)?.into(),
+                            }.to_bin()?)?);
+                        }
+                        let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part {
+                            Self::put_balloon(balloon_part, apns).await?
+                        } else {
+                            (None, None)
+                        };
                         let mut raw = RawIMessage {
                             text: Some(normal.parts.raw_text()),
                             xml: None,
@@ -1428,6 +1518,7 @@ impl MessageInst {
                             app_info,
                             balloon_id,
                             balloon_part,
+                            balloon_part_mmcs,
                         };
         
                         if normal.parts.is_multipart() {
@@ -1530,6 +1621,7 @@ impl MessageInst {
             Message::Typing => panic!("no enc body!"),
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
+            Message::Error(_) => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {
                     rs: true,
@@ -1588,6 +1680,41 @@ impl MessageInst {
         };
 
         Ok(final_msg)
+    }
+
+    async fn get_balloon(part: Option<Data>, mmcs: Option<RawMMCSBalloon>, apns: &APSConnectionResource) -> Option<Vec<u8>> {
+        match (part, mmcs) {
+            (Some(part), None) => Some(part.into()),
+            (None, Some(mmcs)) => {
+                let mmcs: MMCSFile = mmcs.into();
+
+                let mut output: Vec<u8> = vec![];
+                let mut cursor = Cursor::new(&mut output);
+                if let Err(e) = mmcs.get_attachment(apns, &mut cursor, &mut |_,_| {}).await {
+                    error!("failed to mmcs balloon {e}");
+                    return None
+                }
+                Some(output)
+            },
+            (None, None) => None,
+            _ => {
+                error!("bad combo!");
+                None
+            }
+        }
+    }
+
+    async fn put_balloon(balloon: Vec<u8>, apns: &APSConnectionResource) -> Result<(Option<Data>, Option<RawMMCSBalloon>), PushError> {
+        debug!("balloon size {:?}", balloon.len());
+        if balloon.len() > 7168 {
+            let mut cursor = Cursor::new(&balloon);
+            let prepared = MMCSFile::prepare_put(&mut cursor).await?;
+            cursor.rewind()?;
+            let mmcs = MMCSFile::new(apns, &prepared, &mut cursor, &mut |_,_| {}).await?;
+            Ok((None, Some(mmcs.into())))
+        } else {
+            Ok((Some(balloon.into()), None))
+        }
     }
 
     #[async_recursion]
@@ -1664,11 +1791,12 @@ impl MessageInst {
             
             let msg = match loaded.amt {
                 2 => {
-                    let (Some(xml), Some(balloon), Some(balloon_id)) = (&loaded.xml, &loaded.balloon_part, &loaded.balloon_id) else {
+                    let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
+                    let (Some(xml), Some(balloon), Some(balloon_id)) = (&loaded.xml, &balloon_part, &loaded.balloon_id) else {
                         return Err(PushError::BadMsg)
                     };
                     
-                    let data = ExtensionApp::from_bp(balloon.as_ref(), balloon_id)?;
+                    let data = ExtensionApp::from_bp(balloon, balloon_id)?;
                     ReactMessageType::Extension {
                         spec: data,
                         body: MessageParts::parse_parts(xml, None),
@@ -1750,6 +1878,7 @@ impl MessageInst {
                     },
                     subject: None,
                     app: None,
+                    link_meta: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -1777,6 +1906,7 @@ impl MessageInst {
                 },
                 subject: None,
                 app: None,
+                link_meta: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -1793,10 +1923,35 @@ impl MessageInst {
             }, |xml| {
                 MessageParts::parse_parts(xml, Some(&loaded))
             });
+            
+            let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
             let mut app = None;
             if let Some(app_info) = &loaded.app_info {
-                app = Some(ExtensionApp::from_ati(app_info.as_ref(), loaded.balloon_part.as_ref().map(|i| i.as_ref()))?);
+                app = Some(ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref()))?);
             }
+            let mut link_meta = None;
+            if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (loaded.balloon_id.as_deref(), balloon_part) {
+                match (|| {
+                    debug!("a");
+                    let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
+                    debug!("b");
+                    let payload: RichLink = plist::from_value(&KeyedArchive::expand(unpacked.payload.as_ref())?)?;
+                    debug!("c");
+                    Ok::<_, PushError>((unpacked, payload))
+                })() {
+                    Ok((unpacked, payload)) => {
+                        debug!("d");
+                        link_meta = Some(LinkMeta {
+                            data: payload.rich_link_metadata,
+                            attachments: unpacked.attachments.into_iter().map(|i| i.into()).collect(),
+                        });
+                    },
+                    Err(e) => {
+                        error!("Error parsing url preview! {e}");
+                    }
+                }
+            }
+            debug!("e");
             return wrapper.to_message(Some(ConversationData {
                 participants: loaded.participants.clone(),
                 cv_name: loaded.cv_name.clone(),
@@ -1810,6 +1965,7 @@ impl MessageInst {
                 service: MessageType::IMessage,
                 subject: loaded.subject.clone(),
                 app,
+                link_meta,
             }))
         }
         Err(PushError::BadMsg)

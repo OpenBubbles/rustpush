@@ -106,6 +106,8 @@ struct RawReactMessage {
     prid: Option<String>,
     #[serde(rename = "bp")]
     balloon_part: Option<Data>,
+    #[serde(rename = "bpdi")]
+    balloon_part_mmcs: Option<RawMMCSBalloon>,
     #[serde(rename = "bid")]
     balloon_id: Option<String>,
     are: Option<String>,
@@ -269,6 +271,20 @@ struct RawMarkUnread {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawMMCSBalloon {
+    #[serde(rename = "r")]
+    url: String,
+    #[serde(rename = "s")]
+    signature: Data,
+    #[serde(rename = "e")]
+    key: Data,
+    #[serde(rename = "o")]
+    object: String,
+    #[serde(rename = "f")]
+    size: usize,
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: Option<String>,
@@ -301,6 +317,8 @@ struct RawIMessage {
     balloon_id: Option<String>,
     #[serde(rename = "bp")]
     balloon_part: Option<Data>,
+    #[serde(rename = "bpdi")]
+    balloon_part_mmcs: Option<RawMMCSBalloon>,
     #[serde(rename = "ati")]
     app_info: Option<Data>,
 }
@@ -364,6 +382,70 @@ pub struct ExtensionApp {
 
     #[serde(skip)]
     balloon: Option<Balloon>,
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", tag = "$class")]
+pub struct LPImageMetadata {
+    size: String,
+    #[serde(rename = "URL")]
+    url: NSURL,
+    version: u8,
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", tag = "$class")]
+pub struct LPIconMetadata {
+    #[serde(rename = "URL")]
+    url: NSURL,
+    version: u8,
+}
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", tag = "$class")]
+pub struct RichLinkImageAttachmentSubstitute {
+    #[serde(rename = "MIMEType")]
+    mime_type: String,
+    rich_link_image_attachment_substitute_index: u64,
+}
+
+
+#[repr(C)]
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase", tag = "$class")]
+pub struct LPLinkMetadata {
+    image_metadata: Option<LPImageMetadata>,
+    version: u8,
+    icon_metadata: Option<LPIconMetadata>,
+    #[serde(rename = "originalURL")]
+    original_url: NSURL,
+    #[serde(rename = "URL")]
+    url: Option<NSURL>,
+    title: Option<String>,
+    summary: Option<String>,
+    image: Option<RichLinkImageAttachmentSubstitute>,
+    icon: Option<RichLinkImageAttachmentSubstitute>,
+    images: Option<NSArray<LPImageMetadata>>,
+    icons: Option<NSArray<LPIconMetadata>>,
+}
+
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "$class")]
+pub struct RichLink {
+    rich_link_metadata: LPLinkMetadata,
+    rich_link_is_placeholder: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BaseBalloonBody {
+    #[serde(rename = "__payload__")]
+    payload: Data,
+    #[serde(rename = "__attachments__")]
+    attachments: Vec<Data>,
 }
 
 
