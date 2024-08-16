@@ -316,9 +316,8 @@ impl IdentityResource {
 
     pub async fn calculate_rereg_time_s(&self) -> i64 {
         let users_lock = self.users.read().await;
-        // reregister 5 minutes before exp
         users_lock.iter()
-            .map(|user| user.registration.as_ref().unwrap().get_exp().unwrap() - 300)
+            .map(|user| user.registration.as_ref().unwrap().calculate_rereg_time_s().unwrap())
             .min().expect("No identities!")
     }
 

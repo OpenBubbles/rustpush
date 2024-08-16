@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fmt::Display, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, error, info};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey}, error::ErrorStack, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::{self, Rsa}, sha::sha256, x509::X509};
@@ -56,11 +56,14 @@ impl IDSUserType {
 pub struct IDSRegistration {
     pub id_keypair: KeyPair,
     pub handles: Vec<String>, // usable handles
+    #[serde(default)]
+    pub registered_at_s: u64,
+    pub heartbeat_interval_s: Option<u64>,
 }
 
 impl IDSRegistration {
     // returns seconds valid for
-    pub fn get_exp(&self) -> Result<i64, PushError> {
+    fn get_exp(&self) -> Result<i64, PushError> {
         let x509 = X509::from_der(&self.id_keypair.cert)?;
         let expiration = x509.not_after();
 
@@ -71,6 +74,16 @@ impl IDSRegistration {
 
         let unix = Asn1Time::from_unix(since_the_epoch.as_secs().try_into().unwrap())?.as_ref().diff(expiration)?;
         Ok((unix.days as i64) * 86400 + (unix.secs as i64))
+    }
+
+    pub fn calculate_rereg_time_s(&self) -> Result<i64, PushError> {
+        Ok(if let Some(heartbeat_interval) = self.heartbeat_interval_s {
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+            (self.registered_at_s + heartbeat_interval) as i64 - now
+        } else {
+            // reregister 5 minutes before exp
+            self.get_exp()? - 300
+        })
     }
 }
 
@@ -498,6 +511,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
     let users_list = resp.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap()
         .get(0).unwrap().as_dictionary().unwrap().get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
     for user in users_list {
+        // TODO turn this into a struct
         let user_dict = user.as_dictionary().unwrap();
         let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
@@ -520,12 +534,15 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             }
             my_handles.push(uri.to_string());
         }
-        
+
+        let heartbeat_interval = user_dict.get("next-hbi").and_then(|i| i.as_unsigned_integer());
         let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
         let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
         let registration = IDSRegistration {
             id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
             handles: my_handles,
+            registered_at_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+            heartbeat_interval_s: heartbeat_interval,
         };
 
         user.registration = Some(registration);
