@@ -412,7 +412,7 @@ impl ExtensionApp {
 
         Ok(ExtensionApp {
             name: raw.app_name.clone(),
-            app_id: raw.appid.clone(),
+            app_id: Some(raw.appid.clone()),
             bundle_id: bid.to_string(),
             balloon: Some(Balloon::from_raw(raw)?)
         })
@@ -505,7 +505,7 @@ impl Balloon {
                     base: "$null".to_string(),
                     relative: self.url.clone()
                 },
-                appid: app.app_id.clone(),
+                appid: app.app_id.clone().expect("send without appid??"),
             },
             class: NSDictionaryClass::NSMutableDictionary
         };

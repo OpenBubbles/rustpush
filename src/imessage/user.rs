@@ -515,9 +515,11 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
         let user_dict = user.as_dictionary().unwrap();
         let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
-        if status == 6009 {
-            if let Some(alert) = user_dict.get("alert") {
-                return Err(PushError::CustomerMessage(plist::from_value(alert)?))
+        if status != 0 {
+            if status == 6009 {
+                if let Some(alert) = user_dict.get("alert") {
+                    return Err(PushError::CustomerMessage(plist::from_value(alert)?))
+                }
             }
             return Err(PushError::RegisterFailed(status));
         }

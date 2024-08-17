@@ -377,7 +377,7 @@ impl Serialize for RawBalloonData {
 pub struct ExtensionApp {
     name: String,
     #[serde(rename = "adam-id")]
-    app_id: u64,
+    app_id: Option<u64>,
     bundle_id: String,
 
     #[serde(skip)]
