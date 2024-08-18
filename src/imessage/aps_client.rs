@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
 
-use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::{ErrorMessage, SUPPORTED_COMMANDS}, user::QueryOptions};
+use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::{ErrorMessage, SUPPORTED_COMMANDS}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
 use rand::RngCore;
 use async_recursion::async_recursion;
@@ -91,7 +91,7 @@ pub struct IMClient {
 }
 
 impl IMClient {
-    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSUserIdentity, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         
         let _ = Self::setup_conn(&conn).await;
 
@@ -110,7 +110,7 @@ impl IMClient {
             }
         });
 
-        let identity = IdentityResource::new(users, cache_path, conn.clone(), os_config.clone()).await;
+        let identity = IdentityResource::new(users, identity, cache_path, conn.clone(), os_config.clone()).await;
 
         let mut to_refresh = identity.generated_signal.subscribe();
         let my_ident_ref = identity.resource.clone();
@@ -291,7 +291,7 @@ impl IMClient {
                 }
             };
 
-            let decrypted = self.identity.decrypt_payload(&ident.client_data.public_message_identity_key, &target, &message).await?;
+            let decrypted = self.identity.decrypt_payload(&ident.client_data.public_message_identity_key, &message).await?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
             let parsed: Value = plist::from_bytes(&ungzipped)?;
@@ -344,7 +344,7 @@ impl IMClient {
 
         for target in targets {
             let encrypted = if let Some(msg) = &raw {
-                Some(self.identity.encrypt_payload(&handle, &target.delivery_data.client_data.public_message_identity_key, &msg).await?)
+                Some(self.identity.encrypt_payload(&target.delivery_data.client_data.public_message_identity_key, &msg).await?)
             } else { None };
             let send_delivered = if message.send_delivered { &target.participant != message.sender.as_ref().unwrap() } else { false };
             group_size += encrypted.as_ref().map(|i| i.len()).unwrap_or(0);

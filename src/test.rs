@@ -5,7 +5,7 @@ use base64::engine::general_purpose;
 use icloud_auth::{AnisetteConfiguration, AppleAccount};
 use log::{info, error};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, get_gsa_config, register, APSConnectionResource, APSState, ConversationData, IDSUser, IMClient, MacOSConfig, Message, MessageInst, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, get_gsa_config, register, APSConnectionResource, APSState, ConversationData, IDSUser, IDSUserIdentity, IMClient, MacOSConfig, Message, MessageInst, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -18,7 +18,8 @@ use rustpush::OSConfig;
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
     push: APSState,
-    users: Vec<IDSUser>
+    users: Vec<IDSUser>,
+    identity: IDSUserIdentity,
 }
 
 pub fn plist_to_buf<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, plist::Error> {
@@ -149,26 +150,26 @@ async fn main() {
 
         let account = acc.unwrap();
         let pet = account.get_pet().unwrap();
-        // let pet = "GTuBK8IqQsTtWlVcQEYll+CcA7DhCvUycvy4PkW4/W8xbtNpJ8ZSWktKC6pTYgA7i6IPVMmbfWWQfvHZpw/xmg0UyTSIwvFtxM+fu3HDyTW4HvLwatOw1oiKDsxTFmHSK2hRYdAkamG1pBhwITzVxvoy5b2/oBbNfXs6ZiAw614oS9e4ZmnwzgHQUeRZDv1+AymG5R9MI0NXiWWeXknKqNNRTTewwhyqHNkI9VQYbkpDSW0Su9VeHmlBdw/4fatLTRKATVU45x04llskMso2Tn2pcHZ82u2fZxa3GieLgSkvP1rne0XpIQv5eT98LXPbpjSGCgw4bzT9H5or0bcGFwZzaStFz0lMpP//fDk1QLFr2msmckq8izXu8VlXBzBlM6EcOPEInwwhZO5+37k0yleyUtAhxOMWHT/so2W1nOOG+oYdTy9mBADv3C+vdVT2aj4zKfS1ITc33eq0050eLe2hQ7nrPET".to_string();
-
         let user = authenticate_apple(&user_trimmed, &pet, config.as_ref()).await.unwrap();
 
-        panic!("{}", pet);
         vec![user]
     };
 
+    let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSUserIdentity::new().unwrap());
+
     if users[0].registration.is_none() {
         info!("Registering new identity...");
-        register(config.as_ref(), &*connection.state.read().await, &mut users).await.unwrap();
+        register(config.as_ref(), &*connection.state.read().await, &mut users, &identity).await.unwrap();
     }
 
     let mut state = SavedState {
         push: connection.state.read().await.clone(),
+        identity: identity.clone(),
         users: users.clone()
     };
     fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
     
-    let client = IMClient::new(connection.clone(), users, "id_cache.plist".into(), config, Box::new(move |updated_keys| {
+    let client = IMClient::new(connection.clone(), users, identity, "id_cache.plist".into(), config, Box::new(move |updated_keys| {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;

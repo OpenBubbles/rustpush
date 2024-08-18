@@ -119,7 +119,6 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
         auth_keypair: keypair,
         user_id: user_id.to_string(),
         registration: None,
-        identity: IDSUserIdentity::new()?,
         user_type,
         protocol_version: os_config.get_protocol_version(),
     })

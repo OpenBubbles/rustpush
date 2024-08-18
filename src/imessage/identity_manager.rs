@@ -9,9 +9,9 @@ use tokio::sync::{Mutex, RwLock};
 use backon::Retryable;
 use rand::Rng;
 
-use crate::{aps::APSConnection, imessage::user::IDSIdentity, register, util::{bin_deserialize, bin_deserialize_sha, bin_serialize, plist_to_string, Resource, ResourceManager}, APSConnectionResource, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{aps::APSConnection, imessage::user::IDSIdentity, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, plist_to_string, Resource, ResourceManager}, APSConnectionResource, IDSUser, MessageInst, OSConfig, PushError};
 
-use super::{messages::{BundledPayload, MessageTarget}, user::{IDSDeliveryData, IDSPublicIdentity, PrivateDeviceInfo, QueryOptions}};
+use super::{messages::{BundledPayload, MessageTarget}, user::{IDSDeliveryData, IDSPublicIdentity, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}};
 
 const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
 
@@ -238,6 +238,7 @@ const IDS_IV: [u8; 16] = [
 pub struct IdentityResource {
     pub cache: Mutex<KeyCache>,
     pub users: RwLock<Vec<IDSUser>>,
+    pub identity: IDSUserIdentity,
     config: Arc<dyn OSConfig>,
     aps: APSConnection,
     query_lock: Mutex<()>,
@@ -254,7 +255,7 @@ impl Resource for IdentityResource {
         let mut users_lock = self.users.write().await;
         
         debug!("User locked!");
-        if let Err(err) = register(self.config.as_ref(), &*self.aps.state.read().await, &mut *users_lock).await {
+        if let Err(err) = register(self.config.as_ref(), &*self.aps.state.read().await, &mut *users_lock, &self.identity).await {
             debug!("Register failed {}!", err);
             drop(users_lock);
             
@@ -281,11 +282,12 @@ impl Resource for IdentityResource {
 }
 
 impl IdentityResource {
-    pub async fn new(users: Vec<IDSUser>, cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
+    pub async fn new(users: Vec<IDSUser>, identity: IDSUserIdentity, cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
         let resource = Arc::new(IdentityResource {
             cache: Mutex::new(KeyCache::new(cache_path, &conn, &users).await),
             users: RwLock::new(users),
             config,
+            identity,
             aps: conn,
             query_lock: Mutex::new(()),
             manager: Mutex::new(None),
@@ -325,9 +327,26 @@ impl IdentityResource {
         let next_rereg_in = self.calculate_rereg_time_s().await;
 
         info!("Reregistering in {} seconds", next_rereg_in);
+        
+        let mut log_timer = 0;
         if next_rereg_in > 0 {
-            // wait until expiry
-            tokio::time::sleep(Duration::from_secs(next_rereg_in as u64)).await;
+            let target_time = SystemTime::now() + Duration::from_secs(next_rereg_in as u64);
+
+            loop {
+                let Ok(next_time) = target_time.duration_since(SystemTime::now()) else { break };
+
+                // re-print every hour
+                if log_timer == 60 {
+                    info!("Reregistering in {} seconds", next_time.as_secs());
+                    log_timer = 0;
+                }
+
+                log_timer += 1;
+
+                // wait until time or realigning every 60 seconds, to avoid clock skew or sleep
+                // TOKIO SUPPORT CLOCK_BOOTTIME PLS
+                tokio::time::sleep(next_time.min(Duration::from_secs(60))).await;
+            }
         }
 
         // return indicates reregister
@@ -469,16 +488,13 @@ impl IdentityResource {
         Ok(key_cache.get_participants_targets(handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
     }
 
-    pub async fn encrypt_payload(&self, handle: &str, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
+    pub async fn encrypt_payload(&self, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
         let key_bytes = rand::thread_rng().gen::<[u8; 11]>();
-        
-        let users = self.users.read().await;
-        let my_identity = Self::user_by_handle(&*users, handle);
         let hmac = PKey::hmac(&key_bytes)?;
         let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&[
             body.to_vec(),
             vec![0x2],
-            my_identity.identity.hash()?.to_vec(),
+            self.identity.hash()?.to_vec(),
             to.hash()?.to_vec(),
         ].concat())?;
 
@@ -506,7 +522,7 @@ impl IdentityResource {
 
         rsa_cipher.extend_from_slice(&aes_body[100.min(aes_body.len())..]);
 
-        let mut my_signer = Signer::new(MessageDigest::sha1(), &my_identity.identity.pkey_signing()?.as_ref())?;
+        let mut my_signer = Signer::new(MessageDigest::sha1(), &self.identity.pkey_signing()?.as_ref())?;
         let my_sig = my_signer.sign_oneshot_to_vec(&rsa_cipher)?;
 
         let mut payload = EncryptedPayload {
@@ -521,7 +537,7 @@ impl IdentityResource {
         Ok(payload.to_bytes()?)
     }
 
-    pub async fn decrypt_payload(&self, from: &IDSPublicIdentity, handle: &str, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
+    pub async fn decrypt_payload(&self, from: &IDSPublicIdentity, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
         let (_, payload) = EncryptedPayload::from_bytes((raw_payload, 0))?;
         
         let from_signing = from.pkey_signing()?;
@@ -532,15 +548,12 @@ impl IdentityResource {
             return Err(PushError::VerificationFailed)
         }
 
-        let users = self.users.read().await;
-        let my_identity = Self::user_by_handle(&*users, handle);
-
-        let handle_enc = my_identity.identity.pkey_enc()?;
+        let handle_enc = self.identity.pkey_enc()?;
         let mut decrypter = Decrypter::new(&handle_enc)?;
         decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
         decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
         decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
-        let rsa_len = my_identity.identity.enc().size() as usize;
+        let rsa_len = self.identity.enc().size() as usize;
         let len = decrypter.decrypt_len(&payload.body[..rsa_len]).unwrap();
         let mut rsa_body = vec![0; len];
         let decrypted_len = decrypter.decrypt(&payload.body[..rsa_len], &mut rsa_body[..])?;

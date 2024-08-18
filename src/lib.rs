@@ -28,7 +28,7 @@ pub use imessage::aps_client::IMClient;
 use openssl::conf;
 use util::encode_hex;
 pub use util::ResourceState;
-pub use imessage::user::{IDSUser, register};
+pub use imessage::user::{IDSUser, register, IDSUserIdentity};
 pub use auth::{authenticate_apple, authenticate_phone, AuthPhone};
 pub use error::PushError;
 #[cfg(feature = "macOS")]

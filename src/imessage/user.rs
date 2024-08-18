@@ -251,7 +251,6 @@ pub struct IDSUser {
     pub auth_keypair: KeyPair,
     pub user_id: String,
     pub registration: Option<IDSRegistration>,
-    pub identity: IDSUserIdentity,
     pub user_type: IDSUserType,
     pub protocol_version: u32,
 }
@@ -391,7 +390,7 @@ impl IDSUser {
     }
 }
 
-pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUser]) -> Result<(), PushError> {
+pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
     info!("registering!");
     let mut user_list = vec![];
     for user in users.iter() {
@@ -400,7 +399,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
             ("client-data", Value::Dictionary(Dictionary::from_iter([
                 ("is-c2k-equipment", Value::Boolean(true)),
                 ("optionally-receive-typing-indicators", Value::Boolean(true)),
-                ("public-message-identity-key", Value::Data(user.identity.encode()?)),
+                ("public-message-identity-key", Value::Data(identity.encode()?)),
                 ("public-message-identity-version", Value::Integer(2.into())),
                 ("show-peer-errors", Value::Boolean(true)),
                 ("supports-ack-v1", Value::Boolean(true)),
