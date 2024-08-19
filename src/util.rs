@@ -857,6 +857,7 @@ impl KeyedArchive {
 }
 
 
+#[repr(C)]
 #[derive(Serialize, Deserialize, Clone)]
 pub enum NSArrayClass {
     NSArray,
