@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{decode_hex, encode_hex, get_reqwest, get_reqwest_system, plist_to_bin}, APSConnectionResource};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{decode_hex, encode_hex, get_reqwest, plist_to_bin}, APSConnectionResource};
 use log::{debug, info, warn};
 use openssl::{sha::{Sha1, sha256}, hash::{MessageDigest, Hasher}};
 use plist::Data;
@@ -166,7 +166,7 @@ impl MMCSPutContainer {
             let body: Body = Body::wrap_stream(receiver.into_stream());
             let request = self.target.request.clone().unwrap();
             let task = tokio::spawn(async move {
-                let response = transfer_mmcs_container(&get_reqwest_system(), &request, Some(body)).await?;
+                let response = transfer_mmcs_container(&get_reqwest(), &request, Some(body)).await?;
                 Ok::<_, PushError>(response)
             });
             self.finalize = Some(task);
@@ -582,7 +582,7 @@ impl MMCSGetContainer {
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(&get_reqwest_system(), &self.container.request.as_ref().unwrap(), None).await?;
+            let response = transfer_mmcs_container(&get_reqwest(), &self.container.request.as_ref().unwrap(), None).await?;
             self.confirm = Some(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None));
             self.response = Some(response);
         }

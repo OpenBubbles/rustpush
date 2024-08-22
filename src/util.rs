@@ -64,17 +64,6 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 }
 
 
-// make reqwest using system roots
-pub fn get_reqwest_system() -> &'static Client {
-    static SYSTEM_CLIENT: OnceLock<Client> = OnceLock::new();
-    SYSTEM_CLIENT.get_or_init(|| {
-        // return build_proxy();
-        reqwest::Client::builder()
-            .use_rustls_tls()
-            .build()
-            .unwrap()
-    })
-}
 
 fn build_proxy() -> Client {
     let mut headers = HeaderMap::new();
@@ -95,11 +84,8 @@ pub fn get_reqwest() -> &'static Client {
     CLIENT.get_or_init(|| {
         // return build_proxy();
         let certificates = vec![
-            Certificate::from_pem(include_bytes!("../certs/root/albert.apple.com.digicert.cert")).unwrap(),
             Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
-            Certificate::from_pem(include_bytes!("../certs/root/init-p01st.push.apple.com.cert")).unwrap(),
             Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
-            Certificate::from_pem(include_bytes!("../certs/root/content-icloud-com.cert")).unwrap(),
         ];
         let mut headers = HeaderMap::new();
         headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
@@ -108,8 +94,7 @@ pub fn get_reqwest() -> &'static Client {
         let mut builder = reqwest::Client::builder()
             .use_rustls_tls()
             .default_headers(headers.clone())
-            .http1_title_case_headers()
-            .tls_built_in_root_certs(false);
+            .http1_title_case_headers();
     
         for certificate in certificates.into_iter() {
             builder = builder.add_root_certificate(certificate);
@@ -342,7 +327,7 @@ struct Carrier {
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
-    let client = get_reqwest_system();
+    let client = get_reqwest();
     let data = client.get(CARRIER_CONFIG)
         .send().await?;
     
