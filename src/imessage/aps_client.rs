@@ -389,7 +389,7 @@ impl IMClient {
             info!("payload {payloads_cnt}");
 
             for _i in 0..payloads_cnt {
-                let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.50f32;
+                let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.25f32;
 
                 let filter = get_message(|load| {
                     debug!("got {:?}", load);
@@ -403,13 +403,13 @@ impl IMClient {
                 }, &["com.apple.madrid", "com.apple.private.alloy.sms"]);
 
                 let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
-                    250 // wait max 250ms after "good enough" to catch any stray 5032s, to prevent a network race condition
+                    500 // wait max 500ms after "good enough" to catch any stray 5032s, to prevent a network race condition
                 } else {
                     14000 // 14 seconds wait, to cutoff inner timeout
                 }), self.conn.wait_for_timeout(&mut messages, filter)).await else {
                     if is_good_enough {
                         warn!("timeout with {_i}/{payloads_cnt}");
-                        warn!("Greater than 50% submission rate, ignoring undeliverable messages!");
+                        warn!("Greater than 25% submission rate, ignoring undeliverable messages!");
                         break
                     }
                     error!("timeout with {_i}/{payloads_cnt}");

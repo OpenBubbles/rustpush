@@ -12,7 +12,7 @@ use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
-use crate::{imessage::aps_client::MadridRecvMessage, util::{KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
+use crate::{imessage::aps_client::MadridRecvMessage, util::{plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -397,7 +397,9 @@ pub enum MessageType {
 // defined in rawmessages.rs
 impl ExtensionApp {
     fn from_ati(ati: &[u8], bp: Option<&[u8]>) -> Result<ExtensionApp, PushError> {
-        let raw_ext: NSArray<NSDictionary<ExtensionApp>> = plist::from_value(&KeyedArchive::expand(&ungzip(&ati)?)?)?;
+        let expanded = KeyedArchive::expand(&ungzip(&ati)?)?;
+        debug!("ati: {:?}", plist_to_string(&expanded));
+        let raw_ext: NSArray<NSDictionary<ExtensionApp>> = plist::from_value(&expanded)?;
         let mut ext = raw_ext.objects.into_iter().next().unwrap().item;
 
         if let Some(bp) = bp {
@@ -1927,7 +1929,14 @@ impl MessageInst {
             let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
             let mut app = None;
             if let Some(app_info) = &loaded.app_info {
-                app = Some(ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref()))?);
+                // parsing failures for com.apple.Stickers.UserGenerated.MessagesExtension
+                app = match ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref())) {
+                    Ok(i) => Some(i),
+                    Err(e) => {
+                        warn!("Error parsing balloon {e}");
+                        None
+                    }
+                };
             }
             let mut link_meta = None;
             if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (loaded.balloon_id.as_deref(), balloon_part) {
