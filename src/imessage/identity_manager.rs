@@ -316,6 +316,14 @@ impl IdentityResource {
         users_locked.iter().flat_map(|user| user.registration.as_ref().unwrap().handles.clone()).collect::<Vec<String>>()
     }
 
+    pub async fn update_users(&self, users: Vec<IDSUser>) -> Result<(), PushError> {
+        debug!("Swapping users!");
+        *self.users.write().await = users;
+        debug!("Swapped users, reregistering!");
+        self.manager().await.refresh_now().await?;
+        Ok(())
+    }
+
     pub async fn calculate_rereg_time_s(&self) -> i64 {
         let users_lock = self.users.read().await;
         users_lock.iter()
