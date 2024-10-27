@@ -243,7 +243,7 @@ impl IMClient {
             cache_lock.invalidate(&target, &sender);
             return Ok(if sender == target {
                 self.identity.ensure_private_self(&mut cache_lock, &target, true).await?;
-                let private_self = &cache_lock.cache.get(target).unwrap().private_data;
+                let private_self = &cache_lock.cache().get(target).unwrap().private_data;
 
                 let Some(new_device_token) = private_self.iter().find(|dev| &dev.token == sender_token) else {
                     error!("New device not found!");

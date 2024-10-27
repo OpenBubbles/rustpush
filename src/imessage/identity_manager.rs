@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, fs, hash::Hash, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use backon::{ConstantBuilder, ExponentialBuilder};
 use deku::{DekuContainerRead, DekuRead, DekuWrite};
@@ -95,23 +95,34 @@ impl DeliveryHandle {
     }
 }
 
+pub trait KeyCache: Send + Sync {
+    fn get_targets(&self, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError>;
+    fn get_participants_targets(&self, handle: &str, participants: &[String]) -> Vec<DeliveryHandle>;
+    fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData>;
+    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>);
+    fn invalidate(&mut self, handle: &str, keys_for: &str);
+    fn invalidate_all(&mut self);
+    fn does_not_need_refresh(&self, handle: &str, keys_for: &str, refresh: bool) -> bool;
+    fn cache(&mut self) -> &mut HashMap<String, CachedHandle>;
+}
+
 #[derive(Serialize, Deserialize, Debug)]
-pub struct KeyCache {
+pub struct KeyCacheFile {
     pub cache: HashMap<String, CachedHandle>,
     #[serde(skip)]
     cache_location: PathBuf,
 }
 
-impl KeyCache {
-    pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser]) -> KeyCache {
+impl KeyCacheFile {
+    pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser]) -> KeyCacheFile {
         if let Ok(data) = fs::read(&path) {
-            if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
+            if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCacheFile>(Cursor::new(&data)) {
                 loaded.cache_location = path;
                 loaded.verity(conn, users).await;
                 return loaded
             }
         }
-        let mut cache = KeyCache {
+        let mut cache = KeyCacheFile {
             cache: HashMap::new(),
             cache_location: path,
         };
@@ -132,8 +143,14 @@ impl KeyCache {
         let saved = plist_to_string(self).unwrap();
         fs::write(&self.cache_location, saved).unwrap();
     }
+}
 
-    pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
+impl KeyCache for KeyCacheFile {
+    fn cache(&mut self) -> &mut HashMap<String, CachedHandle> {
+        &mut self.cache
+    }
+
+    fn invalidate(&mut self, handle: &str, keys_for: &str) {
         let Some(handle_cache) = self.cache.get_mut(handle) else {
             panic!("No handle cache for handle {}!", handle);
         };
@@ -141,14 +158,14 @@ impl KeyCache {
         self.save();
     }
 
-    pub fn invalidate_all(&mut self) {
+    fn invalidate_all(&mut self) {
         for cache in self.cache.values_mut() {
             cache.keys.clear();
         }
         self.save();
     }
 
-    pub fn get_targets(&self, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError> {
+    fn get_targets(&self, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
         };
@@ -168,7 +185,7 @@ impl KeyCache {
         Ok(self.get_participants_targets(handle, participants).into_iter().filter(|target| target_tokens.contains(&&target.delivery_data.push_token)).collect())
     }
 
-    pub fn get_participants_targets(&self, handle: &str, participants: &[String]) -> Vec<DeliveryHandle> {
+    fn get_participants_targets(&self, handle: &str, participants: &[String]) -> Vec<DeliveryHandle> {
         participants.iter().flat_map(|participant| {
             self.get_keys(handle, &participant).into_iter().map(|i| DeliveryHandle {
                 participant: participant.clone(),
@@ -177,7 +194,7 @@ impl KeyCache {
         }).collect()
     }
     
-    pub fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
+    fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
         let Some(handle_cache) = self.cache.get(handle) else {
             return vec![]
         };
@@ -192,7 +209,7 @@ impl KeyCache {
         }
     }
 
-    pub fn does_not_need_refresh(&self, handle: &str, keys_for: &str, refresh: bool) -> bool {
+    fn does_not_need_refresh(&self, handle: &str, keys_for: &str, refresh: bool) -> bool {
         let Some(handle_cache) = self.cache.get(handle) else {
             return false
         };
@@ -202,7 +219,7 @@ impl KeyCache {
         return !cached.is_dirty(refresh);
     }
 
-    pub fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
+    fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
         let Some(handle_cache) = self.cache.get_mut(handle) else {
             panic!("No handle cache for handle {}!", handle);
         };
@@ -236,7 +253,8 @@ const IDS_IV: [u8; 16] = [
 ];
 
 pub struct IdentityResource {
-    pub cache: Mutex<KeyCache>,
+    //pub cache: Mutex<KeyCacheFile>,
+    pub cache: Mutex<Box<dyn KeyCache>>,
     pub users: RwLock<Vec<IDSUser>>,
     pub identity: IDSUserIdentity,
     config: Arc<dyn OSConfig>,
@@ -268,8 +286,8 @@ impl Resource for IdentityResource {
             })
         }
         debug!("Register success!");
-
-        self.cache.lock().await.verity(&self.aps, &users_lock).await;
+                
+        //self.cache.lock().await.verify(&self.aps, &users_lock).await;
 
         info!("Successfully reregistered!");
 
@@ -284,7 +302,7 @@ impl Resource for IdentityResource {
 impl IdentityResource {
     pub async fn new(users: Vec<IDSUser>, identity: IDSUserIdentity, cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
         let resource = Arc::new(IdentityResource {
-            cache: Mutex::new(KeyCache::new(cache_path, &conn, &users).await),
+            cache: Mutex::new(Box::new(KeyCacheFile::new(cache_path, &conn, &users).await)),
             users: RwLock::new(users),
             config,
             identity,
@@ -368,8 +386,8 @@ impl IdentityResource {
         self.manager.lock().await.as_ref().unwrap().upgrade().unwrap().clone()
     }
 
-    pub async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
-        let my_cache = cache_lock.cache.get_mut(handle).unwrap();
+    pub async fn ensure_private_self(&self, cache_lock: &mut Box<dyn KeyCache>, handle: &str, refresh: bool) -> Result<(), PushError> {
+        let my_cache = cache_lock.cache().get_mut(handle).unwrap();
         if my_cache.private_data.len() != 0 && !refresh {
             return Ok(())
         }
@@ -380,28 +398,28 @@ impl IdentityResource {
             // something changed, requery IDS too
             cache_lock.invalidate(handle, handle);
         }
-        cache_lock.cache.get_mut(handle).unwrap().private_data = regs;
-        cache_lock.save();
+        cache_lock.cache().get_mut(handle).unwrap().private_data = regs;
+        //cache_lock.save();
         Ok(())
     }
 
     pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
         let mut cache_lock = self.cache.lock().await;
         self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache().get(handle).unwrap().private_data;
         Ok(private_self.clone())
     }
 
     pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
         let mut cache_lock = self.cache.lock().await;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache().get(handle).unwrap().private_data;
         if let Some(found) = private_self.iter().find(|i| i.token == token) {
             if let Some(uuid) = &found.uuid {
                 return Ok(uuid.clone())
             }
         }
         self.ensure_private_self(&mut cache_lock, handle, true).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache().get(handle).unwrap().private_data;
         Ok(private_self.iter().find(|i| i.token == token).ok_or(PushError::KeyNotFound(handle.to_string()))?.uuid.as_ref()
             .ok_or(PushError::KeyNotFound(handle.to_string()))?.clone())
     }
@@ -581,5 +599,3 @@ impl IdentityResource {
         self.cache.lock().await.invalidate_all();
     }
 }
-
-
