@@ -57,6 +57,9 @@ pub struct MadridRecvMessage {
     error_status: Option<u64>,
     #[serde(rename = "fM")]
     error_for_str: Option<String>,
+
+    #[serde(skip)]
+    verification_failed: bool,
 }
 
 impl MadridRecvMessage {
@@ -79,6 +82,7 @@ impl MadridRecvMessage {
             message,
             target: token.clone().map(|token| vec![MessageTarget::Token(token)]),
             send_delivered: send_delivered.unwrap_or(false),
+            verification_failed: self.verification_failed,
         })
     }
 }
@@ -281,17 +285,19 @@ impl IMClient {
                 target: Some(target),
                 message: Some(message),
                 token: Some(token),
+                verification_failed,
                 .. 
-            } = &payload else { return Ok(None) };
+            } = &mut payload else { return Ok(None) };
             let ident = match self.identity.get_key_for_sender(&target, &sender, &token).await {
-                Ok(ident) => ident,
+                Ok(ident) => Some(ident.client_data.public_message_identity_key),
                 Err(err) => {
                     error!("No identity for payload! {}", err);
-                    return Err(err)
+                    *verification_failed = true;
+                    None
                 }
             };
 
-            let decrypted = self.identity.decrypt_payload(&ident.client_data.public_message_identity_key, &message).await?;
+            let decrypted = self.identity.decrypt_payload(ident.as_ref(), &message).await?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
             let parsed: Value = plist::from_bytes(&ungzipped)?;

@@ -545,15 +545,17 @@ impl IdentityResource {
         Ok(payload.to_bytes()?)
     }
 
-    pub async fn decrypt_payload(&self, from: &IDSPublicIdentity, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
+    pub async fn decrypt_payload(&self, from: Option<&IDSPublicIdentity>, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
         let (_, payload) = EncryptedPayload::from_bytes((raw_payload, 0))?;
         
-        let from_signing = from.pkey_signing()?;
-        let mut verifier = Verifier::new(MessageDigest::sha1(), &from_signing.as_ref())?;
+        if let Some(from) = from {
+            let from_signing = from.pkey_signing()?;
+            let mut verifier = Verifier::new(MessageDigest::sha1(), &from_signing.as_ref())?;
 
-        if !verifier.verify_oneshot(&payload.sig, &payload.body)? {
-            warn!("Failed to verify payload!");
-            return Err(PushError::VerificationFailed)
+            if !verifier.verify_oneshot(&payload.sig, &payload.body)? {
+                warn!("Failed to verify payload!");
+                return Err(PushError::VerificationFailed)
+            }
         }
 
         let handle_enc = self.identity.pkey_enc()?;

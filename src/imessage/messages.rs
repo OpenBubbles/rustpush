@@ -1263,6 +1263,7 @@ pub struct MessageInst {
     pub sent_timestamp: u64,
     pub target: Option<Vec<MessageTarget>>,
     pub send_delivered: bool,
+    pub verification_failed: bool,
 }
 
 impl MessageInst {
@@ -1276,6 +1277,7 @@ impl MessageInst {
             conversation: Some(conversation),
             message,
             target: None,
+            verification_failed: false,
         }
     }
 
