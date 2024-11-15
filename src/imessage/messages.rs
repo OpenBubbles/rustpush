@@ -354,6 +354,15 @@ impl MessageParts {
                         })
                     }
                 },
+                Ok(reader::XmlEvent::EndElement { name }) => {
+                    if name.local_name == "mention" && staging_item.is_some() {
+                        data.push(IndexedMessagePart {
+                            part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
+                            idx: text_part_idx,
+                            ext: text_meta.take(),
+                        });
+                    }
+                }
                 Ok(reader::XmlEvent::Characters(data)) => {
                     if staging_item.is_none() {
                         staging_item = Some(StagingElement::Text)
@@ -1350,7 +1359,7 @@ impl MessageInst {
                     gv: "8".to_string(),
                     new_name: msg.new_name.clone(),
                     old_name: conversation.cv_name.clone(),
-                    name: msg.new_name.clone(),
+                    name: Some(msg.new_name.clone()),
                     msg_type: "n".to_string()
                 };
                 plist_to_bin(&raw).unwrap()
@@ -1420,8 +1429,8 @@ impl MessageInst {
                     source_participants: remove_prefix(&conversation.participants),
                     sender_guid: conversation.sender_guid.clone(),
                     gv: "8".to_string(),
-                    new_name: conversation.cv_name.clone().unwrap(),
-                    name: conversation.cv_name.clone().unwrap(),
+                    new_name: conversation.cv_name.clone(),
+                    name: conversation.cv_name.clone(),
                     msg_type: "p".to_string(),
                     group_version: msg.group_version
                 };
@@ -1661,6 +1670,7 @@ impl MessageInst {
                         message_guid: random_guid.clone()
                     }),
                     sender_guid: conversation.sender_guid.clone(),
+                    meta: if msg.file.is_none() { Some("ngp".to_string()) } else { None },
                     msg_type: "v".to_string(),
                     participants: remove_prefix(&conversation.participants),
                     gv: "8".to_string(),
@@ -1758,7 +1768,7 @@ impl MessageInst {
         if let Ok(loaded) = plist::from_value::<RawChangeMessage>(&value) {
             return wrapper.to_message(Some(ConversationData {
                 participants: add_prefix(&loaded.source_participants),
-                cv_name: Some(loaded.name.clone()),
+                cv_name: loaded.name,
                 sender_guid: loaded.sender_guid.clone(),
                 after_guid: None,
             }), Message::ChangeParticipants(ChangeParticipantMessage { new_participants: add_prefix(&loaded.target_participants), group_version: loaded.group_version }))

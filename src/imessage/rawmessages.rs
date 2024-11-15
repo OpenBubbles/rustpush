@@ -20,7 +20,7 @@ pub struct RawRenameMessage {
     #[serde(rename = "old")]
     pub old_name: Option<String>,
     #[serde(rename = "n")]
-    pub name: String,
+    pub name: Option<String>,
     #[serde(rename = "type")]
     pub msg_type: String,
     #[serde(rename = "gid")]
@@ -33,13 +33,13 @@ pub struct RawChangeMessage {
     pub group_version: u64,
     #[serde(rename = "tp")]
     pub target_participants: Vec<String>,
-    #[serde(rename = "nn")]
-    pub new_name: String,
     #[serde(rename = "sp")]
     pub source_participants: Vec<String>,
     pub gv: String,
+    #[serde(rename = "nn")]
+    pub new_name: Option<String>,
     #[serde(rename = "n")]
-    pub name: String,
+    pub name: Option<String>,
     #[serde(rename = "type")]
     pub msg_type: String,
     #[serde(rename = "gid")]
@@ -66,6 +66,8 @@ struct RawIconChangeMessage {
     group_version: u64,
     #[serde(rename = "tv")]
     new_icon: Option<IMTransferData>,
+    #[serde(rename = "vt")]
+    meta: Option<String>,
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
     #[serde(rename = "type")]
