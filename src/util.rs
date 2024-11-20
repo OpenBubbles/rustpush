@@ -384,7 +384,7 @@ const MAX_RESOURCE_WAIT: Duration = Duration::from_secs(30);
 pub struct ResourceManager<T: Resource> {
     pub resource: Arc<T>,
     refreshed_at: Mutex<SystemTime>,
-    request_retries: mpsc::Sender<oneshot::Sender<Result<(), Arc<PushError>>>>,
+    request_retries: mpsc::Sender<oneshot::Sender<Result<(), ResourceFailure>>>,
     retry_signal: mpsc::Sender<()>,
     retry_now_signal: mpsc::Sender<()>,
     death_signal: Option<mpsc::Sender<()>>,
@@ -432,7 +432,7 @@ pub enum ResourceState {
 
 impl<T: Resource + 'static> ResourceManager<T> {
     pub fn new<B: BackoffBuilder + 'static>(resource: Arc<T>, backoff: B, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
-        let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), Arc<PushError>>>>(99999);
+        let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), ResourceFailure>>>(99999);
         let (sig_send, mut sig_recv) = mpsc::channel(99999);
         let (retry_now_send, mut retry_now_recv) = mpsc::channel(99999);
         let (death_send, mut death_recv) = mpsc::channel(99999);
@@ -453,7 +453,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
 
         let loop_manager = manager.clone();
         tokio::spawn(async move {
-            let mut resolve_items = move |result: Result<(), Arc<PushError>>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
+            let mut resolve_items = move |result: Result<(), ResourceFailure>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
                 while let Ok(_) = sig_recv.try_recv() { }
                 while let Ok(_) = sig_recv_now.try_recv() { }
                 while let Ok(item) = retry_recv.try_recv() {
@@ -476,15 +476,16 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let mut result = loop_manager.resource.generate_unwind_safe().await;
                 while let Err(e) = result {
                     let shared_err = Arc::new(e);
-                    resolve_items(Err(shared_err.clone()), &mut sig_recv, &mut retry_now_recv);
                     let retry_in = backoff.next().unwrap();
 
                     let is_final = matches!(*shared_err, PushError::DoNotRetry(_));
 
-                    *loop_manager.resource_state.lock().await = ResourceState::Failed(ResourceFailure {
+                    let failure = ResourceFailure {
                         retry_wait: if !is_final { Some(retry_in.as_secs()) } else { None },
                         error: shared_err
-                    });
+                    };
+                    resolve_items(Err(failure.clone()), &mut sig_recv, &mut retry_now_recv);
+                    *loop_manager.resource_state.lock().await = ResourceState::Failed(failure);
                     if is_final {
                         break 'stop;
                     }
@@ -512,7 +513,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
 
     pub async fn ensure_not_failed(&self) -> Result<(), PushError> {
         if let ResourceState::Failed(error) = &*self.resource_state.lock().await {
-            return Err(error.error.clone().into())
+            return Err(error.clone().into())
         }
         Ok(())
     }

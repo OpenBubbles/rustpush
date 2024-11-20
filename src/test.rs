@@ -107,7 +107,7 @@ async fn main() {
     //     code,
     //     beeper_token: token,
     // });
-    // fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
+    fs::write("hwconfig.plist", plist_to_string(config.as_ref()).unwrap()).await.unwrap();
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 

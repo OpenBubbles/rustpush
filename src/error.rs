@@ -58,8 +58,6 @@ pub enum PushError {
     LoginUnauthorized,
     #[error("Bad auth cert {0}")]
     AuthInvalid(u64),
-    #[error("Reregistration failed {0}")]
-    ReRegistrationFailure(#[from] ResourceFailure),
     #[error("APS parse error {0}")]
     APSParseError(#[from] DekuError),
     #[error("Other side hung up! {0}")]
@@ -76,8 +74,8 @@ pub enum PushError {
     ZipError(#[from] zip::result::ZipError),
     #[error("Resource Timeout")]
     ResourceTimeout,
-    #[error("Resource Failure")]
-    ResourceFailure(#[from] Arc<PushError>),
+    #[error("{0}")]
+    ResourceFailure(#[from] ResourceFailure),
     #[error("Resource Panic {0}")]
     ResourcePanic(String),
     #[error("Do not retry {0}")]
