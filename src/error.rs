@@ -90,4 +90,6 @@ pub enum PushError {
     RelayError(u16),
     #[error("Relay code not found!")]
     DeviceNotFound,
+    #[error("Web Tunnel error {0}!")]
+    WebTunnelError(u16),
 }

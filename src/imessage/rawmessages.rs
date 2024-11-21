@@ -323,6 +323,10 @@ struct RawIMessage {
     balloon_part_mmcs: Option<RawMMCSBalloon>,
     #[serde(rename = "ati")]
     app_info: Option<Data>,
+    #[serde(rename = "a")]
+    voice_audio: Option<bool>,
+    #[serde(rename = "e")]
+    voice_e: Option<bool>,
 }
 
 

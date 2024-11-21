@@ -5,6 +5,7 @@ use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey},
 use plist::{Data, Dictionary, Value};
 use rasn::{AsnType, Decode, Encode};
 use reqwest::Method;
+use async_recursion::async_recursion;
 use serde::{de, ser::Error, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, get_reqwest, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
@@ -363,8 +364,9 @@ impl IDSUser {
         }).collect())
     }
 
-    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, handle: &str, query: Vec<String>, options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
-        let body = plist_to_buf(&LookupReq { uris: query })?;
+    #[async_recursion]
+    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
+        let body = plist_to_buf(&LookupReq { uris: query.to_vec() })?;
 
         let request = options.add_headers(SignedRequest::new("id-query", Method::GET /* unused */))
             .header("x-id-self-uri", handle)
@@ -373,7 +375,17 @@ impl IDSUser {
             .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()))
             .body(gzip(&body)?)
             .sign(&self.registration.as_ref().unwrap().id_keypair, KeyType::Id, &*aps.state.read().await, None)?
-            .send_apns(aps).await?;
+            .send_apns(aps).await;
+
+        if let Err(PushError::WebTunnelError(5206 /* Response too large */)) = &request {
+            info!("response too large, chopping in half!");
+            let mut results = HashMap::new();
+            for i in query.chunks(query.len() / 2) {
+                results.extend(self.query(config, aps, handle, i, options).await?);
+            }
+            return Ok(results);
+        }
+        let request = request?;
 
         debug!("receieved apns query {:?}", plist::from_bytes::<Value>(&request)?);
 

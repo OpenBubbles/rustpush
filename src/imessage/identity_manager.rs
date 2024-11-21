@@ -423,7 +423,7 @@ impl IdentityResource {
        for chunk in fetch.chunks(18) {
            debug!("Fetching keys for chunk {:?}", chunk);
            let users = self.users.read().await;
-           let results = match Self::user_by_handle(&users, handle).query(&*self.config, &self.aps, handle, chunk.to_vec(), meta).await {
+           let results = match Self::user_by_handle(&users, handle).query(&*self.config, &self.aps, handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
                    if let PushError::LookupFailed(6005) = err {

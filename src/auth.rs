@@ -282,8 +282,13 @@ impl SignedRequest {
             };
             if recv_id.as_data().unwrap() == msg_id { Some(payload) } else { None }
         }, &["com.apple.madrid"])).await?;
-
-        Ok(ungzip(response.as_dictionary().unwrap()["b"].as_data().unwrap())?)
+        
+        let response = response.as_dictionary().unwrap();
+        if let Some(b) = response.get("b") {
+            Ok(ungzip(b.as_data().unwrap())?)
+        } else {
+            Err(PushError::WebTunnelError(response["s"].as_unsigned_integer().unwrap() as u16))
+        }
     }
 }
 

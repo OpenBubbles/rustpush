@@ -317,7 +317,7 @@ impl MessageParts {
                                     })
                                 },
                                 part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
-                                uti_type: get_attr("uti-type", None),
+                                uti_type: get_attr("uti-type", Some("public.data")),
                                 mime: get_attr("mime-type", Some("application/octet-stream")),
                                 name: get_attr("name", None),
                                 iris: get_attr("iris", Some("no")) == "yes"
@@ -536,6 +536,7 @@ pub struct NormalMessage {
     pub subject: Option<String>,
     pub app: Option<ExtensionApp>,
     pub link_meta: Option<LinkMeta>,
+    pub voice: bool,
 }
 
 #[repr(C)]
@@ -560,6 +561,7 @@ impl NormalMessage {
             subject: None,
             app: None,
             link_meta: None,
+            voice: false,
         }
     }
 }
@@ -1421,6 +1423,8 @@ impl MessageInst {
                     balloon_part: None,
                     balloon_part_mmcs: None,
                     app_info: None,
+                    voice_audio: None,
+                    voice_e: None,
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -1532,6 +1536,8 @@ impl MessageInst {
                             balloon_id,
                             balloon_part,
                             balloon_part_mmcs,
+                            voice_audio: if normal.voice { Some(true) } else { None },
+                            voice_e: if normal.voice { Some(true) } else { None },
                         };
         
                         if normal.parts.is_multipart() {
@@ -1893,6 +1899,7 @@ impl MessageInst {
                     subject: None,
                     app: None,
                     link_meta: None,
+                    voice: false,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -1921,6 +1928,7 @@ impl MessageInst {
                 subject: None,
                 app: None,
                 link_meta: None,
+                voice: false,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -1987,6 +1995,7 @@ impl MessageInst {
                 subject: loaded.subject.clone(),
                 app,
                 link_meta,
+                voice: loaded.voice_audio == Some(true),
             }))
         }
         Err(PushError::BadMsg)

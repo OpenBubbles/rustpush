@@ -130,6 +130,7 @@ struct MMCSPutContainer {
     finish_binary: Option<Vec<u8>>,
     for_object: String,
     confirm_url: String,
+    buffer: Option<Vec<u8>>,
 }
 
 impl MMCSPutContainer {
@@ -144,6 +145,7 @@ impl MMCSPutContainer {
             finish_binary,
             for_object,
             confirm_url,
+            buffer: None,
         }
     }
     
@@ -183,9 +185,13 @@ impl Container for MMCSPutContainer {
     }
     async fn write(&mut self, data: &[u8]) -> Result<(), PushError> {
         self.ensure_stream().await;
-        if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data.to_vec())).await {
-            err.into_inner()?;
+
+        if let Some(data) = self.buffer.take() {
+            if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(data)).await {
+                err.into_inner()?;
+            }
         }
+        self.buffer = Some(data.to_vec());
         self.hasher.update(data).unwrap();
         self.transfer_progress += data.len();
         Ok(())
@@ -210,14 +216,14 @@ impl Container for MMCSPutContainer {
             buf.reserve(footer.encoded_len());
             footer.encode(&mut buf).unwrap();
 
-            let result = self.sender.as_ref().unwrap().send_async(Ok([
+            let result = self.sender.take().unwrap().into_send_async(Ok([
+                self.buffer.take().unwrap(),
                 (buf.len() as u32).to_be_bytes().to_vec(),
                 buf
             ].concat())).await;
             if let Err(err) = result {
                 err.into_inner()?;
             }
-            self.sender = None;
             let reader = self.finalize.take().unwrap().await.unwrap()?;
 
             if !reader.status().is_success() {
@@ -231,6 +237,9 @@ impl Container for MMCSPutContainer {
             None
         } else {
             debug!("MMCS complete normal");
+            if let Err(err) = self.sender.as_ref().unwrap().send_async(Ok(self.buffer.take().unwrap())).await {
+                err.into_inner()?;
+            }
             self.sender = None;
             let reader = self.finalize.take().unwrap().await.unwrap()?;
             let confirmed = confirm_for_resp(&reader, &get_container_url(&self.target.request.as_ref().unwrap()), &self.target.cl_auth_p2, Some(&result));
