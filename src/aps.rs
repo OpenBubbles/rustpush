@@ -408,7 +408,7 @@ impl APSConnectionResource {
         if status != 0 {
             // invalidate pair for next attempt
             state.keypair = None;
-            return Err(PushError::APSConnectError)
+            return Err(PushError::APSConnectError(status))
         }
 
         if let Some(token) = token {

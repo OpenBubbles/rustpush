@@ -31,8 +31,8 @@ pub enum PushError {
     KeyError(KeyError),
     #[error("IDS key missing for {0}")]
     KeyNotFound(String),
-    #[error("Failed to connect to APS")]
-    APSConnectError,
+    #[error("Failed to connect to APS {0}")]
+    APSConnectError(u8),
     #[error("TLS error {0}")]
     TLSError(#[from] rustls::Error),
     #[error("Response error {0}")]
