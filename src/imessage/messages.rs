@@ -146,7 +146,14 @@ impl MessageParts {
                         element = element.attr(key.as_str(), val);
                     }
                     writer.write(element).unwrap();
-                    writer.write(XmlEvent::Characters(html_escape::encode_text(&text).as_ref())).unwrap();
+                    for (idx, line) in text.split("\n").enumerate() {
+                        if idx != 0 {
+                            // insert break
+                            writer.write(XmlEvent::start_element("br")).unwrap();
+                            writer.write(XmlEvent::end_element()).unwrap();
+                        }
+                        writer.write(XmlEvent::Characters(html_escape::encode_text(line).as_ref())).unwrap();
+                    }
                 },
                 MessagePart::Mention(uri, text) => {
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
@@ -352,6 +359,11 @@ impl MessageParts {
                             idx: part_idx,
                             ext: None,
                         })
+                    } else if name.local_name == "br" {
+                        if staging_item.is_none() {
+                            staging_item = Some(StagingElement::Text)
+                        }
+                        string_buf += "\n";
                     }
                 },
                 Ok(reader::XmlEvent::EndElement { name }) => {
