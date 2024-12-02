@@ -259,7 +259,7 @@ impl Resource for IdentityResource {
             debug!("Register failed {}!", err);
             drop(users_lock);
             
-            let needs_relog = matches!(err, PushError::AuthInvalid(6005));
+            let needs_relog = matches!(err, PushError::AuthInvalid(6005) | PushError::RegisterFailed(6005));
             return Err(if needs_relog {
                 info!("Auth returns 6005, relog required!");
                 PushError::DoNotRetry(Box::new(err))
@@ -489,6 +489,9 @@ impl IdentityResource {
     }
 
     pub async fn refresh_handles(&self, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
+        if handles.is_empty() {
+            return Ok(vec![])
+        }
         let targets = handles.iter().map(|handle| handle.participant.clone()).collect::<HashSet<String>>().into_iter().collect::<Vec<_>>();
         self.cache_keys(&targets, handle, true, &QueryOptions { required_for_message: true, result_expected: true }).await?;
         let search_tokens = handles.iter().map(|handle| handle.delivery_data.push_token.clone()).collect::<Vec<_>>();
@@ -496,7 +499,7 @@ impl IdentityResource {
         Ok(key_cache.get_participants_targets(handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
     }
 
-    pub async fn encrypt_payload(&self, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
+    pub fn encrypt_payload(&self, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
         let key_bytes = rand::thread_rng().gen::<[u8; 11]>();
         let hmac = PKey::hmac(&key_bytes)?;
         let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&[
@@ -545,7 +548,7 @@ impl IdentityResource {
         Ok(payload.to_bytes()?)
     }
 
-    pub async fn decrypt_payload(&self, from: Option<&IDSPublicIdentity>, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
+    pub fn decrypt_payload(&self, from: Option<&IDSPublicIdentity>, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
         let (_, payload) = EncryptedPayload::from_bytes((raw_payload, 0))?;
         
         if let Some(from) = from {

@@ -92,4 +92,6 @@ pub enum PushError {
     DeviceNotFound,
     #[error("Web Tunnel error {0}!")]
     WebTunnelError(u16),
+    #[error("APS Ack error {0}!")]
+    APSAckError(u8),
 }

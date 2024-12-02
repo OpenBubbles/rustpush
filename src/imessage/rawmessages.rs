@@ -237,11 +237,11 @@ struct RawSmsIncomingMessage {
     #[serde(rename = "sV")]
     version: String,
     #[serde(rename = "_sc")]
-    sc: u32, // always 0
+    sc: Option<u32>, // always 0
     #[serde(rename = "m")]
     mode: String, // sms or mms
     ic: u32, // always 1
-    n: String, // always 310
+    n: Option<String>, // always 310 (missing)
     #[serde(rename = "g")]
     guid: String
 }
@@ -378,7 +378,7 @@ impl Serialize for RawBalloonData {
 }
 
 #[repr(C)]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExtensionApp {
     name: String,
@@ -492,4 +492,8 @@ pub(super) struct SendMessage {
     pub(super) ex: Option<u32>,
     #[serde(rename = "nr")]
     pub(super) no_response: Option<bool>,
+    #[serde(rename = "rc")]
+    pub(super) retry_count: Option<u8>,
+    #[serde(rename = "oe")]
+    pub(super) original_epoch_nanos: Option<u64>,
 }

@@ -25,6 +25,7 @@ const ZERO_NONCE: [u8; 16] = [
 ];
 // conversation data, used to uniquely identify a conversation from a message
 #[repr(C)]
+#[derive(Clone)]
 pub struct ConversationData {
     pub participants: Vec<String>,
     pub cv_name: Option<String>,
@@ -39,6 +40,7 @@ impl ConversationData {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub enum MessagePart {
     Text(String),
     Attachment(Attachment),
@@ -47,6 +49,7 @@ pub enum MessagePart {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct IndexedMessagePart {
     pub part: MessagePart,
     pub idx: Option<usize>,
@@ -54,6 +57,7 @@ pub struct IndexedMessagePart {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
@@ -477,6 +481,7 @@ pub enum BalloonLayout {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct Balloon {
     url: String,
     session: Option<String>, // UUID
@@ -539,6 +544,7 @@ impl Balloon {
 
 // a "normal" imessage, containing multiple parts and text
 #[repr(C)]
+#[derive(Clone)]
 pub struct NormalMessage {
     pub parts: MessageParts,
     pub effect: Option<String>,
@@ -579,17 +585,20 @@ impl NormalMessage {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct RenameMessage {
     pub new_name: String
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct ChangeParticipantMessage {
     pub new_participants: Vec<String>,
     pub group_version: u64
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub enum Reaction {
     Heart,
     Like,
@@ -613,7 +622,7 @@ impl Reaction {
 }
 
 #[repr(C)]
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "pid")]
 pub enum PartExtension {
     #[serde(rename = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension")]
@@ -681,6 +690,7 @@ impl PartExtension {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub enum ReactMessageType {
     React {
         reaction: Reaction,
@@ -773,6 +783,7 @@ impl ReactMessageType {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct ReactMessage {
     pub to_uuid: String,
     pub to_part: Option<u64>,
@@ -781,6 +792,7 @@ pub struct ReactMessage {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct ErrorMessage {
     pub for_uuid: String,
     pub status: u64,
@@ -806,12 +818,14 @@ impl ReactMessage {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct UnsendMessage {
     pub tuuid: String,
     pub edit_part: u64,
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct EditMessage {
     pub tuuid: String,
     pub edit_part: u64,
@@ -981,12 +995,14 @@ impl MMCSFile {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub enum AttachmentType {
     Inline(Vec<u8>),
     MMCS(MMCSFile)
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct Attachment {
     a_type: AttachmentType,
     part: u64,
@@ -1032,18 +1048,21 @@ impl Attachment {
 
 // file should be 570x570 png
 #[repr(C)]
+#[derive(Clone)]
 pub struct IconChangeMessage {
     pub file: Option<MMCSFile>,
     pub group_version: u64,
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct UpdateExtensionMessage {
     pub for_uuid: String,
     pub ext: PartExtension,
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub enum Message {
     Message(NormalMessage),
     RenameMessage(RenameMessage),
@@ -1216,6 +1235,7 @@ pub fn add_prefix(participants: &[String]) -> Vec<String> {
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub enum MessageTarget {
     Token(Vec<u8>),
     Uuid(String),
@@ -1269,6 +1289,7 @@ impl From<MMCSFile> for RawMMCSBalloon {
 
 // a message that can be sent to other iMessage users
 #[repr(C)]
+#[derive(Clone)]
 pub struct MessageInst {
     pub id: String,
     pub sender: Option<String>,
@@ -1581,10 +1602,10 @@ impl MessageInst {
                                 ssc: 0,
                                 l: 0,
                                 version: "1".to_string(),
-                                sc: 0,
+                                sc: Some(0),
                                 mode: if is_mms { "mms".to_string() } else { "sms".to_string() },
                                 ic: 1,
-                                n: "310".to_string(),
+                                n: Some("310".to_string()),
                                 guid: self.id.clone(),
                             };
 

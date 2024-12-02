@@ -1,9 +1,9 @@
-use std::{path::PathBuf, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{path::PathBuf, pin::Pin, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, error, info, warn};
 use plist::{Data, Value};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, Mutex};
+use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
@@ -140,7 +140,7 @@ impl IMClient {
 
     async fn setup_conn(conn: &APSConnection) -> Result<(), PushError> {
         conn.send(APSMessage::SetState { state: 1 }).await?;
-        conn.filter(&["com.apple.madrid", "com.apple.private.alloy.sms"]).await?;
+        conn.filter(&["com.apple.private.alloy.sms"], &[], &["com.apple.madrid"], &[]).await?;
 
         if let Err(_) = tokio::time::timeout(Duration::from_millis(500), conn.wait_for_timeout(conn.subscribe().await,
             |msg| if let APSMessage::NoStorage = msg { Some(()) } else { None })).await {
@@ -297,7 +297,7 @@ impl IMClient {
                 }
             };
 
-            let decrypted = self.identity.decrypt_payload(ident.as_ref(), &message).await?;
+            let decrypted = self.identity.decrypt_payload(ident.as_ref(), &message)?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
             let parsed: Value = plist::from_bytes(&ungzipped)?;
@@ -311,7 +311,7 @@ impl IMClient {
         }
     }
 
-    pub async fn send(&self, message: &mut MessageInst) -> Result<(), PushError> {
+    pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
         let targets = message.prepare_send(&handles);
@@ -334,13 +334,80 @@ impl IMClient {
         let my_token = self.conn.get_token().await;
         message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
         
-        self.send_targets(message, &message_targets).await
-    }
+        let (sender, receiver) = 
+            tokio::sync::broadcast::channel(message_targets.len());
+        
+        let mut progress = receiver.resubscribe();
 
+        let job = InnerSendJob {
+            conn: self.conn.clone(),
+            identity: self.identity.clone(),
+            user_agent: self.os_config.get_version_ua(),
+            message: message.clone(),
+            status: sender,
+        };
+
+        let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
+
+        let mut received = false;
+        let mut checked = false;
+        loop {
+            select! {
+                finished = &mut job_spawned => {
+                    finished.unwrap()?;
+                    checked = true;
+                    received = true; // for no confirm items
+                    break; // Done
+                },
+                _prog = progress.recv() => {
+                    received = true;
+                },
+                _time = tokio::time::sleep(Duration::from_millis(if received { 500 } else { 15000 })) => {
+                    break;
+                }
+            }
+        }
+
+        if !received {
+            debug!("Not received");
+            job_spawned.abort();
+            return Err(PushError::SendTimedOut)
+        }
+        
+        Ok(SendJob {
+            process: receiver,
+            handle: if checked { None } else { Some(job_spawned) },
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum SendResult {
+    Sent,
+    APSError(i64),
+    TimedOut,
+}
+
+pub struct SendJob {
+    pub process: tokio::sync::broadcast::Receiver<(DeliveryHandle, SendResult)>,
+    pub handle: Option<JoinHandle<Result<(), PushError>>>,
+}
+
+struct InnerSendJob {
+    pub conn: APSConnection,
+    pub identity: IdentityManager,
+    pub user_agent: String,
+    pub message: MessageInst,
+    pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
+}
+
+impl InnerSendJob {
     #[async_recursion]
-    async fn send_targets(&self, message: &mut MessageInst, targets: &[DeliveryHandle]) -> Result<(), PushError> {
-        let my_handles = self.identity.get_handles().await;
+    async fn send_targets(self, targets: Vec<DeliveryHandle>, retry_count: u8) -> Result<(), PushError> {
+        info!("Sending retry {}", retry_count);
+        let message = &self.message;
         let handle = message.sender.as_ref().unwrap().to_string();
+        let my_handles = self.identity.get_handles().await;
         let raw = if message.has_payload() { Some(message.to_raw(&my_handles, &self.conn).await?) } else { None };
 
         let mut groups = vec![];
@@ -348,9 +415,9 @@ impl IMClient {
         let mut group_size = 0;
         const GROUP_MAX_SIZE: usize = 10000;
 
-        for target in targets {
+        for target in &targets {
             let encrypted = if let Some(msg) = &raw {
-                Some(self.identity.encrypt_payload(&target.delivery_data.client_data.public_message_identity_key, &msg).await?)
+                Some(self.identity.encrypt_payload(&target.delivery_data.client_data.public_message_identity_key, &msg)?)
             } else { None };
             let send_delivered = if message.send_delivered { &target.participant != message.sender.as_ref().unwrap() } else { false };
             group_size += encrypted.as_ref().map(|i| i.len()).unwrap_or(0);
@@ -375,7 +442,7 @@ impl IMClient {
                 batch: batch as u8 + 1,
                 command: message.message.get_c(),
                 encryption: if message.has_payload() { Some("pair".to_string()) } else { None },
-                user_agent: self.os_config.get_version_ua(),
+                user_agent: self.user_agent.clone(),
                 v: 8,
                 message_id: msg_id,
                 uuid: uuid.clone().into(),
@@ -383,6 +450,8 @@ impl IMClient {
                 sender: message.sender.clone().unwrap(),
                 ex: message.get_ex(),
                 no_response: message.message.get_nr(),
+                retry_count: if retry_count != 0 { Some(retry_count) } else { None },
+                original_epoch_nanos: if retry_count != 0 { Some(message.sent_timestamp * 1000000) } else { None },
             };
     
             let binary = plist_to_bin(&complete)?;
@@ -390,17 +459,15 @@ impl IMClient {
         }
 
         if message.message.get_nr() != Some(true) {
+            let mut remain_targets = targets;
             let mut refresh_targets: Vec<DeliveryHandle> = vec![];
-            let payloads_cnt = targets.len();
+            let payloads_cnt = remain_targets.len();
             info!("payload {payloads_cnt}");
 
-            for _i in 0..payloads_cnt {
-                let is_good_enough = (_i as f32) / (payloads_cnt as f32) > 0.25f32;
-
+            while !remain_targets.is_empty() {
                 let filter = get_message(|load| {
                     debug!("got {:?}", load);
                     let result: MadridRecvMessage = plist::from_value(&load).ok()?;
-                    debug!("parsed");
                     if result.command != 255 {
                         return None
                     }
@@ -408,46 +475,47 @@ impl IMClient {
                     if result.uuid.as_ref() == Some(&uuid) { Some(result) } else { None }
                 }, &["com.apple.madrid", "com.apple.private.alloy.sms"]);
 
-                let Ok(msg) = tokio::time::timeout(std::time::Duration::from_millis(if is_good_enough {
-                    500 // wait max 500ms after "good enough" to catch any stray 5032s, to prevent a network race condition
-                } else {
-                    14000 // 14 seconds wait, to cutoff inner timeout
-                }), self.conn.wait_for_timeout(&mut messages, filter)).await else {
-                    if is_good_enough {
-                        warn!("timeout with {_i}/{payloads_cnt}");
-                        warn!("Greater than 25% submission rate, ignoring undeliverable messages!");
-                        break
-                    }
-                    error!("timeout with {_i}/{payloads_cnt}");
-                    return Err(PushError::SendTimedOut)
+                let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(60 * ((retry_count as u64) + 1)), 
+                    self.conn.wait_for(&mut messages, filter)).await else {
+                    break;
                 };
                 let load = msg?;
+
+                let Some(target_idx) = remain_targets.iter().position(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) else { continue };
                 match load.status.unwrap() {
                     5032 => {
                         info!("got 5032, refreshing keys!");
-                        if let Some(target) = targets.iter().find(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) {
-                            refresh_targets.push(target.clone())
-                        }
+                        refresh_targets.push(remain_targets.remove(target_idx));
                     },
-                    0 | 5008 => { /* gtg */ },
+                    0 | 5008 => {
+                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::Sent)); // succeeded
+                    },
                     _status => {
-                        if let Some(target) = targets.iter().find(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) {
-                            if target.participant == handle {
-                                warn!("Failed to deliver to self device; ignoring!");
-                                continue // ignore errors sending to self devices
-                            }
+                        if remain_targets[target_idx].participant == handle {
+                            warn!("Failed to deliver to self device; ignoring!");
+                            continue // ignore errors sending to self devices
                         }
-                        return Err(PushError::SendErr(_status))
+                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::APSError(_status)));
                     }
                 }
             }
             
-            if !refresh_targets.is_empty() {
+            if !remain_targets.is_empty() || !refresh_targets.is_empty() {
+                // will bail early if refresh_targets is empty
                 let new_targets = self.identity.refresh_handles(&handle, &refresh_targets).await?;
-                self.send_targets(message, &new_targets).await?;
+                remain_targets.extend(new_targets);
+
+                if retry_count == 5 {
+                    for target in remain_targets {
+                        let _ = self.status.send((target, SendResult::TimedOut));
+                    }
+                    return Ok(())
+                }
+
+                self.send_targets(remain_targets, retry_count + 1).await?;
             }
         }
-
+        info!("Sending done!");
         Ok(())
     }
 }

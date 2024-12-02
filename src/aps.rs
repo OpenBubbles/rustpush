@@ -75,7 +75,10 @@ pub enum APSMessage {
     },
     Filter {
         token: Option<[u8; 32]>,
-        topics: Vec<[u8; 20]>,
+        enabled: Vec<[u8; 20]>,
+        ignored: Vec<[u8; 20]>,
+        opportunistic: Vec<[u8; 20]>,
+        paused: Vec<[u8; 20]>,
     },
     Connect {
         flags: u32,
@@ -135,13 +138,16 @@ impl APSMessage {
                     ]
                 }
             },
-            Self::Filter { token, topics } => {
+            Self::Filter { token, enabled, ignored, opportunistic, paused } => {
                 APSRawMessage {
                     command: 0x9,
                     length: 0,
                     body: [
                         vec![APSRawField { id: 1, value: token.as_ref().unwrap().to_vec(), length: 0 }],
-                        topics.iter().map(|topic| APSRawField { id: 2, value: topic.to_vec(), length: 0 }).collect(),
+                        enabled.iter().map(|topic| APSRawField { id: 2, value: topic.to_vec(), length: 0 }).collect(),
+                        ignored.iter().map(|topic| APSRawField { id: 3, value: topic.to_vec(), length: 0 }).collect(),
+                        opportunistic.iter().map(|topic| APSRawField { id: 4, value: topic.to_vec(), length: 0 }).collect(),
+                        paused.iter().map(|topic| APSRawField { id: 5, value: topic.to_vec(), length: 0 }).collect(),
                     ].concat()
                 }
             },
@@ -186,7 +192,10 @@ impl APSMessage {
             }),
             0x9 => Some(Self::Filter {
                 token: raw.get_field(1).map(|i| i.try_into().unwrap()),
-                topics: raw.body.iter().filter_map(|f| if f.id == 2 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect()
+                enabled: raw.body.iter().filter_map(|f| if f.id == 2 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
+                ignored: raw.body.iter().filter_map(|f| if f.id == 3 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
+                opportunistic: raw.body.iter().filter_map(|f| if f.id == 4 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
+                paused: raw.body.iter().filter_map(|f| if f.id == 5 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
             }),
             0x8 => Some(Self::ConnectResponse {
                 token: raw.get_field(3).map(|i| i.try_into().unwrap()),
@@ -419,28 +428,31 @@ impl APSConnectionResource {
     }
 
     pub async fn send_message(&self, topic: &str, data: Vec<u8>, id: Option<u32>) -> Result<(), PushError> {
+        let my_id = id.unwrap_or_else(|| rand::thread_rng().next_u32());
         self.send(APSMessage::Notification {
-            id: id.unwrap_or_else(|| rand::thread_rng().next_u32()),
+            id: my_id,
             topic: sha1(topic.as_bytes()),
             token: Some(self.get_token().await),
             payload: data
-        }).await
+        }).await?;
+        let status = self.wait_for_timeout(self.subscribe().await, |msg| {
+            let APSMessage::Ack { token: _token, for_id: _, status } = msg else { return None };
+            Some(status)
+        }).await?;
+        if status != 0 {
+            Err(PushError::APSAckError(status))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn subscribe(&self) -> Receiver<APSMessage> {
         self.messages.read().await.as_ref().map(|msgs| msgs.subscribe()).unwrap_or_else(|| Sender::new(1).subscribe())
     }
 
-    pub async fn wait_for_timeout<F, T>(&self, mut recv: impl BorrowMut<Receiver<APSMessage>>, mut f: F) -> Result<T, PushError>
+    pub async fn wait_for_timeout<F, T>(&self, recv: impl BorrowMut<Receiver<APSMessage>>, f: F) -> Result<T, PushError>
     where F: FnMut(APSMessage) -> Option<T> {
-        let value = tokio::time::timeout(Duration::from_secs(15), async move {
-            while let Ok(item) = recv.borrow_mut().recv().await {
-                if let Some(data) = f(item) {
-                    return Ok(data);
-                }
-            }
-            Err(PushError::SendTimedOut)
-        }).await.map_err(|_e| PushError::SendTimedOut).and_then(|e| e);
+        let value = tokio::time::timeout(Duration::from_secs(15), self.wait_for(recv, f)).await.map_err(|_e| PushError::SendTimedOut).and_then(|e| e);
 
         if value.is_err() {
             // request reload
@@ -449,6 +461,16 @@ impl APSConnectionResource {
         }
 
         value
+    }
+
+    pub async fn wait_for<F, T>(&self, mut recv: impl BorrowMut<Receiver<APSMessage>>, mut f: F) -> Result<T, PushError>
+    where F: FnMut(APSMessage) -> Option<T> {
+        while let Ok(item) = recv.borrow_mut().recv().await {
+            if let Some(data) = f(item) {
+                return Ok(data);
+            }
+        }
+        Err(PushError::SendTimedOut)
     }
 
     async fn do_reload(&self) {
@@ -471,10 +493,13 @@ impl APSConnectionResource {
     }
 
 
-    pub async fn filter(&self, topics: &[&str]) -> Result<(), PushError> {
+    pub async fn filter(&self, enabled: &[&str], ignored: &[&str], opportunistic: &[&str], paused: &[&str]) -> Result<(), PushError> {
         self.send(APSMessage::Filter {
             token: Some(self.get_token().await),
-            topics: topics.iter().map(|i| sha1(i.as_bytes())).collect()
+            enabled: enabled.iter().map(|i| sha1(i.as_bytes())).collect(),
+            ignored: ignored.iter().map(|i| sha1(i.as_bytes())).collect(),
+            opportunistic: opportunistic.iter().map(|i| sha1(i.as_bytes())).collect(),
+            paused: paused.iter().map(|i| sha1(i.as_bytes())).collect(),
         }).await
     }
 }
