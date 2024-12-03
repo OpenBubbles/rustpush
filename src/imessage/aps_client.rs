@@ -333,6 +333,13 @@ impl IMClient {
         // do not send to self
         let my_token = self.conn.get_token().await;
         message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
+
+        if message_targets.is_empty() {
+            return Ok(SendJob {
+                process: tokio::sync::broadcast::channel(1).1,
+                handle: None,
+            })
+        }
         
         let (sender, receiver) = 
             tokio::sync::broadcast::channel(message_targets.len());
@@ -509,6 +516,7 @@ impl InnerSendJob {
                     for target in remain_targets {
                         let _ = self.status.send((target, SendResult::TimedOut));
                     }
+                    info!("Retry failed");
                     return Ok(())
                 }
 
