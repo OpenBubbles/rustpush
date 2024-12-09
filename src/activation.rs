@@ -5,7 +5,7 @@ use regex::Regex;
 use reqwest::Version;
 use serde::Serialize;
 
-use crate::{util::{get_nested_value, get_reqwest, plist_to_buf, plist_to_string, KeyPair}, OSConfig, PushError};
+use crate::{util::{get_nested_value, REQWEST, plist_to_buf, plist_to_string, KeyPair}, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -93,7 +93,7 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
         activation_info: String,
     }
 
-    let request = get_reqwest()
+    let request = REQWEST
         .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
         .header("User-Agent", os_config.get_albert_ua())
         .form(&FormBody { activation_info: plist_to_string(&request)? })

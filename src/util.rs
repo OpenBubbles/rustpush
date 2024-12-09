@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::Deref;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
@@ -37,14 +37,12 @@ pub const APNS_BAG: &str = "http://init-p01st.push.apple.com/bag";
 pub const IDS_BAG: &str = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3";
 
 pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Dictionary>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
+    static CACHE: LazyLock<Mutex<HashMap<String, Dictionary>>> = LazyLock::new(Default::default);
     
-    let mut locked = cache.lock().await;
+    let mut locked = CACHE.lock().await;
 
     if !locked.contains_key(url) {
-        let client = get_reqwest();
-        let content = client.get(url).send().await?;
+        let content = REQWEST.get(url).send().await?;
         if !content.status().is_success() {
             return Err(PushError::StatusError(content.status()))
         }
@@ -71,38 +69,35 @@ fn build_proxy() -> Client {
 
     reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://192.168.99.43:8080").unwrap())
+        .proxy(Proxy::https("https://localhost:8080").unwrap())
         .default_headers(headers)
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true)
         .build().unwrap()
 }
 
-pub fn get_reqwest() -> &'static Client {
-    static CLIENT: OnceLock<Client> = OnceLock::new();
 
-    CLIENT.get_or_init(|| {
-        // return build_proxy();
-        let certificates = vec![
-            Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
-            Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
-        ];
-        let mut headers = HeaderMap::new();
-        headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
-    
-    
-        let mut builder = reqwest::Client::builder()
-            .use_rustls_tls()
-            .default_headers(headers.clone())
-            .http1_title_case_headers();
-    
-        for certificate in certificates.into_iter() {
-            builder = builder.add_root_certificate(certificate);
-        }
+pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
+    // return build_proxy();
+    let certificates = vec![
+        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
+        Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
+    ];
+    let mut headers = HeaderMap::new();
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
 
-        builder.build().unwrap()
-    })
-}
+
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .default_headers(headers.clone())
+        .http1_title_case_headers();
+
+    for certificate in certificates.into_iter() {
+        builder = builder.add_root_certificate(certificate);
+    }
+
+    builder.build().unwrap()
+});
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
     let mut curr_val = val;
@@ -327,8 +322,7 @@ struct Carrier {
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
-    let client = get_reqwest();
-    let data = client.get(CARRIER_CONFIG)
+    let data = REQWEST.get(CARRIER_CONFIG)
         .send().await?;
     
     let master: MasterList = plist::from_bytes(&data.bytes().await?)?;
@@ -343,7 +337,7 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
         let Some(latest) = bundles_by_version.keys().max_by_key(|e| e.split(".").next().unwrap().parse::<u64>().unwrap_or(0)) else { continue };
         let Some(latest_url) = &bundles_by_version[latest].bundle_url else { continue };
 
-        let zipped = client.get(latest_url)
+        let zipped = REQWEST.get(latest_url)
             .send().await?;
         let mut cursor = Cursor::new(zipped.bytes().await?);
         let mut archive = zip::ZipArchive::new(&mut cursor)?;

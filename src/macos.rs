@@ -8,7 +8,7 @@ use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, get_reqwest, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
+use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, REQWEST, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
@@ -88,10 +88,9 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
-        let client = get_reqwest();
 
         let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
-        let key = client.get(url)
+        let key = REQWEST.get(url)
             .send().await?;
         let response: CertsResponse = plist::from_bytes(&key.bytes().await?)?;
         let certs: Vec<u8> = response.cert.into();
@@ -105,7 +104,7 @@ impl OSConfig for MacOSConfig {
 
         let info = plist_to_buf(&init)?;
         let url = get_bag(IDS_BAG, "id-initialize-validation").await?.into_string().unwrap();
-        let activation = client.post(url)
+        let activation = REQWEST.post(url)
             .body(info)
             .send().await?;
 

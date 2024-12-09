@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{aps::get_message, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, get_reqwest, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{aps::get_message, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, REQWEST, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,8 +31,7 @@ async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> 
         password: pet.to_string()
     };
 
-    let client = get_reqwest();
-    let resp = client.post(os_config.get_login_url())
+    let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", os_config.get_icloud_ua())
             .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
@@ -100,7 +99,7 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
 
     let url = get_bag(IDS_BAG, user_type.auth_endpoint()).await?.into_string().unwrap();
 
-    let resp = get_reqwest().post(url)
+    let resp = REQWEST.post(url)
         .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
         .header("x-protocol-version", os_config.get_protocol_version())
         .header("content-encoding", "gzip")
