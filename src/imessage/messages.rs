@@ -12,7 +12,8 @@ use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
-use crate::{imessage::aps_client::MadridRecvMessage, util::{plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
+
+use crate::{imessage::aps_client::MadridRecvMessage, util::{plist_to_string, bin_serialize, bin_deserialize, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -483,13 +484,13 @@ pub enum BalloonLayout {
 #[repr(C)]
 #[derive(Clone)]
 pub struct Balloon {
-    url: String,
-    session: Option<String>, // UUID
-    layout: BalloonLayout,
-    ld_text: Option<String>,
-    is_live: bool,
+    pub url: String,
+    pub session: Option<String>, // UUID
+    pub layout: BalloonLayout,
+    pub ld_text: Option<String>,
+    pub is_live: bool,
 
-    icon: Vec<u8>,
+    pub icon: Vec<u8>,
 }
 
 impl Balloon {
@@ -560,8 +561,8 @@ pub struct NormalMessage {
 #[repr(C)]
 #[derive(Clone)]
 pub struct LinkMeta {
-    data: LPLinkMetadata,
-    attachments: Vec<Vec<u8>>,
+    pub data: LPLinkMetadata,
+    pub attachments: Vec<Vec<u8>>,
 }
 
 impl NormalMessage {
@@ -920,13 +921,15 @@ pub struct AttachmentPreparedPut {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MMCSFile {
-    signature: Vec<u8>,
-    object: String,
-    url: String,
-    key: Vec<u8>,
-    size: usize
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub signature: Vec<u8>,
+    pub object: String,
+    pub url: String,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub key: Vec<u8>,
+    pub size: usize
 }
 
 impl From<MMCSTransferData> for MMCSFile {
@@ -995,21 +998,21 @@ impl MMCSFile {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AttachmentType {
-    Inline(Vec<u8>),
+    Inline(#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>),
     MMCS(MMCSFile)
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Attachment {
-    a_type: AttachmentType,
-    part: u64,
-    uti_type: String,
-    mime: String,
-    name: String,
-    iris: bool // or live photo
+    pub a_type: AttachmentType,
+    pub part: u64,
+    pub uti_type: String,
+    pub mime: String,
+    pub name: String,
+    pub iris: bool // or live photo
 }
 
 impl Attachment {

@@ -381,23 +381,23 @@ impl Serialize for RawBalloonData {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExtensionApp {
-    name: String,
+    pub name: String,
     #[serde(rename = "adam-id")]
-    app_id: Option<u64>,
-    bundle_id: String,
+    pub app_id: Option<u64>,
+    pub bundle_id: String,
 
     #[serde(skip)]
-    balloon: Option<Balloon>,
+    pub balloon: Option<Balloon>,
 }
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "$class")]
 pub struct LPImageMetadata {
-    size: String,
+    pub size: String,
     #[serde(rename = "URL")]
-    url: NSURL,
-    version: u8,
+    pub url: NSURL,
+    pub version: u8,
 }
 
 #[repr(C)]
@@ -405,8 +405,8 @@ pub struct LPImageMetadata {
 #[serde(rename_all = "camelCase", tag = "$class")]
 pub struct LPIconMetadata {
     #[serde(rename = "URL")]
-    url: NSURL,
-    version: u8,
+    pub url: NSURL,
+    pub version: u8,
 }
 
 #[repr(C)]
@@ -414,8 +414,8 @@ pub struct LPIconMetadata {
 #[serde(rename_all = "camelCase", tag = "$class")]
 pub struct RichLinkImageAttachmentSubstitute {
     #[serde(rename = "MIMEType")]
-    mime_type: String,
-    rich_link_image_attachment_substitute_index: u64,
+    pub mime_type: String,
+    pub rich_link_image_attachment_substitute_index: u64,
 }
 
 
@@ -423,35 +423,35 @@ pub struct RichLinkImageAttachmentSubstitute {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "$class")]
 pub struct LPLinkMetadata {
-    image_metadata: Option<LPImageMetadata>,
-    version: u8,
-    icon_metadata: Option<LPIconMetadata>,
+    pub image_metadata: Option<LPImageMetadata>,
+    pub version: u8,
+    pub icon_metadata: Option<LPIconMetadata>,
     #[serde(rename = "originalURL")]
-    original_url: NSURL,
+    pub original_url: NSURL,
     #[serde(rename = "URL")]
-    url: Option<NSURL>,
-    title: Option<String>,
-    summary: Option<String>,
-    image: Option<RichLinkImageAttachmentSubstitute>,
-    icon: Option<RichLinkImageAttachmentSubstitute>,
-    images: Option<NSArray<LPImageMetadata>>,
-    icons: Option<NSArray<LPIconMetadata>>,
+    pub url: Option<NSURL>,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub image: Option<RichLinkImageAttachmentSubstitute>,
+    pub icon: Option<RichLinkImageAttachmentSubstitute>,
+    pub images: Option<NSArray<LPImageMetadata>>,
+    pub icons: Option<NSArray<LPIconMetadata>>,
 }
 
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "$class")]
 pub struct RichLink {
-    rich_link_metadata: LPLinkMetadata,
-    rich_link_is_placeholder: bool,
+    pub rich_link_metadata: LPLinkMetadata,
+    pub rich_link_is_placeholder: bool,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct BaseBalloonBody {
     #[serde(rename = "__payload__")]
-    payload: Data,
+    pub payload: Data,
     #[serde(rename = "__attachments__")]
-    attachments: Vec<Data>,
+    pub attachments: Vec<Data>,
 }
 
 
