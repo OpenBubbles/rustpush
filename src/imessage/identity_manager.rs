@@ -473,9 +473,11 @@ impl IdentityResource {
 
     pub async fn get_key_for_sender(&self, handle: &str, sender: &str, sender_token: &[u8]) -> Result<IDSDeliveryData, PushError> {
         let mut retry_count = 0;
-        (|| async move {
+        (|| {
             retry_count += 1;
-            self.get_key_for_sender_once(handle, sender, sender_token, retry_count > 1).await
+            async move {
+                self.get_key_for_sender_once(handle, sender, sender_token, retry_count > 1).await
+            }
         })
             .retry(&ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(1))
             .when(|e| !matches!(e, PushError::DoNotRetry(_))).await
