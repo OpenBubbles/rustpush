@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{aps::get_message, imessage::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, REQWEST, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{aps::get_message, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, REQWEST, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]

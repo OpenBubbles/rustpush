@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{imessage::aps_client::MadridRecvMessage, util::{plist_to_string, bin_serialize, bin_deserialize, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
+use crate::{ids::IDSRecvMessage, util::{plist_to_string, bin_serialize, bin_deserialize, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1096,7 +1096,7 @@ pub const SUPPORTED_COMMANDS: &[u8] = &[
 
 impl Message {
     // also add new C values to client.rs raw_inbound
-    pub(super) fn get_c(&self) -> u8 {
+    pub fn get_c(&self) -> u8 {
         match self {
             Self::Message(msg) => {
                 match msg.service {
@@ -1130,7 +1130,7 @@ impl Message {
         }
     }
 
-    pub(super) fn should_send_delivered(&self, conversation: &ConversationData) -> bool {
+    pub fn should_send_delivered(&self, conversation: &ConversationData) -> bool {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::IMessage) && !conversation.is_group(),
             Message::React(_) => conversation.is_group(),
@@ -1138,7 +1138,7 @@ impl Message {
         }
     }
 
-    pub(super) fn is_sms(&self) -> bool {
+    pub fn is_sms(&self) -> bool {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::SMS { is_phone: _, using_number: _, from_handle: _ }),
             Message::SmsConfirmSent(_) => true,
@@ -1146,7 +1146,7 @@ impl Message {
         }
     }
 
-    pub(super) fn get_nr(&self) -> Option<bool> {
+    pub fn get_nr(&self) -> Option<bool> {
         if self.is_sms() {
             return Some(true)
         }
@@ -1391,7 +1391,7 @@ impl MessageInst {
         target_participants
     }
 
-    pub(super) async fn to_raw(&self, my_handles: &[String], apns: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
+    pub async fn to_raw(&self, my_handles: &[String], apns: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -1777,7 +1777,7 @@ impl MessageInst {
     }
 
     #[async_recursion]
-    pub(super) async fn from_raw(value: Value, wrapper: &MadridRecvMessage, apns: &APSConnectionResource) -> Result<MessageInst, PushError> {
+    pub async fn from_raw(value: Value, wrapper: &IDSRecvMessage, apns: &APSConnectionResource) -> Result<MessageInst, PushError> {
         debug!("xml: {:?}",value);
         if let Ok(loaded) = plist::from_value::<RawSmsActivateMessage>(&value) {
             if !loaded.wc && loaded.ar {

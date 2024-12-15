@@ -6,63 +6,15 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage, ErrorMessage, SUPPORTED_COMMANDS}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
 
-use super::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, messages::{ErrorMessage, SUPPORTED_COMMANDS}, user::{IDSUserIdentity, QueryOptions}};
+use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
 use rand::RngCore;
+use crate::ids::IDSRecvMessage;
 use async_recursion::async_recursion;
 
-#[derive(Deserialize)]
-pub struct MadridRecvMessage {
-    // all messages
-    #[serde(rename = "c")]
-    pub command: u8,
-    #[serde(rename = "e")]
-    pub ns_since_epoch: Option<u64>,
-
-    #[serde(default, rename = "U", deserialize_with = "bin_deserialize_opt_vec")]
-    pub uuid: Option<Vec<u8>>,
-    #[serde(rename = "sP")]
-    pub sender: Option<String>,
-    #[serde(default, rename = "t", deserialize_with = "bin_deserialize_opt_vec")]
-    pub token: Option<Vec<u8>>,
-    #[serde(rename = "tP")]
-    pub target: Option<String>,
-    #[serde(rename = "nr")]
-    pub no_reply: Option<bool>,
-
-    // for c = 100
-    #[serde(rename = "eX")]
-    pub is_typing: Option<u64>,
-    #[serde(rename = "D")]
-    pub send_delivered: Option<bool>,
-
-    // old iOS participants change
-    #[serde(rename = "p")]
-    message_unenc: Option<Value>,
-
-    #[serde(default, rename = "P", deserialize_with = "bin_deserialize_opt_vec")]
-    message: Option<Vec<u8>>,
-
-    // for confirm
-    #[serde(rename = "s")]
-    status: Option<i64>,
-
-    #[serde(default, rename = "fU", deserialize_with = "bin_deserialize_opt_vec")]
-    error_for: Option<Vec<u8>>,
-    #[serde(rename = "fRM")]
-    error_string: Option<String>,
-    #[serde(rename = "fR")]
-    error_status: Option<u64>,
-    #[serde(rename = "fM")]
-    error_for_str: Option<String>,
-
-    #[serde(skip)]
-    verification_failed: bool,
-}
-
-impl MadridRecvMessage {
+impl IDSRecvMessage {
     pub fn to_message(&self, conversation: Option<ConversationData>, message: Message) -> Result<MessageInst, PushError> {
         let Self {
             sender,
@@ -170,7 +122,7 @@ impl IMClient {
     pub async fn receive_wait(&self) -> Result<Option<MessageInst>, PushError> {
         let mut filter = get_message(|load| {
             debug!("recv {:?}", load);
-            let parsed: MadridRecvMessage = plist::from_value(&load).ok()?;
+            let parsed: IDSRecvMessage = plist::from_value(&load).ok()?;
             if SUPPORTED_COMMANDS.contains(&parsed.command) {
                     Some(parsed)
                 } else { None }
@@ -185,10 +137,10 @@ impl IMClient {
         }
     }
     
-    async fn process_msg(&self, mut payload: MadridRecvMessage) -> Result<Option<MessageInst>, PushError> {
+    async fn process_msg(&self, mut payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
         let command = payload.command;
         // delivered/read
-        if let MadridRecvMessage {
+        if let IDSRecvMessage {
             command: 101 | 102,
             ..
         } = &payload {
@@ -200,7 +152,7 @@ impl IMClient {
         }
 
         // typing
-        if let MadridRecvMessage {
+        if let IDSRecvMessage {
             sender: Some(sender),
             target: Some(target),
             is_typing: Some(0),
@@ -220,7 +172,7 @@ impl IMClient {
         }
 
         // errors
-        if let MadridRecvMessage {
+        if let IDSRecvMessage {
             command: 120,
             error_for: Some(_),
             error_status: Some(error_status),
@@ -236,7 +188,7 @@ impl IMClient {
         }
 
         // TODO rewrite
-        if let MadridRecvMessage {
+        if let IDSRecvMessage {
             command: 130,
             sender: Some(sender),
             target: Some(target),
@@ -265,7 +217,7 @@ impl IMClient {
             })
         }
 
-        if let MadridRecvMessage {
+        if let IDSRecvMessage {
             command: 145,
             no_reply: None | Some(false),
             sender: Some(sender),
@@ -280,7 +232,7 @@ impl IMClient {
         }
 
         if payload.message_unenc.is_none() {
-            let MadridRecvMessage {
+            let IDSRecvMessage {
                 sender: Some(sender),
                 target: Some(target),
                 message: Some(message),
@@ -474,7 +426,7 @@ impl InnerSendJob {
             while !remain_targets.is_empty() {
                 let filter = get_message(|load| {
                     debug!("got {:?}", load);
-                    let result: MadridRecvMessage = plist::from_value(&load).ok()?;
+                    let result: IDSRecvMessage = plist::from_value(&load).ok()?;
                     if result.command != 255 {
                         return None
                     }

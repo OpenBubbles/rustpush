@@ -6,6 +6,7 @@ mod imessage;
 mod mmcs;
 mod error;
 mod auth;
+mod ids;
 pub mod findmy;
 
 #[cfg(feature = "macOS")]
@@ -29,7 +30,7 @@ pub use imessage::aps_client::{IMClient, SendJob};
 use openssl::conf;
 use util::encode_hex;
 pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray};
-pub use imessage::user::{IDSUser, register, IDSUserIdentity, PrivateDeviceInfo, SupportAlert, SupportAction};
+pub use ids::user::{IDSUser, register, IDSUserIdentity, PrivateDeviceInfo, SupportAlert, SupportAction};
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate};
 pub use error::PushError;
 #[cfg(feature = "macOS")]

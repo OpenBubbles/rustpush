@@ -450,6 +450,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
                 ("supports-dq-nr", Value::Boolean(true)),
                 ("supports-family-invite-message-bubble", Value::Boolean(true)),
                 ("supports-live-delivery", Value::Boolean(true)),
+                ("supports-findmy-plugin-messages", Value::Boolean(true)),
             ].into_iter()))),
             ("uris", Value::Array(
                 handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([

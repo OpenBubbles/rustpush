@@ -459,44 +459,44 @@ pub struct BaseBalloonBody {
 
 
 #[derive(Serialize, Deserialize, Clone)]
-pub(super) struct BundledPayload {
+pub struct BundledPayload {
     #[serde(rename = "tP")]
-    pub(super) participant: String,
+    pub participant: String,
     #[serde(rename = "D")]
-    pub(super) send_delivered: bool,
+    pub send_delivered: bool,
     #[serde(rename = "sT")]
-    pub(super) session_token: Data,
+    pub session_token: Data,
     #[serde(rename = "P")]
-    pub(super) payload: Option<Data>,
+    pub payload: Option<Data>,
     #[serde(rename = "t")]
-    pub(super) token: Data,
+    pub token: Data,
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct SendMessage {
+pub struct SendMessage {
     #[serde(rename = "fcn")]
-    pub(super) batch: u8,
+    pub batch: u8,
     #[serde(rename = "c")]
-    pub(super) command: u8,
+    pub command: u8,
     #[serde(rename = "E")]
-    pub(super) encryption: Option<String>,
+    pub encryption: Option<String>,
     #[serde(rename = "ua")]
-    pub(super) user_agent: String,
-    pub(super) v: u8,
+    pub user_agent: String,
+    pub v: u8,
     #[serde(rename = "i")]
-    pub(super) message_id: u32,
+    pub message_id: u32,
     #[serde(rename = "U")]
-    pub(super) uuid: Data,
+    pub uuid: Data,
     #[serde(rename = "dtl")]
-    pub(super) payloads: Vec<BundledPayload>,
+    pub payloads: Vec<BundledPayload>,
     #[serde(rename = "sP")]
-    pub(super) sender: String,
+    pub sender: String,
     #[serde(rename = "eX")]
-    pub(super) ex: Option<u32>,
+    pub ex: Option<u32>,
     #[serde(rename = "nr")]
-    pub(super) no_response: Option<bool>,
+    pub no_response: Option<bool>,
     #[serde(rename = "rc")]
-    pub(super) retry_count: Option<u8>,
+    pub retry_count: Option<u8>,
     #[serde(rename = "oe")]
-    pub(super) original_epoch_nanos: Option<u64>,
+    pub original_epoch_nanos: Option<u64>,
 }
