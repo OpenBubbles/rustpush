@@ -344,7 +344,7 @@ struct RawBalloonData {
     live_layout_info: Option<NSData>,
     #[serde(rename = "URL")]
     url: NSURL,
-    appid: u64,
+    appid: Option<u64>,
 }
 
 impl Serialize for RawBalloonData {
@@ -357,9 +357,12 @@ impl Serialize for RawBalloonData {
         dict.extend([
             ("an".to_string(), self.app_name.clone().into()),
             ("ai".to_string(), plist::to_value(&self.app_icon).map_err(serde::ser::Error::custom)?),
-            ("URL".to_string(), plist::to_value(&self.url).map_err(serde::ser::Error::custom)?),
-            ("appid".to_string(), self.appid.into())
+            ("URL".to_string(), plist::to_value(&self.url).map_err(serde::ser::Error::custom)?)
         ].into_iter());
+
+        if let Some(appid) = &self.appid {
+            dict["appid"] = appid.into();
+        }
 
         if let Some(ldtext) = &self.ldtext {
             dict.insert("ldtext".to_string(), ldtext.clone().into());

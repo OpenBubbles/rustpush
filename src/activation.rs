@@ -95,7 +95,7 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
 
     let request = REQWEST
         .post(format!("https://albert.apple.com/deviceservices/deviceActivation?device={}", os_config.get_activation_device()))
-        .header("User-Agent", os_config.get_albert_ua())
+        .header("User-Agent", os_config.get_normal_ua("ApplePushService/4.0"))
         .form(&FormBody { activation_info: plist_to_string(&request)? })
         .send().await?
         .text().await?;

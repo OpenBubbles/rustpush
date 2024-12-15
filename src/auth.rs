@@ -1,10 +1,11 @@
-use std::{io::Cursor, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
 use log::debug;
+use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
 use plist::{Data, Dictionary, Value};
 use reqwest::{header::{HeaderMap, HeaderName}, Client, Method, Request, RequestBuilder, Response, Url};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
@@ -19,22 +20,63 @@ struct AuthRequest {
     password: String
 }
 
-async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<(String, String), PushError> {
+#[derive(Clone, Copy)]
+pub enum LoginDelegate {
+    IDS,
+    MobileMe,
+}
+
+impl LoginDelegate {
+    fn delegate(&self) -> (&'static str, Value) {
+        match self {
+            Self::IDS => {
+                ("com.apple.private.ids", Value::Dictionary(Dictionary::from_iter([
+                    ("protocol-version", Value::String("4".to_string()))
+                ].into_iter())))
+            },
+            Self::MobileMe => {
+                ("com.apple.mobileme", Value::Dictionary(Dictionary::new()))
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct IDSDelegateResponse {
+    pub auth_token: String,
+    pub profile_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct MobileMeDelegateResponse {
+    pub tokens: HashMap<String, String>,
+}
+
+pub struct DelegateResponses {
+    pub ids: Option<IDSDelegateResponse>,
+    pub mobileme: Option<MobileMeDelegateResponse>,
+}
+
+pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &str, adsid: &str, anisette: &mut AnisetteClient<T>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
     let request = AuthRequest {
         apple_id: username.to_string(),
         client_id: Uuid::new_v4().to_string(),
-        delegates: Value::Dictionary(Dictionary::from_iter([
-            ("com.apple.private.ids", Value::Dictionary(Dictionary::from_iter([
-                ("protocol-version", Value::String("4".to_string()))
-            ].into_iter()))),
-        ].into_iter())),
+        delegates: Value::Dictionary(Dictionary::from_iter(delegates.iter().map(|d| d.delegate()))),
         password: pet.to_string()
     };
 
+    let validation_data = os_config.generate_validation_data().await?;
+
+    let base_headers = anisette.get_headers().await?;
+
     let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
-            .header("User-Agent", os_config.get_icloud_ua())
+            .header("User-Agent", os_config.get_normal_ua("com.apple.iCloudHelper/282"))
             .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
+            .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
+            .header("X-Apple-ADSID", adsid)
+            .headers(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect())
             .basic_auth(username, Some(pet))
             .body(plist_to_string(&request)?)
             .send()
@@ -55,14 +97,18 @@ async fn get_auth_token(username: &str, pet: &str, os_config: &dyn OSConfig) -> 
         return Err(PushError::AuthError(parsed.clone()));
     }
 
-    let ids_data = parsed_dict.get("delegates").unwrap().as_dictionary().unwrap()
-        .get("com.apple.private.ids").unwrap().as_dictionary().unwrap()
-        .get("service-data").unwrap().as_dictionary().unwrap();
+    fn get_delegate<T: DeserializeOwned>(delegates: &Dictionary, item: &str) -> Result<Option<T>, PushError> {
+        let Some(Value::Dictionary(item)) = delegates.get(item) else { return Ok(None) };
+        let data = item.get("service-data").unwrap();
+        Ok(Some(plist::from_value(data)?))
+    }
 
-    let token = ids_data.get("auth-token").unwrap().as_string().unwrap();
-    let user = ids_data.get("profile-id").unwrap().as_string().unwrap();
-    
-    Ok((token.to_string(), user.to_string()))
+    let delegates = parsed_dict.get("delegates").unwrap().as_dictionary().unwrap();
+
+    Ok(DelegateResponses {
+        ids: get_delegate(delegates, "com.apple.private.ids")?,
+        mobileme: get_delegate(delegates, "com.apple.mobileme")?,
+    })
 }
 
 #[derive(Serialize)]
@@ -136,9 +182,8 @@ pub struct AuthPhone {
     pub sigs: Vec<Data>
 }
 
-pub async fn authenticate_apple(username: &str, pet: &str, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
-    let (token, user) = get_auth_token(username, pet, os_config).await?;
-    authenticate(os_config, &user, plist::to_value(&AuthApple { auth_token: token })?, IDSUserType::Apple).await
+pub async fn authenticate_apple(ids_delegate: IDSDelegateResponse, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
+    authenticate(os_config, &ids_delegate.profile_id, plist::to_value(&AuthApple { auth_token: ids_delegate.auth_token })?, IDSUserType::Apple).await
 }
 
 pub async fn authenticate_phone(number: &str, phone: AuthPhone, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {

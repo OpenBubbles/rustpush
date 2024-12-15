@@ -1,6 +1,7 @@
 use std::{any::Any, io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
+use omnisette::AnisetteError;
 #[cfg(feature = "macOS")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
@@ -94,4 +95,8 @@ pub enum PushError {
     WebTunnelError(u16),
     #[error("APS Ack error {0}!")]
     APSAckError(u8),
+    #[error("Anisette Error {0}!")]
+    AnisetteError(#[from] AnisetteError),
+    #[error("JSON Error {0}!")]
+    JsonError(#[from] serde_json::Error),
 }

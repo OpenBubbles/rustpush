@@ -2,7 +2,6 @@
 use std::{collections::HashMap, time::{Duration, SystemTime}};
 
 use async_trait::async_trait;
-use icloud_auth::{AnisetteConfiguration, LoginClientInfo};
 use open_absinthe::nac::{HardwareConfig, ValidationCtx};
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
@@ -55,12 +54,9 @@ impl OSConfig for MacOSConfig {
         }
     }
 
-    fn get_icloud_ua(&self) -> String {
-        self.icloud_ua.clone()
-    }
-
-    fn get_albert_ua(&self) -> String {
-        "ApplePushService/4.0 CFNetwork/1492.0.1 Darwin/23.3.0".to_string()
+    fn get_normal_ua(&self, item: &str) -> String {
+        let part = self.icloud_ua.split_once(char::is_whitespace).unwrap().0;
+        format!("{item} {part}")
     }
 
     fn get_aoskit_version(&self) -> String {
@@ -68,7 +64,7 @@ impl OSConfig for MacOSConfig {
     }
 
     fn get_mme_clientinfo(&self, for_item: &str) -> String {
-        format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, self.aoskit_version)
+        format!("<{}> <macOS;{};{}> <{}>", self.inner.product_name, self.version, self.inner.os_build_num, for_item)
     }
 
     fn get_version_ua(&self) -> String {

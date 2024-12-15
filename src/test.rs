@@ -1,11 +1,12 @@
 
-use std::{io::Cursor, path::PathBuf, sync::Arc};
+use std::{io::Cursor, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 
 use base64::engine::general_purpose;
-use icloud_auth::{AnisetteConfiguration, AppleAccount};
+use icloud_auth::AppleAccount;
 use log::{info, error};
+use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, get_gsa_config, register, APSConnectionResource, APSState, ConversationData, IDSUser, IDSUserIdentity, IMClient, MacOSConfig, Message, MessageInst, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, get_gateways_for_mccmnc, login_apple_delegates, register, APSConnectionResource, APSState, Attachment, ConversationData, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, RelayConfig};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -13,6 +14,7 @@ use serde::{Serialize, Deserialize};
 use std::io::Write;
 use base64::Engine;
 use std::str::FromStr;
+use std::io::Seek;
 use rustpush::OSConfig;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -144,13 +146,18 @@ async fn main() {
             std::io::stdin().read_line(&mut input).unwrap();
             input.trim().to_string()
         };
-        let acc = AppleAccount::login(appleid_closure, tfa_closure,AnisetteConfiguration::new()
-            .set_client_info(get_gsa_config(&*connection.state.read().await, config.as_ref()))
-            .set_configuration_path(PathBuf::from_str("anisette_test").unwrap())).await;
 
-        let account = acc.unwrap();
+
+        
+        let mut client = default_provider(config.get_gsa_config(&*connection.state.read().await), PathBuf::from_str("anisette_test").unwrap());
+        let acc = AppleAccount::login(appleid_closure, tfa_closure, 
+                config.get_gsa_config(&*connection.state.read().await), client.clone()).await;
+
+        let account: AppleAccount<_> = acc.unwrap();
         let pet = account.get_pet().unwrap();
-        let user = authenticate_apple(&user_trimmed, &pet, config.as_ref()).await.unwrap();
+
+        let delegates = login_apple_delegates(&user_trimmed, &pet, account.spd.as_ref().unwrap()["adsid"].as_string().unwrap(), &mut *client.lock().await, config.as_ref(), &[LoginDelegate::IDS]).await.unwrap();
+        let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         vec![user]
     };
@@ -174,6 +181,8 @@ async fn main() {
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
     let handle = client.identity.get_handles().await[0].clone();
+
+    // client.identity.refresh_now().await.unwrap();
 
 
     //sleep(Duration::from_millis(10000)).await;
@@ -243,9 +252,19 @@ async fn main() {
                             sender_guid: Some(Uuid::new_v4().to_string()),
                             after_guid: None,
                         }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage)));
+
+                        // msg.scheduled_ms = Some((SystemTime::now() + Duration::from_secs(60)).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64);
+
                         if let Err(err) = client.send(&mut msg).await {
                             error!("Error sending message {err}");
                         }
+
+                        // tokio::time::sleep(Duration::from_secs(10)).await;
+
+                        // msg.message = Message::Unschedule;
+                        // if let Err(err) = client.send(&mut msg).await {
+                        //     error!("Error sending message {err}");
+                        // }
                     }
                 }
                 print!(">> ");

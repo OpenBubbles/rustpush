@@ -440,7 +440,7 @@ impl ExtensionApp {
 
         Ok(ExtensionApp {
             name: raw.app_name.clone(),
-            app_id: Some(raw.appid.clone()),
+            app_id: raw.appid.clone(),
             bundle_id: bid.to_string(),
             balloon: Some(Balloon::from_raw(raw)?)
         })
@@ -494,6 +494,9 @@ pub struct Balloon {
 }
 
 impl Balloon {
+    fn decode_raw(bp: &[u8]) -> Result<Balloon, PushError> {
+        Balloon::from_raw(Balloon::unpack_raw(bp)?)
+    }
 
     fn unpack_raw(bp: &[u8]) -> Result<RawBalloonData, PushError> {
         let unpacked: NSDictionary<RawBalloonData> = plist::from_value(&KeyedArchive::expand(&ungzip(&bp)?)?)?;
@@ -534,7 +537,7 @@ impl Balloon {
                     base: "$null".to_string(),
                     relative: self.url.clone()
                 },
-                appid: app.app_id.clone().expect("send without appid??"),
+                appid: app.app_id.clone(),
             },
             class: NSDictionaryClass::NSMutableDictionary
         };
@@ -1988,6 +1991,19 @@ impl MessageInst {
                 // parsing failures for com.apple.Stickers.UserGenerated.MessagesExtension
                 app = match ExtensionApp::from_ati(app_info.as_ref(), balloon_part.as_ref().map(|i| i.as_ref())) {
                     Ok(i) => Some(i),
+                    Err(e) => {
+                        warn!("Error parsing balloon {e}");
+                        None
+                    }
+                };
+            } else if let Some(balloon) = &balloon_part {
+                app = match Balloon::decode_raw(&balloon) {
+                    Ok(i) => Some(ExtensionApp {
+                        app_id: None,
+                        name: "None".to_string(),
+                        bundle_id: loaded.balloon_id.clone().unwrap(),
+                        balloon: Some(i),
+                    }),
                     Err(e) => {
                         warn!("Error parsing balloon {e}");
                         None
