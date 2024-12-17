@@ -376,6 +376,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
                 "platform": "macosx",
                 "processId": rand::thread_rng().gen_range(600..2000u32).to_string(),
                 "productType": meta.hardware_version,
+                "selectedFriend": self.selected_friend,
                 "regionCode": "US",
                 "signedInAs": "tag3@copper.jjtech.dev",
                 "timezone": "EST, -18000",
@@ -476,10 +477,10 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         let _ = client.make_request::<serde_json::Value>(config, if daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
 
         Ok(client)
-    }
+    }   
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, "minCallback/refreshClient", json!({})).await?;
+        let _ = self.make_request::<serde_json::Value>(config, if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" }, json!({})).await?;
         Ok(())
     }
 
