@@ -1,16 +1,31 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use futures::lock::Mutex;
+use log::debug;
 use omnisette::{AnisetteClient, AnisetteError, AnisetteHeaders, AnisetteProvider, ArcAnisetteClient};
 use plist::{Dictionary, Value};
 use rand::Rng;
 use reqwest::{header::{HeaderMap, HeaderName}, Request};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
-use crate::{auth::MobileMeDelegateResponse, util::{encode_hex, REQWEST}, APSConnection, OSConfig, PushError};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget}, user::IDSService, IDSRecvMessage}, util::{encode_hex, REQWEST}, APSConnection, APSMessage, OSConfig, PushError};
 
-
+pub const MULTIPLEX_SERVICE: IDSService = IDSService {
+    name: "com.apple.private.alloy.multiplex1",
+    sub_services: &[
+        "com.apple.private.alloy.fmf",
+        "com.apple.private.alloy.fmd",
+    ],
+    client_data: &[
+        ("supports-fmd-v2", Value::Boolean(true)),
+        ("supports-incoming-fmd-v1", Value::Boolean(true)),
+    ],
+    flags: 1,
+    capabilities_name: "com.apple.private.alloy"
+};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FindMyState {
@@ -18,23 +33,25 @@ pub struct FindMyState {
     fmf_token: String,
     fmip_token: String,
     udid: String,
+    user: String,
 }
 
 impl FindMyState {
-    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> FindMyState {
-        let udid: [u8; 40] = rand::thread_rng().gen();
+    pub fn new(dsid: String, user: String, delegate: &MobileMeDelegateResponse) -> FindMyState {
+        let udid: [u8; 20] = rand::thread_rng().gen();
         FindMyState {
             dsid,
             fmf_token: delegate.tokens["mmeFMFAppToken"].clone(),
             fmip_token: delegate.tokens["mmeFMIPAppToken"].clone(),
             udid: encode_hex(&udid),
+            user
         }
     }
 }
 
-async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver: &str, anisette: &mut AnisetteClient<T>) -> Result<HeaderMap, PushError> {
+async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver: &str, anisette: &mut AnisetteClient<T>, ua: &str) -> Result<HeaderMap, PushError> {
     let mut map = HeaderMap::new();
-    map.insert("User-Agent", config.get_normal_ua("Find%20My/375.20").parse().unwrap());
+    map.insert("User-Agent", config.get_normal_ua(ua).parse().unwrap());
     map.insert("X-Apple-Realm-Support", "1.0".parse().unwrap());
     map.insert("X-MME-CLIENT-INFO", config.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.findmy/375.20)").parse().unwrap());
     map.insert("X-Apple-AuthScheme", "Forever".parse().unwrap());
@@ -51,6 +68,66 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
     Ok(map)
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kFMFServicePayloadKey", rename_all = "camelCase")]
+enum FMFPayload {
+    MappingPacket {
+        p: String
+    }
+}
+
+pub struct FindMyClient<P: AnisetteProvider> {
+    pub conn: APSConnection,
+    pub identity: IdentityManager,
+    _interest_token: APSInterestToken,
+    pub daemon: Mutex<FindMyFriendsClient<P>>,
+    config: Arc<dyn OSConfig>,
+}
+
+impl<P: AnisetteProvider> FindMyClient<P> {
+    pub async fn new(conn: APSConnection, config: Arc<dyn OSConfig>, state: FindMyState, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
+        let client = FindMyFriendsClient::new(config.as_ref(), state, conn.clone(), anisette, true).await?;
+        Ok(FindMyClient {
+            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"]).await.0,
+            conn,
+            identity,
+            daemon: Mutex::new(client),
+            config,
+        })
+    }
+
+    pub async fn handle(&self, msg: APSMessage) -> Result<(), PushError> {
+        if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"]).await? {
+            let parsed: FMFPayload = plist::from_value(&message)?;
+            debug!("Find my IDS message came in as {}", encode_hex(&uuid));
+            match parsed {
+                FMFPayload::MappingPacket { p } => {
+                    let since_the_epoch = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("Time went backwards");
+                    let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender], &[MessageTarget::Token(token)])?;
+                    self.identity.send_message(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"].into_iter().find(|i| i == &topic).unwrap(), IDSSendMessage {
+                        sender: target,
+                        raw: None,
+                        send_delivered: false,
+                        command: 244,
+                        ex: None,
+                        no_response: true,
+                        id: Uuid::new_v4().to_string().to_uppercase(),
+                        sent_timestamp: since_the_epoch.as_millis() as u64,
+                        response_for: Some(uuid),
+                    }, targets).await?;
+
+                    debug!("Importing find my token {p}!");
+
+                    self.daemon.lock().await.import(self.config.as_ref(), &p).await?;
+                    debug!("Imported find my token {p}!");
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct LocateInProgress {
@@ -195,7 +272,7 @@ pub struct FindMyPhoneClient<P: AnisetteProvider> {
 impl<P: AnisetteProvider> FindMyPhoneClient<P> {
     async fn make_request<T: for<'a> Deserialize<'a>>(&mut self, config: &dyn OSConfig, path: &str) -> Result<T, PushError> {
         let request = REQWEST.post(format!("https://p{}-fmipmobile.icloud.com/fmipservice/device/{}/{}", self.server, self.state.dsid, path))
-            .headers(get_find_my_headers(config, "3.0", &mut *self.anisette.lock().await).await?)
+            .headers(get_find_my_headers(config, "3.0", &mut *self.anisette.lock().await, "Find%20My/375.20").await?)
             .basic_auth(&self.state.dsid, Some(&self.state.fmip_token));
 
         let ms_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as f64 / 1000f64;
@@ -265,50 +342,83 @@ pub struct FindMyFriendsClient<P: AnisetteProvider> {
     pub followers: Vec<Follow>,
     pub following: Vec<Follow>,
     aps: APSConnection,
+    daemon: bool,
 }
 
 impl<P: AnisetteProvider> FindMyFriendsClient<P> {
-    async fn make_request<T: for<'a> Deserialize<'a>>(&mut self, config: &dyn OSConfig, path: &str) -> Result<T, PushError> {
-        let request = REQWEST.post(format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/{}/{}/{}", self.server, self.state.dsid, self.state.udid.to_uppercase(), path))
-            .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await).await?)
+    async fn make_request<T: for<'a> Deserialize<'a>>(&mut self, config: &dyn OSConfig, path: &str, data: serde_json::Value) -> Result<T, PushError> {
+        let request = REQWEST.post(format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/{}/{}/{}", self.server, 
+                if self.daemon { format!("fmfd/{}", self.state.dsid) } else { self.state.dsid.clone() }, self.state.udid.to_uppercase(), path))
+            .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await, if self.daemon { "FMFD/1.0" } else { "Find%20My/375.20" }).await?)
             .header("X-FMF-Model-Version", "1")
             .basic_auth(&self.state.dsid, Some(&self.state.fmf_token));
 
         let ms_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as f64 / 1000f64;
         let meta = config.get_debug_meta();
+        let reg = config.get_register_meta();
 
         let token = self.aps.get_token().await;
 
-        let client_context = json!({
-            "appPushModeAllowed": true,
-            "appVersion": "7.0",
-            "apsToken": encode_hex(&token).to_uppercase(),
-            "countryCode": "US",
-            "currentTime": ms_since_epoch,
-            "deviceClass": "Mac",
-            "deviceUDID": self.state.udid,
-            "frontMostWindow": false,
-            "legacyFallbackData": {},
-            "limitedPrecision": false,
-            "liveSessionStatistics": {},
-            "osVersion": meta.user_version,
-            "productType": meta.hardware_version,
-            "pushMode": true,
-            "regionCode": "US",
-            "selectedFriend": self.selected_friend,
-            "tabs": {
-                "currentTab": [],
-                "lastVisitedTime": [],
-                "timeSpent": []
-            },
-            "windowVisible": false
-        });
+        let client_context = if self.daemon {
+            json!({
+                "appName": "fmfd",
+                "appVersion": "7.0",
+                "apsToken": encode_hex(&token).to_uppercase(),
+                "buildVersion": reg.software_version,
+                "countryCode": "CA",
+                "currentTime": ms_since_epoch,
+                "deviceClass": "Mac",
+                "deviceHasPasscode": true,
+                "deviceUDID": self.state.udid,
+                "fencingEnabled": true,
+                "isFMFAppRemoved": false,
+                "osVersion": meta.user_version,
+                "platform": "macosx",
+                "processId": rand::thread_rng().gen_range(600..2000u32).to_string(),
+                "productType": meta.hardware_version,
+                "regionCode": "US",
+                "signedInAs": "tag3@copper.jjtech.dev",
+                "timezone": "EST, -18000",
+                "unlockState": 0,
+            })
+        } else {
+            json!({
+                "appPushModeAllowed": true,
+                "appVersion": "7.0",
+                "apsToken": encode_hex(&token).to_uppercase(),
+                "countryCode": "US",
+                "currentTime": ms_since_epoch,
+                "deviceClass": "Mac",
+                "deviceUDID": self.state.udid,
+                "frontMostWindow": false,
+                "legacyFallbackData": {},
+                "limitedPrecision": false,
+                "liveSessionStatistics": {},
+                "osVersion": meta.user_version,
+                "productType": meta.hardware_version,
+                "pushMode": true,
+                "regionCode": "US",
+                "selectedFriend": self.selected_friend,
+                "tabs": {
+                    "currentTab": [],
+                    "lastVisitedTime": [],
+                    "timeSpent": []
+                },
+                "windowVisible": false
+            })
+        };
 
-        let raw_request: serde_json::Value = request.json(&json!({
+        let mut req = json!({
             "clientContext": client_context,
             "dataContext": self.data_context,
             "serverContext": self.server_context,
-        })).send().await?.json().await?;
+        });
+
+        let serde_json::Value::Object(obj) = &mut req else { panic!() };
+        let serde_json::Value::Object(data) = data else { panic!() };
+        obj.extend(data.into_iter());
+
+        let raw_request: serde_json::Value = request.json(&req).send().await?.json().await?;
 
         let request: FindMyFriendsStateUpdate = serde_json::from_value(raw_request.clone())?;
 
@@ -349,7 +459,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
     }
 
 
-    pub async fn new(config: &dyn OSConfig, state: FindMyState, aps: APSConnection, anisette: ArcAnisetteClient<P>) -> Result<FindMyFriendsClient<P>, PushError> {
+    pub async fn new(config: &dyn OSConfig, state: FindMyState, aps: APSConnection, anisette: ArcAnisetteClient<P>, daemon: bool) -> Result<FindMyFriendsClient<P>, PushError> {
         let mut client = FindMyFriendsClient {
             data_context: json!({}),
             server_context: json!({}),
@@ -360,15 +470,21 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             followers: vec![],
             following: vec![],
             aps,
+            daemon
         };
 
-        let _ = client.make_request::<serde_json::Value>(config, "first/initClient").await?;
+        let _ = client.make_request::<serde_json::Value>(config, if daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
 
         Ok(client)
     }
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, "minCallback/refreshClient").await?;
+        let _ = self.make_request::<serde_json::Value>(config, "minCallback/refreshClient", json!({})).await?;
+        Ok(())
+    }
+
+    pub async fn import(&mut self, config: &dyn OSConfig, url: &str) -> Result<(), PushError> {
+        let _ = self.make_request::<serde_json::Value>(config, "import", json!({"url": url})).await?;
         Ok(())
     }
 }

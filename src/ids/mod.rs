@@ -6,7 +6,7 @@ use crate::util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip};
 pub mod user;
 pub mod identity_manager;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct IDSRecvMessage {
     // all messages
     #[serde(rename = "c")]
@@ -53,4 +53,6 @@ pub struct IDSRecvMessage {
 
     #[serde(skip)]
     pub verification_failed: bool,
+    #[serde(skip)]
+    pub topic: String,
 }

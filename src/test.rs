@@ -6,7 +6,7 @@ use icloud_auth::AppleAccount;
 use log::{info, error};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, get_gateways_for_mccmnc, login_apple_delegates, register, APSConnectionResource, APSState, Attachment, ConversationData, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, RelayConfig};
+use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, register, APSConnectionResource, APSState, Attachment, ConversationData, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, RelayConfig, MADRID_SERVICE};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -120,6 +120,10 @@ async fn main() {
         )
         .await;
 
+    let mut subscription = connection.messages_cont.subscribe();
+
+    let mut anisette_client = default_provider(config.get_gsa_config(&*connection.state.read().await), PathBuf::from_str("anisette_test").unwrap());
+
     
     if let Some(error) = error {
         panic!("{}", error);
@@ -149,24 +153,31 @@ async fn main() {
 
 
         
-        let mut client = default_provider(config.get_gsa_config(&*connection.state.read().await), PathBuf::from_str("anisette_test").unwrap());
         let acc = AppleAccount::login(appleid_closure, tfa_closure, 
-                config.get_gsa_config(&*connection.state.read().await), client.clone()).await;
+                config.get_gsa_config(&*connection.state.read().await), anisette_client.clone()).await;
 
         let account: AppleAccount<_> = acc.unwrap();
         let pet = account.get_pet().unwrap();
+        let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&user_trimmed, &pet, account.spd.as_ref().unwrap()["adsid"].as_string().unwrap(), &mut *client.lock().await, config.as_ref(), &[LoginDelegate::IDS]).await.unwrap();
+        let delegates = login_apple_delegates(&user_trimmed, &pet, spd["adsid"].as_string().unwrap(), &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
+        let mobileme = delegates.mobileme.unwrap();
+        let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), spd["acname"].as_string().unwrap().to_string(), &mobileme);
+
+        let id_path = PathBuf::from_str("findmy.plist").unwrap();
+        std::fs::write(id_path, plist_to_string(&findmy).unwrap()).unwrap();
         vec![user]
     };
+    
+    let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE];
 
     let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSUserIdentity::new().unwrap());
 
-    if users[0].registration.is_none() {
+    if users[0].registration.is_empty() {
         info!("Registering new identity...");
-        register(config.as_ref(), &*connection.state.read().await, &mut users, &identity).await.unwrap();
+        register(config.as_ref(), &*connection.state.read().await, services, &mut users, &identity).await.unwrap();
     }
 
     let mut state = SavedState {
@@ -176,11 +187,17 @@ async fn main() {
     };
     fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
     
-    let client = IMClient::new(connection.clone(), users, identity, "id_cache.plist".into(), config, Box::new(move |updated_keys| {
+    let client = IMClient::new(connection.clone(), users, identity, services, "id_cache.plist".into(), config.clone(), Box::new(move |updated_keys| {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
     let handle = client.identity.get_handles().await[0].clone();
+
+
+    let id_path = PathBuf::from_str("findmy.plist").unwrap();
+    let state: FindMyState = plist::from_file(id_path).unwrap();
+
+    let findmy_client = FindMyClient::new(connection.clone(), config.clone(), state, anisette_client.clone(), client.identity.clone()).await.unwrap();
 
     // client.identity.refresh_now().await.unwrap();
 
@@ -198,7 +215,10 @@ async fn main() {
     
     loop {
         tokio::select! {
-            msg = client.receive_wait() => {
+            msg = subscription.recv() => {
+                let msg = msg.unwrap();
+                let _ = findmy_client.handle(msg.clone()).await;
+                let msg = client.handle(msg).await;
                 if msg.is_err() {
                     error!("Failed to receive {}", msg.err().unwrap());
                     continue;

@@ -2,23 +2,36 @@ use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::
 
 use backon::{ConstantBuilder, ExponentialBuilder};
 use deku::{DekuContainerRead, DekuRead, DekuWrite};
-use log::{debug, info, warn};
-use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
-use plist::Value;
+use log::{debug, error, info, warn};
+use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
+use plist::{Data, Value};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::{sync::{Mutex, RwLock}, task::JoinHandle};
 use backon::Retryable;
 use rand::Rng;
+use async_recursion::async_recursion;
+use tokio::select;
+use rand::RngCore;
+use uuid::Uuid;
+use std::str::FromStr;
 
-use crate::{aps::{get_message, APSConnection}, ids::user::IDSIdentity, imessage::messages::{BundledPayload, MessageTarget}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, plist_to_string, Resource, ResourceManager}, APSConnectionResource, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection}, ids::user::IDSIdentity, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
-use super::{user::{IDSDeliveryData, IDSPublicIdentity, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
+use super::{user::{IDSDeliveryData, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
 
 const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
 
  // one minute. Used to prevent during message replay mass spamming IDS with queries for a given key.
 const REFRESH_MIN: Duration = Duration::from_secs(60);
 use deku::{DekuContainerWrite, DekuUpdate};
+
+#[repr(C)]
+#[derive(Clone)]
+pub enum MessageTarget {
+    Token(Vec<u8>),
+    Uuid(String),
+}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CachedKeys {
@@ -65,9 +78,9 @@ pub struct CachedHandle {
 
 impl CachedHandle {
     // hash key factors
-    async fn verity(&mut self, conn: &APSConnectionResource, user: &IDSUser) {
+    async fn verity(&mut self, conn: &APSConnectionResource, user: &IDSUser, main_service: &str) {
         let mut env = Hasher::new(MessageDigest::sha1()).unwrap();
-        env.update(&user.registration.as_ref().unwrap().id_keypair.cert).unwrap();
+        env.update(&user.registration[main_service].id_keypair.cert).unwrap();
         env.update(&conn.get_token().await).unwrap();
         let hash: [u8; 20] = env.finish().unwrap().to_vec().try_into().unwrap();
         if hash != self.env_hash {
@@ -76,6 +89,18 @@ impl CachedHandle {
             self.keys.clear();
         }
     }
+}
+
+pub struct IDSSendMessage {
+    pub sender: String,
+    pub raw: Option<Vec<u8>>,
+    pub send_delivered: bool,
+    pub command: u8,
+    pub ex: Option<u32>,
+    pub no_response: bool,
+    pub id: String,
+    pub sent_timestamp: u64,
+    pub response_for: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -98,17 +123,17 @@ impl DeliveryHandle {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct KeyCache {
-    pub cache: HashMap<String, CachedHandle>,
+    pub cache: HashMap<String, HashMap<String, CachedHandle>>,
     #[serde(skip)]
     cache_location: PathBuf,
 }
 
 impl KeyCache {
-    pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser]) -> KeyCache {
+    pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) -> KeyCache {
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
-                loaded.verity(conn, users).await;
+                loaded.verity(conn, users, services).await;
                 return loaded
             }
         }
@@ -116,15 +141,20 @@ impl KeyCache {
             cache: HashMap::new(),
             cache_location: path,
         };
-        cache.verity(conn, users).await;
+        cache.verity(conn, users, services).await;
         cache
     }
 
     // verify integrity
-    pub async fn verity(&mut self, conn: &APSConnectionResource, users: &[IDSUser]) {
+    pub async fn verity(&mut self, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) {
         for user in users {
-            for handle in &user.registration.as_ref().unwrap().handles {
-                self.cache.entry(handle.clone()).or_default().verity(conn, user).await;
+            for main_service in services {
+                let Some(reg) = user.registration.get(main_service.name) else { continue };
+                for service in std::iter::once(main_service.name).chain(main_service.sub_services.iter().copied()) {
+                    for handle in &reg.handles {
+                        self.cache.entry(service.to_string()).or_default().entry(handle.clone()).or_default().verity(conn, user, &main_service.name).await;
+                    }
+                }
             }
         }
     }
@@ -135,22 +165,26 @@ impl KeyCache {
     }
 
     pub fn invalidate(&mut self, handle: &str, keys_for: &str) {
-        let Some(handle_cache) = self.cache.get_mut(handle) else {
-            panic!("No handle cache for handle {}!", handle);
-        };
-        handle_cache.keys.remove(keys_for);
+        for cache in self.cache.values_mut() {
+            let Some(handle_cache) = cache.get_mut(handle) else {
+                panic!("No handle cache for handle {handle}!");
+            };
+            handle_cache.keys.remove(keys_for);
+        }
         self.save();
     }
 
     pub fn invalidate_all(&mut self) {
         for cache in self.cache.values_mut() {
-            cache.keys.clear();
+            for cache in cache.values_mut() {
+                cache.keys.clear();
+            }
         }
         self.save();
     }
 
-    pub fn get_targets(&self, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError> {
-        let Some(handle_cache) = self.cache.get(handle) else {
+    pub fn get_targets(&self, service: &str, handle: &str, participants: &[String], keys_for: &[MessageTarget]) -> Result<Vec<DeliveryHandle>, PushError> {
+        let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
             return Err(PushError::KeyNotFound(handle.to_string()))
         };
         let target_tokens = keys_for.iter().map(|i| Ok(match i {
@@ -166,20 +200,20 @@ impl KeyCache {
                 !handle_cache.keys.get(*p).map(|c| c.is_valid()).unwrap_or(false)) {
             return Err(PushError::KeyNotFound(not_found.to_string())) // at least one of our caches isn't up-to-date
         }
-        Ok(self.get_participants_targets(handle, participants).into_iter().filter(|target| target_tokens.contains(&&target.delivery_data.push_token)).collect())
+        Ok(self.get_participants_targets(service, handle, participants).into_iter().filter(|target| target_tokens.contains(&&target.delivery_data.push_token)).collect())
     }
 
-    pub fn get_participants_targets(&self, handle: &str, participants: &[String]) -> Vec<DeliveryHandle> {
+    pub fn get_participants_targets(&self, service: &str, handle: &str, participants: &[String]) -> Vec<DeliveryHandle> {
         participants.iter().flat_map(|participant| {
-            self.get_keys(handle, &participant).into_iter().map(|i| DeliveryHandle {
+            self.get_keys(service, handle, &participant).into_iter().map(|i| DeliveryHandle {
                 participant: participant.clone(),
                 delivery_data: i.clone(),
             })
         }).collect()
     }
     
-    pub fn get_keys(&self, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
-        let Some(handle_cache) = self.cache.get(handle) else {
+    pub fn get_keys(&self, service: &str, handle: &str, keys_for: &str) -> Vec<&IDSDeliveryData> {
+        let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
             return vec![]
         };
         let Some(cached) = handle_cache.keys.get(keys_for) else {
@@ -193,8 +227,8 @@ impl KeyCache {
         }
     }
 
-    pub fn does_not_need_refresh(&self, handle: &str, keys_for: &str, refresh: bool) -> bool {
-        let Some(handle_cache) = self.cache.get(handle) else {
+    pub fn does_not_need_refresh(&self, service: &str, handle: &str, keys_for: &str, refresh: bool) -> bool {
+        let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
             return false
         };
         let Some(cached) = handle_cache.keys.get(keys_for) else {
@@ -203,9 +237,9 @@ impl KeyCache {
         return !cached.is_dirty(refresh);
     }
 
-    pub fn put_keys(&mut self, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
-        let Some(handle_cache) = self.cache.get_mut(handle) else {
-            panic!("No handle cache for handle {}!", handle);
+    pub fn put_keys(&mut self, service: &str, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
+        let Some(handle_cache) = self.cache.get_mut(service).and_then(|a| a.get_mut(handle)) else {
+            panic!("No handle cache for service {service} handle {handle}!");
         };
         let ms_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -244,6 +278,7 @@ pub struct IdentityResource {
     aps: APSConnection,
     query_lock: Mutex<()>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
+    services: &'static [&'static IDSService]
 }
 
 pub type IdentityManager = Arc<ResourceManager<IdentityResource>>;
@@ -256,7 +291,7 @@ impl Resource for IdentityResource {
         let mut users_lock = self.users.write().await;
         
         debug!("User locked!");
-        if let Err(err) = register(self.config.as_ref(), &*self.aps.state.read().await, &mut *users_lock, &self.identity).await {
+        if let Err(err) = register(self.config.as_ref(), &*self.aps.state.read().await, &self.services, &mut *users_lock, &self.identity).await {
             debug!("Register failed {}!", err);
             drop(users_lock);
             
@@ -270,7 +305,7 @@ impl Resource for IdentityResource {
         }
         debug!("Register success!");
 
-        self.cache.lock().await.verity(&self.aps, &users_lock).await;
+        self.cache.lock().await.verity(&self.aps, &users_lock, self.services).await;
 
         info!("Successfully reregistered!");
 
@@ -283,15 +318,16 @@ impl Resource for IdentityResource {
 }
 
 impl IdentityResource {
-    pub async fn new(users: Vec<IDSUser>, identity: IDSUserIdentity, cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
+    pub async fn new(users: Vec<IDSUser>, identity: IDSUserIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
         let resource = Arc::new(IdentityResource {
-            cache: Mutex::new(KeyCache::new(cache_path, &conn, &users).await),
+            cache: Mutex::new(KeyCache::new(cache_path, &conn, &users, services).await),
             users: RwLock::new(users),
             config,
             identity,
             aps: conn,
             query_lock: Mutex::new(()),
             manager: Mutex::new(None),
+            services,
         });
 
         let task_resource = resource.clone();
@@ -314,7 +350,7 @@ impl IdentityResource {
 
     pub async fn get_handles(&self) -> Vec<String> {
         let users_locked = self.users.read().await;
-        users_locked.iter().flat_map(|user| user.registration.as_ref().unwrap().handles.clone()).collect::<Vec<String>>()
+        users_locked.iter().flat_map(|user| user.registration["com.apple.madrid"].handles.clone()).collect::<Vec<String>>()
     }
 
     pub async fn update_users(&self, users: Vec<IDSUser>) -> Result<(), PushError> {
@@ -328,7 +364,7 @@ impl IdentityResource {
     pub async fn calculate_rereg_time_s(&self) -> i64 {
         let users_lock = self.users.read().await;
         users_lock.iter()
-            .map(|user| user.registration.as_ref().unwrap().calculate_rereg_time_s().unwrap())
+            .map(|user| user.registration["com.apple.madrid"].calculate_rereg_time_s().unwrap())
             .min().expect("No identities!")
     }
 
@@ -362,7 +398,7 @@ impl IdentityResource {
     }
 
     pub fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
-        users.iter().find(|user| user.registration.as_ref().unwrap().handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
+        users.iter().find(|user| user.registration["com.apple.madrid"].handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
     }
 
     async fn manager(&self) -> IdentityManager {
@@ -370,7 +406,7 @@ impl IdentityResource {
     }
 
     pub async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
-        let my_cache = cache_lock.cache.get_mut(handle).unwrap();
+        let my_cache = cache_lock.cache.get_mut("com.apple.madrid").unwrap().get_mut(handle).unwrap();
         if my_cache.private_data.len() != 0 && !refresh {
             return Ok(())
         }
@@ -381,7 +417,7 @@ impl IdentityResource {
             // something changed, requery IDS too
             cache_lock.invalidate(handle, handle);
         }
-        cache_lock.cache.get_mut(handle).unwrap().private_data = regs;
+        cache_lock.cache.get_mut("com.apple.madrid").unwrap().get_mut(handle).unwrap().private_data = regs;
         cache_lock.save();
         Ok(())
     }
@@ -389,25 +425,25 @@ impl IdentityResource {
     pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
         let mut cache_lock = self.cache.lock().await;
         self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
         Ok(private_self.clone())
     }
 
     pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
         let mut cache_lock = self.cache.lock().await;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
         if let Some(found) = private_self.iter().find(|i| i.token == token) {
             if let Some(uuid) = &found.uuid {
                 return Ok(uuid.clone())
             }
         }
         self.ensure_private_self(&mut cache_lock, handle, true).await?;
-        let private_self = &cache_lock.cache.get(handle).unwrap().private_data;
+        let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
         Ok(private_self.iter().find(|i| i.token == token).ok_or(PushError::KeyNotFound(handle.to_string()))?.uuid.as_ref()
             .ok_or(PushError::KeyNotFound(handle.to_string()))?.clone())
     }
 
-    async fn cache_keys_once(&self, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
+    async fn cache_keys_once(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
         // only one IDS query can happen at the a time. period.
        let id_lock = self.query_lock.lock().await;
        
@@ -415,7 +451,7 @@ impl IdentityResource {
        // find participants whose keys need to be fetched
        debug!("Getting keys for {:?}", participants);
        let key_cache = self.cache.lock().await;
-       let fetch: Vec<String> = participants.iter().filter(|p| !key_cache.does_not_need_refresh(handle, *p, refresh))
+       let fetch: Vec<String> = participants.iter().filter(|p| !key_cache.does_not_need_refresh(&topic, handle, *p, refresh))
            .map(|p| p.to_string()).collect();
        if fetch.len() == 0 {
            return Ok(())
@@ -424,7 +460,7 @@ impl IdentityResource {
        for chunk in fetch.chunks(18) {
            debug!("Fetching keys for chunk {:?}", chunk);
            let users = self.users.read().await;
-           let results = match Self::user_by_handle(&users, handle).query(&*self.config, &self.aps, handle, chunk, meta).await {
+           let results = match Self::user_by_handle(&users, handle).query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
                    if let PushError::LookupFailed(6005) = err {
@@ -446,25 +482,71 @@ impl IdentityResource {
                if results.len() == 0 {
                    warn!("IDS returned zero keys for participant {}", id);
                }
-               key_cache.put_keys(handle, &id, results);
+               key_cache.put_keys(&topic, handle, &id, results);
            }   
        }
        debug!("Cached keys for {:?}", participants);
        Ok(())
     }
 
-    pub async fn cache_keys(&self, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
-        (|| async { self.cache_keys_once(participants, handle, refresh, meta).await })
+    pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {
+        let APSMessage::Notification { id: _, topic, token: _, payload } = msg else { return Ok(None) };
+        let Some(topic) = topics.iter().find(|t| sha1(t.as_bytes()) == topic) else { return Ok(None) };
+        debug!("ID got message {topic} {:?}", plist::from_bytes::<Value>(&payload)?);
+        
+        let mut payload = plist::from_bytes::<IDSRecvMessage>(&payload)?;
+
+
+        payload.topic = topic.to_string();
+
+        if let IDSRecvMessage {
+            sender: Some(sender),
+            target: Some(target),
+            message: Some(message),
+            token: Some(token),
+            message_unenc: None,
+            verification_failed,
+            .. 
+        } = &mut payload {
+            let ident = match self.get_key_for_sender(*topic, &target, &sender, &token).await {
+                Ok(ident) => Some(ident.client_data.public_message_identity_key),
+                Err(err) => {
+                    error!("No identity for payload! {}", err);
+                    *verification_failed = true;
+                    None
+                }
+            };
+
+            let decrypted = self.decrypt_payload(ident.as_ref(), &message)?;
+            let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
+
+            let parsed: Value = plist::from_bytes(&ungzipped)?;
+            payload.message_unenc = Some(parsed);
+        }
+
+        Ok(Some(payload))
+    }
+
+    pub fn get_main_service(&self, topic: &'static str) -> &'static str {
+        self.services.iter().find(|s| s.name == topic || s.sub_services.contains(&topic)).expect(&format!("Topic {topic} not found!")).name
+    }
+
+    pub fn is_subservice(&self, topic: &'static str) -> bool {
+        self.get_main_service(topic) != topic
+    }
+
+    pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
+        (|| async { self.cache_keys_once(topic, participants, handle, refresh, meta).await })
             .retry(&ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(1))
             .when(|e| !matches!(e, PushError::DoNotRetry(_))).await
             .map_err(|e| PushError::DoNotRetry(Box::new(e)))
     }
 
-    pub async fn get_key_for_sender_once(&self, handle: &str, sender: &str, sender_token: &[u8], is_retry: bool) -> Result<IDSDeliveryData, PushError> {
-        self.cache_keys(&[sender.to_string()], handle, is_retry, &QueryOptions { required_for_message: false, result_expected: true }).await?;
+    pub async fn get_key_for_sender_once(&self, topic: &'static str, handle: &str, sender: &str, sender_token: &[u8], is_retry: bool) -> Result<IDSDeliveryData, PushError> {
+        self.cache_keys(topic, &[sender.to_string()], handle, is_retry, &QueryOptions { required_for_message: false, result_expected: true }).await?;
 
         let cache = self.cache.lock().await;
-        let keys = cache.get_keys(handle, sender);
+        let keys = cache.get_keys(&topic, handle, sender);
         let Some(my_key) = keys.iter().find(|key| key.push_token == sender_token) else {
             warn!("No public key for token retry {is_retry}");
             return Err(PushError::KeyNotFound(sender.to_string()))
@@ -472,12 +554,12 @@ impl IdentityResource {
         Ok((*my_key).clone())
     }
 
-    pub async fn get_key_for_sender(&self, handle: &str, sender: &str, sender_token: &[u8]) -> Result<IDSDeliveryData, PushError> {
+    pub async fn get_key_for_sender(&self, topic: &'static str, handle: &str, sender: &str, sender_token: &[u8]) -> Result<IDSDeliveryData, PushError> {
         let mut retry_count = 0;
         (|| {
             retry_count += 1;
             async move {
-                self.get_key_for_sender_once(handle, sender, sender_token, retry_count > 1).await
+                self.get_key_for_sender_once(topic, handle, sender, sender_token, retry_count > 1).await
             }
         })
             .retry(&ConstantBuilder::default().with_delay(Duration::ZERO).with_max_times(1))
@@ -485,21 +567,21 @@ impl IdentityResource {
             .map_err(|e| PushError::DoNotRetry(Box::new(e)))
     }
 
-    pub async fn validate_targets(&self, targets: &[String], handle: &str) -> Result<Vec<String>, PushError> {
-        self.cache_keys(targets, handle, false, &QueryOptions::default()).await?;
+    pub async fn validate_targets(&self, targets: &[String], topic: &'static str, handle: &str) -> Result<Vec<String>, PushError> {
+        self.cache_keys(topic, targets, handle, false, &QueryOptions::default()).await?;
         let key_cache = self.cache.lock().await;
-        Ok(targets.iter().filter(|target| !key_cache.get_keys(handle, *target).is_empty()).map(|i| i.clone()).collect())
+        Ok(targets.iter().filter(|target| !key_cache.get_keys(&topic, handle, *target).is_empty()).map(|i| i.clone()).collect())
     }
 
-    pub async fn refresh_handles(&self, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
+    pub async fn refresh_handles(&self, topic: &'static str, handle: &str, handles: &[DeliveryHandle]) -> Result<Vec<DeliveryHandle>, PushError> {
         if handles.is_empty() {
             return Ok(vec![])
         }
         let targets = handles.iter().map(|handle| handle.participant.clone()).collect::<HashSet<String>>().into_iter().collect::<Vec<_>>();
-        self.cache_keys(&targets, handle, true, &QueryOptions { required_for_message: true, result_expected: true }).await?;
+        self.cache_keys(topic, &targets, handle, true, &QueryOptions { required_for_message: true, result_expected: true }).await?;
         let search_tokens = handles.iter().map(|handle| handle.delivery_data.push_token.clone()).collect::<Vec<_>>();
         let key_cache = self.cache.lock().await;
-        Ok(key_cache.get_participants_targets(handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
+        Ok(key_cache.get_participants_targets(&topic, handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
     }
 
     pub fn encrypt_payload(&self, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
@@ -588,6 +670,253 @@ impl IdentityResource {
     pub async fn invalidate_id_cache(&self) {
         self.cache.lock().await.invalidate_all();
     }
+
+    pub async fn send_message(&self, topic: &'static str, ids_message: IDSSendMessage, mut message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
+
+        // do not send to self
+        let my_token = self.aps.get_token().await;
+        message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
+
+        if message_targets.is_empty() {
+            return Ok(SendJob {
+                process: tokio::sync::broadcast::channel(1).1,
+                handle: None,
+            })
+        }
+
+        let (sender, receiver) = 
+            tokio::sync::broadcast::channel(message_targets.len());
+
+        let mut progress = receiver.resubscribe();
+
+        let job = InnerSendJob {
+            conn: self.aps.clone(),
+            identity: self.manager().await.clone(),
+            user_agent: self.config.get_version_ua(),
+            message: ids_message,
+            status: sender,
+            topic,
+        };
+
+        let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
+
+        let mut received = false;
+        let mut checked = false;
+        loop {
+            select! {
+                finished = &mut job_spawned => {
+                    finished.unwrap()?;
+                    checked = true;
+                    received = true; // for no confirm items
+                    break; // Done
+                },
+                _prog = progress.recv() => {
+                    received = true;
+                },
+                _time = tokio::time::sleep(Duration::from_millis(if received { 500 } else { 15000 })) => {
+                    break;
+                }
+            }
+        }
+
+        if !received {
+            debug!("Not received");
+            job_spawned.abort();
+            return Err(PushError::SendTimedOut)
+        }
+        
+        Ok(SendJob {
+            process: receiver,
+            handle: if checked { None } else { Some(job_spawned) },
+        })
+    }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BundledPayload {
+    #[serde(rename = "tP")]
+    pub participant: String,
+    #[serde(rename = "D")]
+    pub send_delivered: bool,
+    #[serde(rename = "sT")]
+    pub session_token: Data,
+    #[serde(rename = "P")]
+    pub payload: Option<Data>,
+    #[serde(rename = "t")]
+    pub token: Data,
+}
+
+
+#[derive(Serialize, Deserialize)]
+pub struct SendMessage {
+    #[serde(rename = "fcn")]
+    pub batch: u8,
+    #[serde(rename = "c")]
+    pub command: u8,
+    #[serde(rename = "E")]
+    pub encryption: Option<String>,
+    #[serde(rename = "ua")]
+    pub user_agent: String,
+    pub v: u8,
+    #[serde(rename = "i")]
+    pub message_id: u32,
+    #[serde(rename = "U")]
+    pub uuid: Data,
+    #[serde(rename = "dtl")]
+    pub payloads: Vec<BundledPayload>,
+    #[serde(rename = "sP")]
+    pub sender: String,
+    #[serde(rename = "eX")]
+    pub ex: Option<u32>,
+    #[serde(rename = "nr")]
+    pub no_response: Option<bool>,
+    #[serde(rename = "rc")]
+    pub retry_count: Option<u8>,
+    #[serde(rename = "oe")]
+    pub original_epoch_nanos: Option<u64>,
+    #[serde(rename = "rI")]
+    pub response_for: Option<Data>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SendResult {
+    Sent,
+    APSError(i64),
+    TimedOut,
+}
+
+pub struct SendJob {
+    pub process: tokio::sync::broadcast::Receiver<(DeliveryHandle, SendResult)>,
+    pub handle: Option<JoinHandle<Result<(), PushError>>>,
+}
+
+struct InnerSendJob {
+    pub conn: APSConnection,
+    pub identity: IdentityManager,
+    pub user_agent: String,
+    pub message: IDSSendMessage,
+    pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
+    pub topic: &'static str,
+}
+
+// TODO refactor sending to identity_manager, abstract message away as a trait/generic
+impl InnerSendJob {
+    #[async_recursion]
+    async fn send_targets(self, targets: Vec<DeliveryHandle>, retry_count: u8) -> Result<(), PushError> {
+        info!("Sending retry {}", retry_count);
+        let message = &self.message;
+        let handle = message.sender.clone();
+
+        let mut groups = vec![];
+        let mut group = vec![];
+        let mut group_size = 0;
+        const GROUP_MAX_SIZE: usize = 10000;
+
+        for target in &targets {
+            let encrypted = if let Some(msg) = &message.raw {
+                Some(self.identity.encrypt_payload(&target.delivery_data.client_data.public_message_identity_key, &msg)?)
+            } else { None };
+            let send_delivered = if message.send_delivered { &target.participant != &message.sender } else { false };
+            group_size += encrypted.as_ref().map(|i| i.len()).unwrap_or(0);
+            group.push(target.build_bundle(send_delivered, encrypted));
+            
+            if group_size > GROUP_MAX_SIZE {
+                groups.push(std::mem::take(&mut group));
+                group_size = 0;
+            }
+        }
+        if group.len() > 0 {
+            groups.push(group);
+        }
+
+        let mut messages = self.conn.subscribe().await;
+
+        let msg_id = rand::thread_rng().next_u32();
+        let uuid = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
+        debug!("send_uuid {}", encode_hex(&uuid));
+        for (batch, group) in groups.into_iter().enumerate() {
+            let complete = SendMessage {
+                batch: batch as u8 + 1,
+                command: message.command,
+                encryption: if message.raw.is_some() { Some("pair".to_string()) } else { None },
+                user_agent: self.user_agent.clone(),
+                v: 8,
+                message_id: msg_id,
+                uuid: uuid.clone().into(),
+                payloads: group,
+                sender: message.sender.clone(),
+                ex: message.ex,
+                no_response: if message.no_response { Some(true) } else { None },
+                retry_count: if retry_count != 0 { Some(retry_count) } else { None },
+                original_epoch_nanos: if retry_count != 0 { Some(message.sent_timestamp * 1000000) } else { None },
+                response_for: message.response_for.clone().map(|i| i.into())
+            };
+    
+            let binary = plist_to_bin(&complete)?;
+            self.conn.send_message(&self.topic, binary, Some(msg_id)).await?
+        }
+
+        if !message.no_response {
+            let mut remain_targets = targets;
+            let mut refresh_targets: Vec<DeliveryHandle> = vec![];
+            let payloads_cnt = remain_targets.len();
+            info!("payload {payloads_cnt}");
+
+            while !remain_targets.is_empty() {
+                let filter_list = &[self.topic];
+                let filter = get_message(|load| {
+                    debug!("got {:?}", load);
+                    let result: IDSRecvMessage = plist::from_value(&load).ok()?;
+                    if result.command != 255 {
+                        return None
+                    }
+                    // make sure it's my message
+                    if result.uuid.as_ref() == Some(&uuid) { Some(result) } else { None }
+                }, filter_list);
+
+                let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(60 * ((retry_count as u64) + 1)), 
+                    self.conn.wait_for(&mut messages, filter)).await else {
+                    break;
+                };
+                let load = msg?;
+
+                let Some(target_idx) = remain_targets.iter().position(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) else { continue };
+                match load.status.unwrap() {
+                    5032 => {
+                        info!("got 5032, refreshing keys!");
+                        refresh_targets.push(remain_targets.remove(target_idx));
+                    },
+                    0 | 5008 => {
+                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::Sent)); // succeeded
+                    },
+                    _status => {
+                        if remain_targets[target_idx].participant == handle {
+                            warn!("Failed to deliver to self device; ignoring!");
+                            continue // ignore errors sending to self devices
+                        }
+                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::APSError(_status)));
+                    }
+                }
+            }
+            
+            if !remain_targets.is_empty() || !refresh_targets.is_empty() {
+                // will bail early if refresh_targets is empty
+                let new_targets = self.identity.refresh_handles(self.topic, &handle, &refresh_targets).await?;
+                remain_targets.extend(new_targets);
+
+                if retry_count == 5 {
+                    for target in remain_targets {
+                        let _ = self.status.send((target, SendResult::TimedOut));
+                    }
+                    info!("Retry failed");
+                    return Ok(())
+                }
+
+                self.send_targets(remain_targets, retry_count + 1).await?;
+            }
+        }
+        info!("Sending done!");
+        Ok(())
+    }
+}
 

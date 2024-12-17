@@ -251,7 +251,7 @@ struct HandleResult {
 pub struct IDSUser {
     pub auth_keypair: KeyPair,
     pub user_id: String,
-    pub registration: Option<IDSRegistration>,
+    pub registration: HashMap<String, IDSRegistration>,
     pub user_type: IDSUserType,
     pub protocol_version: u32,
 }
@@ -365,23 +365,27 @@ impl IDSUser {
     }
 
     #[async_recursion]
-    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
+    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, topic: &'static str, main_topic: &str, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
         let body = plist_to_buf(&LookupReq { uris: query.to_vec() })?;
 
-        let request = options.add_headers(SignedRequest::new("id-query", Method::GET /* unused */))
+        let mut request = options.add_headers(SignedRequest::new("id-query", Method::GET /* unused */))
             .header("x-id-self-uri", handle)
             .header("x-push-token", &base64_encode(&aps.get_token().await))
             .header("x-protocol-version", &self.protocol_version.to_string())
-            .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()))
+            .header("user-agent", &format!("com.apple.madrid-lookup {}", config.get_version_ua()));
+        if main_topic != topic {
+            request = request.header("x-id-sub-service", topic);
+        }
+        let request = request
             .body(gzip(&body)?)
-            .sign(&self.registration.as_ref().unwrap().id_keypair, KeyType::Id, &*aps.state.read().await, None)?
-            .send_apns(aps).await;
+            .sign(&self.registration[main_topic].id_keypair, KeyType::Id, &*aps.state.read().await, None)?
+            .send_apns(aps, topic).await;
 
         if let Err(PushError::WebTunnelError(5206 /* Response too large */)) = &request {
             info!("response too large, chopping in half!");
             let mut results = HashMap::new();
             for i in query.chunks(query.len() / 2) {
-                results.extend(self.query(config, aps, handle, i, options).await?);
+                results.extend(self.query(config, aps, topic, main_topic, handle, i, options).await?);
             }
             return Ok(results);
         }
@@ -402,68 +406,56 @@ impl IDSUser {
     }
 }
 
-pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
+pub struct IDSService {
+    pub name: &'static str,
+    pub sub_services: &'static [&'static str],
+    pub client_data: &'static [(&'static str, Value)],
+    pub flags: u64,
+    pub capabilities_name: &'static str,
+}
+
+pub async fn register(config: &dyn OSConfig, aps: &APSState, services: &[&'static IDSService], users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
     info!("registering!");
-    let mut user_list = vec![];
+
+    let mut possible_handles: HashMap<String, Vec<String>> = HashMap::new();
     for user in users.iter() {
-        let handles = user.get_possible_handles(aps).await?;
-        let mut user_data = Dictionary::from_iter([
-            ("client-data", Value::Dictionary(Dictionary::from_iter([
-                ("is-c2k-equipment", Value::Boolean(true)),
-                ("optionally-receive-typing-indicators", Value::Boolean(true)),
-                ("public-message-identity-key", Value::Data(identity.encode()?)),
-                ("public-message-identity-version", Value::Integer(2.into())),
-                ("show-peer-errors", Value::Boolean(true)),
-                ("supports-ack-v1", Value::Boolean(true)),
-                ("supports-activity-sharing-v1", Value::Boolean(true)),
-                ("supports-audio-messaging-v2", Value::Boolean(true)),
-                ("supports-autoloopvideo-v1", Value::Boolean(true)),
-                ("supports-be-v1", Value::Boolean(true)),
-                ("supports-ca-v1", Value::Boolean(true)),
-                ("supports-fsm-v1", Value::Boolean(true)),
-                ("supports-fsm-v2", Value::Boolean(true)),
-                ("supports-fsm-v3", Value::Boolean(true)),
-                ("supports-ii-v1", Value::Boolean(true)),
-                ("supports-impact-v1", Value::Boolean(true)),
-                ("supports-inline-attachments", Value::Boolean(true)),
-                ("supports-keep-receipts", Value::Boolean(true)),
-                ("supports-location-sharing", Value::Boolean(true)),
-                ("supports-media-v2", Value::Boolean(true)),
-                ("supports-photos-extension-v1", Value::Boolean(true)),
-                ("supports-st-v1", Value::Boolean(true)),
-                ("supports-update-attachments-v1", Value::Boolean(true)),
-                ("supports-people-request-messages", Value::Boolean(true)),
-                ("supports-people-request-messages-v2", Value::Boolean(true)),
-                ("supports-people-request-messages-v3", Value::Boolean(true)),
-                ("supports-rem", Value::Boolean(true)),
-                ("nicknames-version", Value::Real(1.0)),
-                ("ec-version", Value::Real(1.0)),
-                ("supports-cross-platform-sharing", Value::Boolean(true)),
-                ("supports-original-timestamp-v1", Value::Boolean(true)),
-                ("supports-sa-v1", Value::Boolean(true)),
-                ("supports-photos-extension-v2", Value::Boolean(true)),
-                ("prefers-sdr", Value::Boolean(false)),
-                ("supports-shared-exp", Value::Boolean(true)),
-                ("supports-protobuf-payload-data-v2", Value::Boolean(true)),
-                ("supports-hdr", Value::Boolean(true)),
-                ("supports-heif", Value::Boolean(true)),
-                ("supports-dq-nr", Value::Boolean(true)),
-                ("supports-family-invite-message-bubble", Value::Boolean(true)),
-                ("supports-live-delivery", Value::Boolean(true)),
-                ("supports-findmy-plugin-messages", Value::Boolean(true)),
-            ].into_iter()))),
-            ("uris", Value::Array(
-                handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
-                    ("uri", Value::String(handle.clone()))
-                ].into_iter()))).collect()
-            )),
-            ("user-id", Value::String(user.user_id.to_string()))
-        ].into_iter());
-        if let IDSUserType::Phone = user.user_type {
-            user_data.insert("tag".to_string(), Value::String("SIM".to_string()));
-        }
-        user_list.push(Value::Dictionary(user_data));
+        possible_handles.insert(user.user_id.clone(), user.get_possible_handles(aps).await?);
     }
+
+    let identity_key = identity.encode()?;
+
+    let services = services.iter().map(|service| {
+        let mut user_list = vec![];
+        for user in users.iter() {
+            let handles = &possible_handles[&user.user_id];
+            let mut user_data = Dictionary::from_iter([
+                ("client-data", Value::Dictionary(Dictionary::from_iter([
+                    ("public-message-identity-key", Value::Data(identity_key.clone())),
+                    ("public-message-identity-version", Value::Integer(2.into())),
+                ].into_iter().chain(service.client_data.iter().map(|(a, b)| (*a, b.clone())))))),
+                ("uris", Value::Array(
+                    handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
+                        ("uri", Value::String(handle.clone()))
+                    ].into_iter()))).collect()
+                )),
+                ("user-id", Value::String(user.user_id.to_string()))
+            ].into_iter());
+            if let IDSUserType::Phone = user.user_type {
+                user_data.insert("tag".to_string(), Value::String("SIM".to_string()));
+            }
+            user_list.push(Value::Dictionary(user_data));
+        }
+        Value::Dictionary(Dictionary::from_iter([
+            ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
+                ("flags", Value::Integer(service.flags.into())),
+                ("name", service.capabilities_name.into()),
+                ("version", Value::Integer(1.into())),
+            ].into_iter()))])),
+            ("service", Value::String(service.name.to_string())),
+            ("sub-services", plist::to_value(&service.sub_services).unwrap()),
+            ("users", Value::Array(user_list))
+        ].into_iter()))
+    }).collect::<Vec<_>>();
 
     let register_meta = config.get_register_meta();
     let body = Value::Dictionary(Dictionary::from_iter([
@@ -472,23 +464,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
         ("language", Value::String("en-US".to_string())),
         ("os-version", Value::String(register_meta.os_version)),
         ("private-device-data", Value::Dictionary(config.get_private_data())),
-        ("services", Value::Array(vec![
-            Value::Dictionary(Dictionary::from_iter([
-                ("capabilities", Value::Array(vec![Value::Dictionary(Dictionary::from_iter([
-                    ("flags", Value::Integer(17.into())),
-                    ("name", "Messenger".into()),
-                    ("version", Value::Integer(1.into())),
-                ].into_iter()))])),
-                ("service", Value::String("com.apple.madrid".to_string())),
-                ("sub-services", Value::Array(vec![
-                    Value::String("com.apple.private.alloy.sms".to_string()),
-                    Value::String("com.apple.private.alloy.gelato".to_string()),
-                    Value::String("com.apple.private.alloy.biz".to_string()),
-                    Value::String("com.apple.private.alloy.gamecenter.imessage".to_string()),
-                ])),
-                ("users", Value::Array(user_list))
-            ].into_iter()))
-        ])),
+        ("services", Value::Array(services)),
         ("software-version", Value::String(register_meta.software_version)),
         ("validation-data", Value::Data(config.generate_validation_data().await?))
     ].into_iter()));
@@ -520,46 +496,53 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, users: &mut [IDSUse
     }
 
     // update registrations
-    let users_list = resp.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap()
-        .get(0).unwrap().as_dictionary().unwrap().get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
-    for user in users_list {
-        // TODO turn this into a struct
-        let user_dict = user.as_dictionary().unwrap();
-        let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
+    let service_list = resp.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap();
+    
+    for service in service_list {
+        let dict = service.as_dictionary().unwrap();
+        let service_name = dict.get("service").unwrap().as_string().unwrap();
+        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
 
-        if status != 0 {
-            if status == 6009 {
-                if let Some(alert) = user_dict.get("alert") {
-                    return Err(PushError::CustomerMessage(plist::from_value(alert)?))
-                }
-            }
-            return Err(PushError::RegisterFailed(status));
-        }
 
-        let mut my_handles = vec![];
-
-        let cert = user_dict.get("cert").unwrap().as_data().unwrap();
-        for uri in user_dict.get("uris").unwrap().as_array().unwrap() {
-            let status = uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
-            let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
+        for user in users_list {
+            // TODO turn this into a struct
+            let user_dict = user.as_dictionary().unwrap();
+            let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
+    
             if status != 0 {
-                error!("Failed to register {uri} status {}", status);
+                if status == 6009 {
+                    if let Some(alert) = user_dict.get("alert") {
+                        return Err(PushError::CustomerMessage(plist::from_value(alert)?))
+                    }
+                }
                 return Err(PushError::RegisterFailed(status));
             }
-            my_handles.push(uri.to_string());
+    
+            let mut my_handles = vec![];
+    
+            let cert = user_dict.get("cert").unwrap().as_data().unwrap();
+            for uri in user_dict.get("uris").unwrap().as_array().unwrap() {
+                let status = uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
+                let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
+                if status != 0 {
+                    error!("Failed to register {uri} status {}", status);
+                    return Err(PushError::RegisterFailed(status));
+                }
+                my_handles.push(uri.to_string());
+            }
+    
+            let heartbeat_interval = user_dict.get("next-hbi").and_then(|i| i.as_unsigned_integer());
+            let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
+            let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
+            let registration = IDSRegistration {
+                id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
+                handles: my_handles,
+                registered_at_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                heartbeat_interval_s: heartbeat_interval,
+            };
+    
+            user.registration.insert(service_name.to_string(), registration);
         }
-
-        let heartbeat_interval = user_dict.get("next-hbi").and_then(|i| i.as_unsigned_integer());
-        let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
-        let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
-        let registration = IDSRegistration {
-            id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
-            handles: my_handles,
-            registered_at_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
-            heartbeat_interval_s: heartbeat_interval,
-        };
-
-        user.registration = Some(registration);
     }
 
     Ok(())

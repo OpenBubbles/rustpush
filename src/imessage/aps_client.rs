@@ -1,18 +1,72 @@
 use std::{path::PathBuf, pin::Pin, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, error, info, warn};
-use plist::{Data, Value};
+use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection}, imessage::messages::{MessageTarget, SendMessage, ErrorMessage, SUPPORTED_COMMANDS}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::IDSService}, imessage::messages::{ErrorMessage, SUPPORTED_COMMANDS}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
 use rand::RngCore;
 use crate::ids::IDSRecvMessage;
 use async_recursion::async_recursion;
+
+pub const MADRID_SERVICE: IDSService = IDSService {
+    name: "com.apple.madrid",
+    sub_services: &[
+        "com.apple.private.alloy.sms",
+        "com.apple.private.alloy.gelato",
+        "com.apple.private.alloy.biz",
+        "com.apple.private.alloy.gamecenter.imessage",
+    ],
+    client_data: &[
+        ("is-c2k-equipment", Value::Boolean(true)),
+        ("optionally-receive-typing-indicators", Value::Boolean(true)),
+        ("show-peer-errors", Value::Boolean(true)),
+        ("supports-ack-v1", Value::Boolean(true)),
+        ("supports-activity-sharing-v1", Value::Boolean(true)),
+        ("supports-audio-messaging-v2", Value::Boolean(true)),
+        ("supports-autoloopvideo-v1", Value::Boolean(true)),
+        ("supports-be-v1", Value::Boolean(true)),
+        ("supports-ca-v1", Value::Boolean(true)),
+        ("supports-fsm-v1", Value::Boolean(true)),
+        ("supports-fsm-v2", Value::Boolean(true)),
+        ("supports-fsm-v3", Value::Boolean(true)),
+        ("supports-ii-v1", Value::Boolean(true)),
+        ("supports-impact-v1", Value::Boolean(true)),
+        ("supports-inline-attachments", Value::Boolean(true)),
+        ("supports-keep-receipts", Value::Boolean(true)),
+        ("supports-location-sharing", Value::Boolean(true)),
+        ("supports-media-v2", Value::Boolean(true)),
+        ("supports-photos-extension-v1", Value::Boolean(true)),
+        ("supports-st-v1", Value::Boolean(true)),
+        ("supports-update-attachments-v1", Value::Boolean(true)),
+        ("supports-people-request-messages", Value::Boolean(true)),
+        ("supports-people-request-messages-v2", Value::Boolean(true)),
+        ("supports-people-request-messages-v3", Value::Boolean(true)),
+        ("supports-rem", Value::Boolean(true)),
+        ("nicknames-version", Value::Real(1.0)),
+        ("ec-version", Value::Real(1.0)),
+        ("supports-cross-platform-sharing", Value::Boolean(true)),
+        ("supports-original-timestamp-v1", Value::Boolean(true)),
+        ("supports-sa-v1", Value::Boolean(true)),
+        ("supports-photos-extension-v2", Value::Boolean(true)),
+        ("prefers-sdr", Value::Boolean(false)),
+        ("supports-shared-exp", Value::Boolean(true)),
+        ("supports-protobuf-payload-data-v2", Value::Boolean(true)),
+        ("supports-hdr", Value::Boolean(true)),
+        ("supports-heif", Value::Boolean(true)),
+        ("supports-dq-nr", Value::Boolean(true)),
+        ("supports-family-invite-message-bubble", Value::Boolean(true)),
+        ("supports-live-delivery", Value::Boolean(true)),
+        ("supports-findmy-plugin-messages", Value::Boolean(true)),
+    ],
+    flags: 17,
+    capabilities_name: "Messenger"
+};
 
 impl IDSRecvMessage {
     pub fn to_message(&self, conversation: Option<ConversationData>, message: Message) -> Result<MessageInst, PushError> {
@@ -42,13 +96,13 @@ impl IDSRecvMessage {
 pub struct IMClient {
     pub conn: APSConnection,
     pub identity: IdentityManager,
-    raw_inbound: Mutex<broadcast::Receiver<APSMessage>>,
     os_config: Arc<dyn OSConfig>,
+    _interest_token: APSInterestToken,
 }
 
 impl IMClient {
-    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSUserIdentity, cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
-        
+    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSUserIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+        let interest = conn.request_topics(vec!["com.apple.private.alloy.sms", "com.apple.madrid"]).await.0;
         let _ = Self::setup_conn(&conn).await;
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -66,7 +120,7 @@ impl IMClient {
             }
         });
 
-        let identity = IdentityResource::new(users, identity, cache_path, conn.clone(), os_config.clone()).await;
+        let identity = IdentityResource::new(users, identity, services, cache_path, conn.clone(), os_config.clone()).await;
 
         let mut to_refresh = identity.generated_signal.subscribe();
         let my_ident_ref = identity.resource.clone();
@@ -83,7 +137,7 @@ impl IMClient {
         });
 
         IMClient {
-            raw_inbound: Mutex::new(conn.messages_cont.subscribe()),
+            _interest_token: interest,
             conn,
             os_config: os_config.clone(),
             identity,
@@ -91,9 +145,6 @@ impl IMClient {
     }
 
     async fn setup_conn(conn: &APSConnection) -> Result<(), PushError> {
-        conn.send(APSMessage::SetState { state: 1 }).await?;
-        conn.filter(&["com.apple.private.alloy.sms"], &[], &["com.apple.madrid"], &[]).await?;
-
         if let Err(_) = tokio::time::timeout(Duration::from_millis(500), conn.wait_for_timeout(conn.subscribe().await,
             |msg| if let APSMessage::NoStorage = msg { Some(()) } else { None })).await {
 
@@ -119,21 +170,13 @@ impl IMClient {
         Ok(())
     }
 
-    pub async fn receive_wait(&self) -> Result<Option<MessageInst>, PushError> {
-        let mut filter = get_message(|load| {
-            debug!("recv {:?}", load);
-            let parsed: IDSRecvMessage = plist::from_value(&load).ok()?;
-            if SUPPORTED_COMMANDS.contains(&parsed.command) {
-                    Some(parsed)
-                } else { None }
-        }, &["com.apple.madrid", "com.apple.private.alloy.sms"]);
-        loop {
-            let msg = self.raw_inbound.lock().await.recv().await.unwrap();
-            if let Some(received) = filter(msg) {
-                let recieved = self.process_msg(received).await;
-                if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
-                return recieved
-            }
+    pub async fn handle(&self, msg: APSMessage) -> Result<Option<MessageInst>, PushError> {
+        if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
+            let recieved = self.process_msg(received).await;
+            if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
+            recieved
+        } else {
+            Ok(None)
         }
     }
     
@@ -199,7 +242,7 @@ impl IMClient {
             cache_lock.invalidate(&target, &sender);
             return Ok(if sender == target {
                 self.identity.ensure_private_self(&mut cache_lock, &target, true).await?;
-                let private_self = &cache_lock.cache.get(target).unwrap().private_data;
+                let private_self = &cache_lock.cache["com.apple.madrid"].get(target).unwrap().private_data;
 
                 let Some(new_device_token) = private_self.iter().find(|dev| &dev.token == sender_token) else {
                     error!("New device not found!");
@@ -232,28 +275,7 @@ impl IMClient {
         }
 
         if payload.message_unenc.is_none() {
-            let IDSRecvMessage {
-                sender: Some(sender),
-                target: Some(target),
-                message: Some(message),
-                token: Some(token),
-                verification_failed,
-                .. 
-            } = &mut payload else { return Ok(None) };
-            let ident = match self.identity.get_key_for_sender(&target, &sender, &token).await {
-                Ok(ident) => Some(ident.client_data.public_message_identity_key),
-                Err(err) => {
-                    error!("No identity for payload! {}", err);
-                    *verification_failed = true;
-                    None
-                }
-            };
-
-            let decrypted = self.identity.decrypt_payload(ident.as_ref(), &message)?;
-            let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
-
-            let parsed: Value = plist::from_bytes(&ungzipped)?;
-            payload.message_unenc = Some(parsed);
+            return Ok(None);
         }
 
         match MessageInst::from_raw(payload.message_unenc.take().unwrap(), &payload, &self.conn).await {
@@ -266,8 +288,11 @@ impl IMClient {
     pub async fn send(&self, message: &mut MessageInst) -> Result<SendJob, PushError> {
         let handles = self.identity.get_handles().await;
 
+        let topic = if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" };
+
         let targets = message.prepare_send(&handles);
         self.identity.cache_keys(
+            topic,
             &targets,
             message.sender.as_ref().unwrap(),
             false,
@@ -276,208 +301,30 @@ impl IMClient {
 
         let handle = message.sender.as_ref().unwrap().to_string();
         let ident_cache = self.identity.cache.lock().await;
-        let mut message_targets = if let Some(message_targets) = &message.target {
-            ident_cache.get_targets(&handle, &targets, message_targets)?
+        let message_targets = if let Some(message_targets) = &message.target {
+            ident_cache.get_targets(topic, &handle, &targets, message_targets)?
         } else {
-            ident_cache.get_participants_targets(&handle, &targets)
+            ident_cache.get_participants_targets(topic, &handle, &targets)
         };
 
-        // do not send to self
-        let my_token = self.conn.get_token().await;
-        message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
-
-        if message_targets.is_empty() {
-            return Ok(SendJob {
-                process: tokio::sync::broadcast::channel(1).1,
-                handle: None,
-            })
-        }
-        
-        let (sender, receiver) = 
-            tokio::sync::broadcast::channel(message_targets.len());
-        
-        let mut progress = receiver.resubscribe();
-
-        let job = InnerSendJob {
-            conn: self.conn.clone(),
-            identity: self.identity.clone(),
-            user_agent: self.os_config.get_version_ua(),
-            message: message.clone(),
-            status: sender,
-        };
-
-        let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
-
-        let mut received = false;
-        let mut checked = false;
-        loop {
-            select! {
-                finished = &mut job_spawned => {
-                    finished.unwrap()?;
-                    checked = true;
-                    received = true; // for no confirm items
-                    break; // Done
-                },
-                _prog = progress.recv() => {
-                    received = true;
-                },
-                _time = tokio::time::sleep(Duration::from_millis(if received { 500 } else { 15000 })) => {
-                    break;
-                }
-            }
-        }
-
-        if !received {
-            debug!("Not received");
-            job_spawned.abort();
-            return Err(PushError::SendTimedOut)
-        }
-        
-        Ok(SendJob {
-            process: receiver,
-            handle: if checked { None } else { Some(job_spawned) },
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum SendResult {
-    Sent,
-    APSError(i64),
-    TimedOut,
-}
-
-pub struct SendJob {
-    pub process: tokio::sync::broadcast::Receiver<(DeliveryHandle, SendResult)>,
-    pub handle: Option<JoinHandle<Result<(), PushError>>>,
-}
-
-struct InnerSendJob {
-    pub conn: APSConnection,
-    pub identity: IdentityManager,
-    pub user_agent: String,
-    pub message: MessageInst,
-    pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
-}
-
-impl InnerSendJob {
-    #[async_recursion]
-    async fn send_targets(self, targets: Vec<DeliveryHandle>, retry_count: u8) -> Result<(), PushError> {
-        info!("Sending retry {}", retry_count);
-        let message = &self.message;
-        let handle = message.sender.as_ref().unwrap().to_string();
         let my_handles = self.identity.get_handles().await;
-        let raw = if message.has_payload() { Some(message.to_raw(&my_handles, &self.conn).await?) } else { None };
+        let ids_message = IDSSendMessage {
+            sender: message.sender.as_ref().unwrap().to_string(),
+            raw: if message.has_payload() { Some(message.to_raw(&my_handles, &self.conn).await?) } else { None },
+            send_delivered: message.send_delivered,
+            command: message.message.get_c(),
+            ex: message.get_ex(),
+            no_response: message.message.get_nr() == Some(true),
+            id: message.id.clone(),
+            sent_timestamp: message.sent_timestamp,
+            response_for: None,
+        };
 
-        let mut groups = vec![];
-        let mut group = vec![];
-        let mut group_size = 0;
-        const GROUP_MAX_SIZE: usize = 10000;
 
-        for target in &targets {
-            let encrypted = if let Some(msg) = &raw {
-                Some(self.identity.encrypt_payload(&target.delivery_data.client_data.public_message_identity_key, &msg)?)
-            } else { None };
-            let send_delivered = if message.send_delivered { &target.participant != message.sender.as_ref().unwrap() } else { false };
-            group_size += encrypted.as_ref().map(|i| i.len()).unwrap_or(0);
-            group.push(target.build_bundle(send_delivered, encrypted));
-            
-            if group_size > GROUP_MAX_SIZE {
-                groups.push(std::mem::take(&mut group));
-                group_size = 0;
-            }
-        }
-        if group.len() > 0 {
-            groups.push(group);
-        }
-
-        let mut messages = self.conn.subscribe().await;
-
-        let msg_id = rand::thread_rng().next_u32();
-        let uuid = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
-        debug!("send_uuid {}", encode_hex(&uuid));
-        for (batch, group) in groups.into_iter().enumerate() {
-            let complete = SendMessage {
-                batch: batch as u8 + 1,
-                command: message.message.get_c(),
-                encryption: if message.has_payload() { Some("pair".to_string()) } else { None },
-                user_agent: self.user_agent.clone(),
-                v: 8,
-                message_id: msg_id,
-                uuid: uuid.clone().into(),
-                payloads: group,
-                sender: message.sender.clone().unwrap(),
-                ex: message.get_ex(),
-                no_response: message.message.get_nr(),
-                retry_count: if retry_count != 0 { Some(retry_count) } else { None },
-                original_epoch_nanos: if retry_count != 0 { Some(message.sent_timestamp * 1000000) } else { None },
-            };
-    
-            let binary = plist_to_bin(&complete)?;
-            self.conn.send_message(if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" }, binary, Some(msg_id)).await?
-        }
-
-        if message.message.get_nr() != Some(true) {
-            let mut remain_targets = targets;
-            let mut refresh_targets: Vec<DeliveryHandle> = vec![];
-            let payloads_cnt = remain_targets.len();
-            info!("payload {payloads_cnt}");
-
-            while !remain_targets.is_empty() {
-                let filter = get_message(|load| {
-                    debug!("got {:?}", load);
-                    let result: IDSRecvMessage = plist::from_value(&load).ok()?;
-                    if result.command != 255 {
-                        return None
-                    }
-                    // make sure it's my message
-                    if result.uuid.as_ref() == Some(&uuid) { Some(result) } else { None }
-                }, &["com.apple.madrid", "com.apple.private.alloy.sms"]);
-
-                let Ok(msg) = tokio::time::timeout(std::time::Duration::from_secs(60 * ((retry_count as u64) + 1)), 
-                    self.conn.wait_for(&mut messages, filter)).await else {
-                    break;
-                };
-                let load = msg?;
-
-                let Some(target_idx) = remain_targets.iter().position(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) else { continue };
-                match load.status.unwrap() {
-                    5032 => {
-                        info!("got 5032, refreshing keys!");
-                        refresh_targets.push(remain_targets.remove(target_idx));
-                    },
-                    0 | 5008 => {
-                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::Sent)); // succeeded
-                    },
-                    _status => {
-                        if remain_targets[target_idx].participant == handle {
-                            warn!("Failed to deliver to self device; ignoring!");
-                            continue // ignore errors sending to self devices
-                        }
-                        let _ = self.status.send((remain_targets.remove(target_idx), SendResult::APSError(_status)));
-                    }
-                }
-            }
-            
-            if !remain_targets.is_empty() || !refresh_targets.is_empty() {
-                // will bail early if refresh_targets is empty
-                let new_targets = self.identity.refresh_handles(&handle, &refresh_targets).await?;
-                remain_targets.extend(new_targets);
-
-                if retry_count == 5 {
-                    for target in remain_targets {
-                        let _ = self.status.send((target, SendResult::TimedOut));
-                    }
-                    info!("Retry failed");
-                    return Ok(())
-                }
-
-                self.send_targets(remain_targets, retry_count + 1).await?;
-            }
-        }
-        info!("Sending done!");
-        Ok(())
+        self.identity.send_message(topic, ids_message, message_targets).await
     }
 }
+
+
 
 

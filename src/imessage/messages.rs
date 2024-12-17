@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{ids::IDSRecvMessage, util::{plist_to_string, bin_serialize, bin_deserialize, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
+use crate::{ids::{identity_manager::MessageTarget, IDSRecvMessage}, util::{bin_deserialize, bin_serialize, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1240,12 +1240,6 @@ pub fn add_prefix(participants: &[String]) -> Vec<String> {
     }).collect()
 }
 
-#[repr(C)]
-#[derive(Clone)]
-pub enum MessageTarget {
-    Token(Vec<u8>),
-    Uuid(String),
-}
 
 // defined in rawmessages
 impl BaseBalloonBody {

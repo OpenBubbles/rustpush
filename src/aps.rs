@@ -1,9 +1,9 @@
 
-use std::{borrow::BorrowMut, cmp::min, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
+use std::{borrow::BorrowMut, cmp::min, collections::HashMap, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
 
 use backon::ExponentialBuilder;
 use deku::prelude::*;
-use log::error;
+use log::{debug, error};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer};
 use plist::Value;
 use rand::{Rng, RngCore};
@@ -41,8 +41,8 @@ impl APSRawMessage {
     }
 }
 
-pub fn get_message<F, T>(mut pred: F, topics: &'static [&str]) -> impl FnMut(APSMessage) -> Option<T>
-    where F: FnMut(Value) -> Option<T> {
+pub fn get_message<'t, F, T>(mut pred: F, topics: &'t [&str]) -> impl FnMut(APSMessage) -> Option<T> + 't
+    where F: FnMut(Value) -> Option<T> + 't {
     move |msg| {
         if let APSMessage::Notification { id: _, topic, token: _, payload } = msg {
             if !topics.iter().any(|t| sha1(t.as_bytes()) == topic) {
@@ -237,6 +237,26 @@ pub struct APSState {
     pub keypair: Option<KeyPair>,
 }
 
+pub struct APSInterestToken {
+    topics: Vec<&'static str>,
+    aps: APSConnection,
+}
+
+impl Drop for APSInterestToken {
+    fn drop(&mut self) {
+        // we don't care if it succeeds or not; we want to decrement no matter what
+        let aps_ref = self.aps.clone();
+        let topics = self.topics.clone();
+        tokio::spawn(async move {
+            let mut topic_lock = aps_ref.topics.lock().await;
+            for topic in &topics {
+                *topic_lock.entry(*topic).or_default() -= 1;
+            }
+            let _ = aps_ref.update_topics(&mut *topic_lock).await; // not much we can do
+        });
+    }
+}
+
 pub struct APSConnectionResource {
     os_config: Arc<dyn OSConfig>,
     pub state: RwLock<APSState>,
@@ -245,6 +265,7 @@ pub struct APSConnectionResource {
     pub messages_cont: broadcast::Sender<APSMessage>,
     reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
+    topics: Mutex<HashMap<&'static str, u64>>,
 }
 
 const APNS_PORT: u16 = 5223;
@@ -335,6 +356,7 @@ impl APSConnectionResource {
             messages_cont,
             reader: Mutex::new(None),
             manager: Mutex::new(None),
+            topics: Mutex::new(HashMap::new()),
         });
         
         let result = connection.generate().await;
@@ -391,6 +413,20 @@ impl APSConnectionResource {
         self.state.read().await.token.unwrap()
     }
 
+    async fn update_topics(&self, topic_lock: &mut HashMap<&'static str, u64>) -> Result<(), PushError> {
+        topic_lock.retain(|_k, v| *v > 0);
+        self.filter(&topic_lock.keys().map(|k| *k).collect::<Vec<_>>(), &[], &[], &[]).await?;
+        Ok(())
+    }
+
+    pub async fn request_topics(&self, topics: Vec<&'static str>) -> (APSInterestToken, Option<PushError>) {
+        let mut topic_lock = self.topics.lock().await;
+        for topic in &topics {
+            *topic_lock.entry(*topic).or_default() += 1;
+        }
+        (APSInterestToken { topics, aps: self.get_manager().await }, self.update_topics(&mut *topic_lock).await.err())
+    }
+
     async fn do_connect(self: &Arc<Self>) -> Result<(), PushError> {
         let mut state = self.state.write().await;
 
@@ -423,6 +459,10 @@ impl APSConnectionResource {
         if let Some(token) = token {
             state.token = Some(token);
         }
+
+        drop(state);
+        self.send(APSMessage::SetState { state: 1 }).await?;
+        self.update_topics(&mut *self.topics.lock().await).await?; // not much we can do
 
         Ok(())
     }
@@ -473,8 +513,12 @@ impl APSConnectionResource {
         Err(PushError::SendTimedOut)
     }
 
+    async fn get_manager(&self) -> APSConnection {
+        self.manager.lock().await.as_ref().unwrap().upgrade().unwrap()
+    }
+
     async fn do_reload(&self) {
-        self.manager.lock().await.as_ref().unwrap().upgrade().unwrap().request_update().await;
+        self.get_manager().await.request_update().await;
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {
@@ -493,7 +537,8 @@ impl APSConnectionResource {
     }
 
 
-    pub async fn filter(&self, enabled: &[&str], ignored: &[&str], opportunistic: &[&str], paused: &[&str]) -> Result<(), PushError> {
+    async fn filter(&self, enabled: &[&str], ignored: &[&str], opportunistic: &[&str], paused: &[&str]) -> Result<(), PushError> {
+        debug!("Filtering to {enabled:?} {ignored:?} {opportunistic:?} {paused:?}");
         self.send(APSMessage::Filter {
             token: Some(self.get_token().await),
             enabled: enabled.iter().map(|i| sha1(i.as_bytes())).collect(),

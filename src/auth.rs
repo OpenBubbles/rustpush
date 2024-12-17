@@ -163,7 +163,7 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
     Ok(IDSUser {
         auth_keypair: keypair,
         user_id: user_id.to_string(),
-        registration: None,
+        registration: HashMap::new(),
         user_type,
         protocol_version: os_config.get_protocol_version(),
     })
@@ -298,7 +298,7 @@ impl SignedRequest {
             .send().await?)
     }
 
-    pub async fn send_apns(self, aps: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
+    pub async fn send_apns(self, aps: &APSConnectionResource, topic: &'static str) -> Result<Vec<u8>, PushError> {
         let url = get_bag(IDS_BAG, self.bag).await?;
 
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();
@@ -318,14 +318,14 @@ impl SignedRequest {
         debug!("sending apns query {:?}", request);
 
         let receiver = aps.subscribe().await;
-        aps.send_message("com.apple.madrid", plist_to_bin(&request)?, None).await?;
+        aps.send_message(topic, plist_to_bin(&request)?, None).await?;
 
         let response = aps.wait_for_timeout(receiver, get_message(|payload| {
             let Some(recv_id) = payload.as_dictionary().unwrap().get("U") else {
                 return None
             };
             if recv_id.as_data().unwrap() == msg_id { Some(payload) } else { None }
-        }, &["com.apple.madrid"])).await?;
+        }, &[topic])).await?;
         
         let response = response.as_dictionary().unwrap();
         if let Some(b) = response.get("b") {
