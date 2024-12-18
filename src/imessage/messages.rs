@@ -602,14 +602,15 @@ pub struct ChangeParticipantMessage {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Reaction {
     Heart,
     Like,
     Dislike,
     Laugh,
-    Emphsize,
-    Question
+    Emphasize,
+    Question,
+    Emoji(String),
 }
 
 impl Reaction {
@@ -619,8 +620,16 @@ impl Reaction {
             Self::Like => 1,
             Self::Dislike => 2,
             Self::Laugh => 3,
-            Self::Emphsize => 4,
-            Self::Question => 5
+            Self::Emphasize => 4,
+            Self::Question => 5,
+            Self::Emoji(_) => 6,
+        }
+    }
+
+    fn get_emoji(&self) -> Option<String> {
+        match self {
+            Self::Emoji(e) => Some(e.clone()),
+            _ => None
         }
     }
 }
@@ -713,24 +722,26 @@ impl ReactMessageType {
                 if *enable {
                     format!("{} “{}”",
                         match reaction {
-                            Reaction::Heart => "Loved",
-                            Reaction::Like => "Liked",
-                            Reaction::Dislike => "Disliked",
-                            Reaction::Laugh => "Laughed at",
-                            Reaction::Emphsize => "Emphasized",
-                            Reaction::Question => "Questioned",
+                            Reaction::Heart => "Loved".to_string(),
+                            Reaction::Like => "Liked".to_string(),
+                            Reaction::Dislike => "Disliked".to_string(),
+                            Reaction::Laugh => "Laughed at".to_string(),
+                            Reaction::Emphasize => "Emphasized".to_string(),
+                            Reaction::Question => "Questioned".to_string(),
+                            Reaction::Emoji(e) => format!("Reacted {} to ", e)
                         },
                         to_text
                     )
                 } else {
                     format!("Removed a{} from “{}”",
                         match reaction {
-                            Reaction::Heart => " heart",
-                            Reaction::Like => " like",
-                            Reaction::Dislike => " dislike",
-                            Reaction::Laugh => " laugh",
-                            Reaction::Emphsize => "n exclamation",
-                            Reaction::Question => " question mark",
+                            Reaction::Heart => " heart".to_string(),
+                            Reaction::Like => " like".to_string(),
+                            Reaction::Dislike => " dislike".to_string(),
+                            Reaction::Laugh => " laugh".to_string(),
+                            Reaction::Emphasize => "n exclamation".to_string(),
+                            Reaction::Question => " question mark".to_string(),
+                            Reaction::Emoji(e) => format!(" {}", e),
                         },
                         to_text
                     )
@@ -756,6 +767,11 @@ impl ReactMessageType {
             Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _ } => 1000,
             Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _ } => 2,
         }
+    }
+
+    fn get_emoji(&self) -> Option<String> {
+        let Self::React { reaction, enable: _ } = self else { return None };
+        reaction.get_emoji()
     }
 
     fn notification(&self) -> bool {
@@ -808,14 +824,15 @@ impl ReactMessage {
         self.reaction.get_text(&self.to_text)
     }
 
-    fn from_idx(idx: u64) -> Option<Reaction> {
-        Some(match idx {
-            0 => Reaction::Heart,
-            1 => Reaction::Like,
-            2 => Reaction::Dislike,
-            3 => Reaction::Laugh,
-            4 => Reaction::Emphsize,
-            5 => Reaction::Question,
+    fn from_idx(idx: u64, emoji: Option<String>) -> Option<Reaction> {
+        Some(match (idx, emoji) {
+            (0, None) => Reaction::Heart,
+            (1, None) => Reaction::Like,
+            (2, None) => Reaction::Dislike,
+            (3, None) => Reaction::Laugh,
+            (4, None) => Reaction::Emphasize,
+            (5, None) => Reaction::Question,
+            (6, Some(em)) => Reaction::Emoji(em),
             _ => return None
         })
     }
@@ -1502,6 +1519,7 @@ impl MessageInst {
                     participants: conversation.participants.clone(),
                     after_guid: conversation.after_guid.clone(),
                     sender_guid: conversation.sender_guid.clone(),
+                    react_emoji: react.reaction.get_emoji(),
                     pv: 0,
                     gv: "8".to_string(),
                     v: "1".to_string(),
@@ -1866,11 +1884,11 @@ impl MessageInst {
                     }
                 },
                 2000..=2999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 2000).ok_or(PushError::BadMsg)?,
+                    reaction: ReactMessage::from_idx(loaded.amt - 2000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
                     enable: true
                 },
                 3000..=3999 => ReactMessageType::React {
-                    reaction: ReactMessage::from_idx(loaded.amt - 3000).ok_or(PushError::BadMsg)?,
+                    reaction: ReactMessage::from_idx(loaded.amt - 3000, loaded.react_emoji.clone()).ok_or(PushError::BadMsg)?,
                     enable: false
                 },
                 _ => return Err(PushError::BadMsg)

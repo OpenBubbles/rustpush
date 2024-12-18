@@ -63,6 +63,8 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-family-invite-message-bubble", Value::Boolean(true)),
         ("supports-live-delivery", Value::Boolean(true)),
         ("supports-findmy-plugin-messages", Value::Boolean(true)),
+        ("supports-stick-moji-backs", Value::Boolean(true)),
+        ("supports-emoji-tapbacks", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"

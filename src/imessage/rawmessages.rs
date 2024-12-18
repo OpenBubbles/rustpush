@@ -93,6 +93,8 @@ struct RawReactMessage {
     after_guid: Option<String>, // uuid
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
+    #[serde(rename = "ame")]
+    react_emoji: Option<String>,
     gv: String,
     v: String,
     #[serde(rename = "n")]

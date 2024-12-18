@@ -3,7 +3,7 @@ use std::{io::Cursor, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 
 use base64::engine::general_purpose;
 use icloud_auth::AppleAccount;
-use log::{info, error};
+use log::{debug, error, info};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
 use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, register, APSConnectionResource, APSState, Attachment, ConversationData, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, RelayConfig, MADRID_SERVICE};
@@ -49,6 +49,8 @@ async fn main() {
         std::env::set_var("RUST_LOG", "debug");
     }
     pretty_env_logger::try_init().unwrap();
+
+    // debug!("item {}", plist_to_string(&IDSUserIdentity::new().unwrap()).unwrap());
 
     // info!("here {}", get_gateways_for_mccmnc("310160").await.unwrap());
 
