@@ -642,9 +642,8 @@ impl Reaction {
 
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone)]
-#[serde(tag = "pid")]
+#[serde(untagged)]
 pub enum PartExtension {
-    #[serde(rename = "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension")]
     Sticker {
         #[serde(rename = "spw")]
         msg_width: f64,
@@ -687,24 +686,21 @@ impl PartExtension {
     }
 
     fn from_dict(mut data: HashMap<String, String>) -> Option<Self> {
-        match data.get("pid")?.as_str() {
-            "com.apple.messages.MSMessageExtensionBalloonPlugin:0000000000:com.apple.Stickers.UserGenerated.MessagesExtension" => Some(PartExtension::Sticker {
-                msg_width: data.get("spw")?.parse().ok()?,
-                rotation: data.get("sro")?.parse().ok()?,
-                sai: data.get("sai")?.parse().ok()?,
-                scale: data.get("ssa")?.parse().ok()?,
-                update: None, // updates aren't sent by dict
-                sli: data.get("sli")?.parse().ok()?,
-                normalized_x: data.get("sxs")?.parse().ok()?,
-                normalized_y: data.get("sys")?.parse().ok()?,
-                version: data.get("spv")?.parse().ok()?,
-                hash: data.remove("shash")?,
-                safi: data.get("safi")?.parse().ok()?,
-                effect_type: data.get("stickerEffectType")?.parse().ok()?,
-                sticker_id: data.remove("sid")?,
-            }),
-            _ => None
-        }
+        Some(PartExtension::Sticker {
+            msg_width: data.get("spw")?.parse().ok()?,
+            rotation: data.get("sro")?.parse().ok()?,
+            sai: data.get("sai")?.parse().ok()?,
+            scale: data.get("ssa")?.parse().ok()?,
+            update: None, // updates aren't sent by dict
+            sli: data.get("sli")?.parse().ok()?,
+            normalized_x: data.get("sxs")?.parse().ok()?,
+            normalized_y: data.get("sys")?.parse().ok()?,
+            version: data.get("spv")?.parse().ok()?,
+            hash: data.remove("shash")?,
+            safi: data.get("safi")?.parse().ok()?,
+            effect_type: data.get("stickerEffectType")?.parse().ok()?,
+            sticker_id: data.remove("sid")?,
+        })
     }
 }
 
