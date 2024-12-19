@@ -611,6 +611,11 @@ pub enum Reaction {
     Emphasize,
     Question,
     Emoji(String),
+    // send not supported
+    Sticker {
+        spec: Option<ExtensionApp>,
+        body: MessageParts
+    }
 }
 
 impl Reaction {
@@ -623,6 +628,7 @@ impl Reaction {
             Self::Emphasize => 4,
             Self::Question => 5,
             Self::Emoji(_) => 6,
+            Self::Sticker { spec: _, body: _ } => 7,
         }
     }
 
@@ -728,7 +734,8 @@ impl ReactMessageType {
                             Reaction::Laugh => "Laughed at".to_string(),
                             Reaction::Emphasize => "Emphasized".to_string(),
                             Reaction::Question => "Questioned".to_string(),
-                            Reaction::Emoji(e) => format!("Reacted {} to ", e)
+                            Reaction::Emoji(e) => format!("Reacted {} to ", e),
+                            Reaction::Sticker { spec: _, body: _ } => "Reacted with a sticker to ".to_string(),
                         },
                         to_text
                     )
@@ -742,6 +749,7 @@ impl ReactMessageType {
                             Reaction::Emphasize => "n exclamation".to_string(),
                             Reaction::Question => " question mark".to_string(),
                             Reaction::Emoji(e) => format!(" {}", e),
+                            Reaction::Sticker { spec: _, body: _ } => " sticker".to_string(),
                         },
                         to_text
                     )
@@ -1881,6 +1889,16 @@ impl MessageInst {
                     ReactMessageType::Extension {
                         spec: data,
                         body: MessageParts::parse_parts(xml, None),
+                    }
+                },
+                2007 | 3007 => {
+                    let Some(xml) = &loaded.xml else {
+                        return Err(PushError::BadMsg)
+                    };
+                    let data = loaded.type_spec.as_ref().and_then(|e| ExtensionApp::from_ati(e.as_ref(), None).ok());
+                    ReactMessageType::React {
+                        reaction: Reaction::Sticker { spec: data, body:  MessageParts::parse_parts(xml, None) },
+                        enable: loaded.amt == 2007
                     }
                 },
                 2000..=2999 => ReactMessageType::React {
