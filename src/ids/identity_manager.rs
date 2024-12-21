@@ -319,6 +319,18 @@ impl Resource for IdentityResource {
 
 impl IdentityResource {
     pub async fn new(users: Vec<IDSUser>, identity: IDSUserIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, conn: APSConnection, config: Arc<dyn OSConfig>) -> IdentityManager {
+        // if any user has a registration with outdated client_data
+        let needs_refresh = services.iter().any(|service| 
+                users.iter().any(|user| 
+                        user.registration.get(service.name).map(|s| {
+                            if s.data_hash != service.hash_data() {
+                                debug!("Triggering reregister because service {} data hash changed.", service.name);
+                                true
+                            } else {
+                                false
+                            }
+                        }).unwrap_or(false)));
+        
         let resource = Arc::new(IdentityResource {
             cache: Mutex::new(KeyCache::new(cache_path, &conn, &users, services).await),
             users: RwLock::new(users),
@@ -332,8 +344,12 @@ impl IdentityResource {
 
         let task_resource = resource.clone();
         let cancel = tokio::spawn(async move {
-            task_resource.schedule_rereg().await
+            if !needs_refresh {
+                task_resource.schedule_rereg().await
+            }
+            // return indicates reregister
         });
+        
         let resource = ResourceManager::new(
             resource,
             ExponentialBuilder::default()

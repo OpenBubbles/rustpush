@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, error, info};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey}, error::ErrorStack, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::{self, Rsa}, sha::sha256, x509::X509};
@@ -8,7 +8,7 @@ use reqwest::Method;
 use async_recursion::async_recursion;
 use serde::{de, ser::Error, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, REQWEST, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, plist_to_bin, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
 
 
 #[repr(C)]
@@ -60,6 +60,8 @@ pub struct IDSRegistration {
     #[serde(default)]
     pub registered_at_s: u64,
     pub heartbeat_interval_s: Option<u64>,
+    #[serde(default)]
+    pub data_hash: u64,
 }
 
 impl IDSRegistration {
@@ -414,7 +416,15 @@ pub struct IDSService {
     pub capabilities_name: &'static str,
 }
 
-pub async fn register(config: &dyn OSConfig, aps: &APSState, services: &[&'static IDSService], users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
+impl IDSService {
+    pub fn hash_data(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        plist_to_bin(&self.client_data).unwrap().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'static IDSService], users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
     info!("registering!");
 
     let mut possible_handles: HashMap<String, Vec<String>> = HashMap::new();
@@ -424,7 +434,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, services: &[&'stati
 
     let identity_key = identity.encode()?;
 
-    let services = services.iter().map(|service| {
+    let services = id_services.iter().map(|service| {
         let mut user_list = vec![];
         for user in users.iter() {
             let handles = &possible_handles[&user.user_id];
@@ -503,6 +513,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, services: &[&'stati
         let service_name = dict.get("service").unwrap().as_string().unwrap();
         let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
 
+        let service = id_services.iter().find(|service| service.name == service_name).expect("Service not found??");
 
         for user in users_list {
             // TODO turn this into a struct
@@ -539,6 +550,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, services: &[&'stati
                 handles: my_handles,
                 registered_at_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
                 heartbeat_interval_s: heartbeat_interval,
+                data_hash: service.hash_data(),
             };
     
             user.registration.insert(service_name.to_string(), registration);
