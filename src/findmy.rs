@@ -343,6 +343,7 @@ pub struct FindMyFriendsClient<P: AnisetteProvider> {
     pub following: Vec<Follow>,
     aps: APSConnection,
     daemon: bool,
+    has_init: bool,
 }
 
 impl<P: AnisetteProvider> FindMyFriendsClient<P> {
@@ -471,16 +472,25 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             followers: vec![],
             following: vec![],
             aps,
-            daemon
+            daemon,
+            has_init: false,
         };
-
-        let _ = client.make_request::<serde_json::Value>(config, if daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
+        
+        if !daemon {
+            let _ = client.make_request::<serde_json::Value>(config, "first/initClient", json!({})).await?;
+            client.has_init = true;
+        }
 
         Ok(client)
     }   
 
     pub async fn refresh(&mut self, config: &dyn OSConfig) -> Result<(), PushError> {
-        let _ = self.make_request::<serde_json::Value>(config, if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" }, json!({})).await?;
+        if !self.has_init {
+            let _ = self.make_request::<serde_json::Value>(config, if self.daemon { "initClient" } else { "first/initClient" }, json!({})).await?;
+            self.has_init = true;
+        } else {
+            let _ = self.make_request::<serde_json::Value>(config, if self.selected_friend.is_some() { "minCallback/selFriend/refreshClient" } else { "minCallback/refreshClient" }, json!({})).await?;
+        }
         Ok(())
     }
 
