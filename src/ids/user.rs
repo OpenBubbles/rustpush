@@ -253,6 +253,7 @@ struct HandleResult {
 pub struct IDSUser {
     pub auth_keypair: KeyPair,
     pub user_id: String,
+    #[serde(default)]
     pub registration: HashMap<String, IDSRegistration>,
     pub user_type: IDSUserType,
     pub protocol_version: u32,
