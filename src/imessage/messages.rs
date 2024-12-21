@@ -1,6 +1,6 @@
 
 
-use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
+use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
 use openssl::symm::{Cipher, Crypter};
@@ -8,7 +8,7 @@ use plist::{Data, Value};
 use regex::Regex;
 use uuid::Uuid;
 use rand::Rng;
-use xml::{EventReader, reader, writer::XmlEvent, EmitterConfig};
+use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader, EventWriter};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
@@ -40,10 +40,126 @@ impl ConversationData {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct TextFlags {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+impl TextFlags {
+    fn open_flags<T: Write>(&self, writer: &mut EventWriter<T>) {
+        if self.bold {
+            writer.write(XmlEvent::start_element("b")).unwrap();
+        }
+        if self.italic {
+            writer.write(XmlEvent::start_element("i")).unwrap();
+        }
+        if self.underline {
+            writer.write(XmlEvent::start_element("u")).unwrap();
+        }
+        if self.strikethrough {
+            writer.write(XmlEvent::start_element("s")).unwrap();
+        }
+    }
+
+    fn close_flags<T: Write>(&self, writer: &mut EventWriter<T>) {
+        if self.bold {
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+        if self.italic {
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+        if self.underline {
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+        if self.strikethrough {
+            writer.write(XmlEvent::end_element()).unwrap();
+        }
+    }
+
+    fn apply_tag(&mut self, tag: &str, applied: bool) {
+        match tag {
+            "b" => self.bold = applied,
+            "i" => self.italic = applied,
+            "u" => self.underline = applied,
+            "s" => self.strikethrough = applied,
+            _tag => panic!("Bad text flag tag {_tag}!"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TextEffect {
+    Big = 5,
+    Small = 11,
+    Shake = 9,
+    Nod = 8,
+    Explode = 12,
+    Ripple = 4,
+    Bloom = 6,
+    Jitter = 10,
+}
+
+// cmon rust this should be a #[derive]
+impl TryFrom<u32> for TextEffect {
+    type Error = PushError;
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            5 => Self::Big,
+            11 => Self::Small,
+            9 => Self::Shake,
+            8 => Self::Nod,
+            12 => Self::Explode,
+            4 => Self::Ripple,
+            6 => Self::Bloom,
+            10 => Self::Jitter,
+            _ => return Err(PushError::BadMsg)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum TextFormat {
+    Flags(TextFlags),
+    Effect(TextEffect),
+}
+
+impl TextFormat {
+    fn open_flags<T: Write>(&self, writer: &mut EventWriter<T>) {
+        match self {
+            Self::Flags(flags) => flags.open_flags(writer),
+            Self::Effect(effect) => {
+                writer.write(XmlEvent::start_element("texteffect").attr("type", &(*effect as u32).to_string())).unwrap();
+            }
+        }
+    }
+
+    fn close_flags<T: Write>(&self, writer: &mut EventWriter<T>) {
+        match self {
+            Self::Flags(flags) => flags.close_flags(writer),
+            Self::Effect(_effect) => {
+                writer.write(XmlEvent::end_element()).unwrap();
+            }
+        }
+    }
+
+    fn is_normal(&self) -> bool {
+        matches!(self, Self::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false }))
+    }
+}
+
+impl Default for TextFormat {
+    fn default() -> Self {
+        Self::Flags(Default::default())
+    }
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub enum MessagePart {
-    Text(String),
+    Text(String, TextFormat),
     Attachment(Attachment),
     Mention(String, String),
     Object(String),
@@ -67,12 +183,14 @@ impl MessageParts {
     }
 
     fn is_multipart(&self) -> bool {
-        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)) || matches!(p.part, MessagePart::Mention(_, _)))
+        self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)) || 
+            matches!(p.part, MessagePart::Mention(_, _)) || 
+            matches!(p.part, MessagePart::Text(_, fmt) if !fmt.is_normal()))
     }
 
     fn from_raw(raw: &str) -> MessageParts {
         MessageParts(vec![IndexedMessagePart {
-            part: MessagePart::Text(raw.to_string()),
+            part: MessagePart::Text(raw.to_string(), Default::default()),
             idx: None,
             ext: None,
         }])
@@ -144,13 +262,14 @@ impl MessageParts {
                         }
                     }
                 },
-                MessagePart::Text(text) => {
+                MessagePart::Text(text, format) => {
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
                         element = element.attr(key.as_str(), val);
                     }
                     writer.write(element).unwrap();
+                    format.open_flags(&mut writer);
                     for (idx, line) in text.split("\n").enumerate() {
                         if idx != 0 {
                             // insert break
@@ -159,6 +278,7 @@ impl MessageParts {
                         }
                         writer.write(XmlEvent::Characters(html_escape::encode_text(line).as_ref())).unwrap();
                     }
+                    format.close_flags(&mut writer);
                 },
                 MessagePart::Mention(uri, text) => {
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
@@ -192,7 +312,7 @@ impl MessageParts {
         if !mms {
             parts.push("(null)(0)".to_string());
             let data = self.0.iter().map(|p| {
-                if let MessagePart::Text(text) = &p.part {
+                if let MessagePart::Text(text, _fmt) = &p.part {
                     text.to_string()
                 } else { panic!("bad type!") }
             }).collect::<Vec<String>>().join("|");
@@ -205,7 +325,7 @@ impl MessageParts {
         } else {
             for (idx, part) in self.0.iter().enumerate() {
                 out.push(match &part.part {
-                    MessagePart::Text(text) => {
+                    MessagePart::Text(text, _fmt) => {
                         let content_id = format!("text{:0>6}", idx + 1);
                         parts.push(format!("{}.txt(0)", content_id));
                         RawSmsIncomingMessageData {
@@ -247,7 +367,7 @@ impl MessageParts {
                 raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
             };
             let typ = if corresponding.mime_type == "text/plain" {
-                MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap())
+                MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap(), Default::default())
             } else {
                 MessagePart::Attachment(Attachment {
                     a_type: AttachmentType::Inline(corresponding.data.clone().into()),
@@ -277,10 +397,10 @@ impl MessageParts {
             Mention(String /* uri */),
         }
         impl StagingElement {
-            fn complete(self, buf: String) -> MessagePart {
+            fn complete(self, buf: String, format: TextFormat) -> MessagePart {
                 match self {
                     Self::Mention(user) => MessagePart::Mention(user, buf),
-                    Self::Text => MessagePart::Text(buf)
+                    Self::Text => MessagePart::Text(buf, format)
                 }
             }
         }
@@ -288,6 +408,7 @@ impl MessageParts {
         let mut text_part_idx: Option<usize> = None;
         let mut text_meta: Option<PartExtension> = None;
         let mut staging_item: Option<StagingElement> = None;
+        let mut staging_format = TextFormat::default();
         for e in reader {
             match e {
                 Ok(reader::XmlEvent::StartElement { name, attributes, namespace: _ }) => {
@@ -297,87 +418,146 @@ impl MessageParts {
                     };
                     let part_idx = attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|opt| opt.value.parse().unwrap());
                     let all_items: HashMap<String, String> = attributes.iter().map(|a| (a.name.to_string(), a.value.clone())).collect();
-                    if name.local_name == "FILE" {
-                        if staging_item.is_some() {
+                    match name.local_name.as_str() {
+                        "FILE" => {
+                            if staging_item.is_some() {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.take(),
+                                });
+                                text_part_idx = None; // FILEs are always top-level, so reset the thing
+                                text_meta = None;
+                            }
                             data.push(IndexedMessagePart {
-                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
-                                idx: text_part_idx,
-                                ext: text_meta.take(),
-                            });
-                            text_part_idx = None; // FILEs are always top-level, so reset the thing
-                            text_meta = None;
-                        }
-                        data.push(IndexedMessagePart {
-                            part: MessagePart::Attachment(Attachment {
-                                a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
-                                    AttachmentType::Inline(if inline.value == "ia-0" {
-                                        raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
-                                    } else if inline.value == "ia-1" {
-                                        raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                part: MessagePart::Attachment(Attachment {
+                                    a_type: if let Some(inline) = attributes.iter().find(|attr| attr.name.to_string() == "inline-attachment") {
+                                        AttachmentType::Inline(if inline.value == "ia-0" {
+                                            raw.map_or(vec![], |raw| raw.inline0.clone().unwrap().into())
+                                        } else if inline.value == "ia-1" {
+                                            raw.map_or(vec![], |raw| raw.inline1.clone().unwrap().into())
+                                        } else {
+                                            continue
+                                        })
                                     } else {
-                                        continue
-                                    })
-                                } else {
-                                    let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                    let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                    AttachmentType::MMCS(MMCSFile {
-                                        signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                        object: get_attr("mmcs-owner", None),
-                                        url: get_attr("mmcs-url", None),
-                                        key: key[1..].to_vec(),
-                                        size: get_attr("file-size", None).parse().unwrap()
-                                    })
-                                },
-                                part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
-                                uti_type: get_attr("uti-type", Some("public.data")),
-                                mime: get_attr("mime-type", Some("application/octet-stream")),
-                                name: get_attr("name", None),
-                                iris: get_attr("iris", Some("no")) == "yes"
-                            }),
-                            idx: part_idx,
-                            ext: PartExtension::from_dict(all_items),
-                        })
-                    } else if name.local_name == "span" {
-                        text_part_idx = part_idx;
-                        text_meta = PartExtension::from_dict(all_items);
-                    } else if name.local_name == "mention" {
-                        if staging_item.is_some() {
+                                        let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
+                                        let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
+                                        AttachmentType::MMCS(MMCSFile {
+                                            signature: sig.clone(), // chop off first byte because it's not actually the signature
+                                            object: get_attr("mmcs-owner", None),
+                                            url: get_attr("mmcs-url", None),
+                                            key: key[1..].to_vec(),
+                                            size: get_attr("file-size", None).parse().unwrap()
+                                        })
+                                    },
+                                    part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
+                                    uti_type: get_attr("uti-type", Some("public.data")),
+                                    mime: get_attr("mime-type", Some("application/octet-stream")),
+                                    name: get_attr("name", None),
+                                    iris: get_attr("iris", Some("no")) == "yes"
+                                }),
+                                idx: part_idx,
+                                ext: PartExtension::from_dict(all_items),
+                            })
+                        },
+                        "span" => {
+                            text_part_idx = part_idx;
+                            text_meta = PartExtension::from_dict(all_items);
+                        },
+                        "mention" => {
+                            if staging_item.is_some() {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.take(),
+                                });
+                            }
+                            staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
+                        },
+                        "object" => {
+                            if staging_item.is_some() {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.take(),
+                                });
+                                text_part_idx = None; // objects are always top-level, so reset the thing
+                                text_meta = None;
+                            }
                             data.push(IndexedMessagePart {
-                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
-                                idx: text_part_idx,
-                                ext: text_meta.take(),
-                            });
+                                part: MessagePart::Object(get_attr("breadcrumbText", None)),
+                                idx: part_idx,
+                                ext: None,
+                            })
+                        },
+                        "br" => {
+                            if staging_item.is_none() {
+                                staging_item = Some(StagingElement::Text)
+                            }
+                            string_buf += "\n";
+                        },
+                        "b" | "s" | "i" | "u" => {
+                            // if we have something in the buffer
+                            if string_buf.trim().len() > 0 {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), staging_format), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.clone(),
+                                });
+                            }
+                            if let TextFormat::Flags(flags) = &mut staging_format {
+                                flags.apply_tag(&name.local_name, true);
+                            }
+                        },
+                        "texteffect" => {
+                            if string_buf.trim().len() > 0 {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.take(),
+                                });
+                            }
+                            let t: u32 = get_attr("type", None).parse().expect("Effect type not a number!");
+                            staging_format = TextFormat::Effect(t.try_into().expect("Effect # not valid!"));
                         }
-                        staging_item = Some(StagingElement::Mention(get_attr("uri", None)))
-                    } else if name.local_name == "object" {
-                        if staging_item.is_some() {
-                            data.push(IndexedMessagePart {
-                                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
-                                idx: text_part_idx,
-                                ext: text_meta.take(),
-                            });
-                            text_part_idx = None; // objects are always top-level, so reset the thing
-                            text_meta = None;
-                        }
-                        data.push(IndexedMessagePart {
-                            part: MessagePart::Object(get_attr("breadcrumbText", None)),
-                            idx: part_idx,
-                            ext: None,
-                        })
-                    } else if name.local_name == "br" {
-                        if staging_item.is_none() {
-                            staging_item = Some(StagingElement::Text)
-                        }
-                        string_buf += "\n";
+                        _ => {},
                     }
                 },
                 Ok(reader::XmlEvent::EndElement { name }) => {
-                    if name.local_name == "mention" && staging_item.is_some() {
-                        data.push(IndexedMessagePart {
-                            part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)), 
-                            idx: text_part_idx,
-                            ext: text_meta.take(),
-                        });
+                    if staging_item.is_some() {
+                        match name.local_name.as_str() {
+                            "mention" => {
+                                data.push(IndexedMessagePart {
+                                    part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), Default::default()), 
+                                    idx: text_part_idx,
+                                    ext: text_meta.take(),
+                                });
+                            }
+                            "b" | "s" | "i" | "u" => {
+                                // if we have something in the buffer
+                                if string_buf.trim().len() > 0 {
+                                    data.push(IndexedMessagePart {
+                                        part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), staging_format), 
+                                        idx: text_part_idx,
+                                        ext: text_meta.clone(),
+                                    });
+                                }
+                                if let TextFormat::Flags(flags) = &mut staging_format {
+                                    flags.apply_tag(&name.local_name, false);
+                                }
+                            },
+                            "texteffect" => {
+                                let format = mem::take(&mut staging_format);
+                                if string_buf.trim().len() > 0 {
+                                    data.push(IndexedMessagePart {
+                                        part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), format), 
+                                        idx: text_part_idx,
+                                        ext: text_meta.take(),
+                                    });
+                                }
+                            }
+                            _ => {},
+                        }
                     }
                 }
                 Ok(reader::XmlEvent::Characters(data)) => {
@@ -391,7 +571,7 @@ impl MessageParts {
         }
         if staging_item.is_some() {
             data.push(IndexedMessagePart {
-                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf)),
+                part: staging_item.take().unwrap().complete(std::mem::take(&mut string_buf), mem::take(&mut staging_format)),
                 idx: text_part_idx,
                 ext: None,
             });
@@ -401,7 +581,7 @@ impl MessageParts {
 
     pub fn raw_text(&self) -> String {
         self.0.iter().filter_map(|m| match &m.part {
-            MessagePart::Text(text) => Some(text.clone()),
+            MessagePart::Text(text, _) => Some(text.clone()),
             MessagePart::Attachment(_) => None,
             MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
             MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()) // two object replacements
@@ -572,7 +752,7 @@ impl NormalMessage {
     pub fn new(text: String, service: MessageType) -> NormalMessage {
         NormalMessage {
             parts: MessageParts(vec![IndexedMessagePart {
-                part: MessagePart::Text(text),
+                part: MessagePart::Text(text, Default::default()),
                 idx: None,
                 ext: None,
             }]),
