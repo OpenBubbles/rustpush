@@ -75,14 +75,17 @@ pub trait OSConfig: Sync + Send {
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String>;
     fn get_aoskit_version(&self) -> String;
 
+    fn get_adi_mme_info(&self, for_item: &str) -> String {
+        self.get_mme_clientinfo(for_item)
+    }
+
     fn get_gsa_config(&self, push: &APSState) -> LoginClientInfo {
         LoginClientInfo {
             ak_context_type: "imessage".to_string(),
             client_app_name: "Messages".to_string(),
             client_bundle_id: "com.apple.MobileSMS".to_string(),
-            // must be mac for clearadi
-            mme_client_info_akd: "<iMac13,1> <macOS;13.6.4;22G513> <com.apple.AuthKit/1 (com.apple.akd/1.0)>".to_string(),
-            mme_client_info: "<iMac13,1> <macOS;13.6.4;22G513> <com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)>".to_string(),
+            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)"),
+            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)"),
             akd_user_agent: "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
             browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
             hardware_headers: self.get_gsa_hardware_headers(),

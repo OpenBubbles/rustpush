@@ -53,7 +53,6 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
     let mut map = HeaderMap::new();
     map.insert("User-Agent", config.get_normal_ua(ua).parse().unwrap());
     map.insert("X-Apple-Realm-Support", "1.0".parse().unwrap());
-    map.insert("X-MME-CLIENT-INFO", config.get_mme_clientinfo("com.apple.AuthKit/1 (com.apple.findmy/375.20)").parse().unwrap());
     map.insert("X-Apple-AuthScheme", "Forever".parse().unwrap());
     // X-FMF-Model-Version
     map.insert("X-Apple-Find-API-Ver", api_ver.parse().unwrap());
@@ -61,7 +60,9 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
     map.insert("Accept", "application/json".parse().unwrap());
     map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());
 
-    let base_headers = anisette.get_headers().await?;
+    let mut base_headers = anisette.get_headers().await?.clone();
+
+    base_headers.insert("X-Mme-Client-Info".to_string(), config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.findmy/375.20)"));
 
     map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 
