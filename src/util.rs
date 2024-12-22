@@ -78,7 +78,7 @@ fn build_proxy() -> Client {
 
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
-    return build_proxy();
+    // return build_proxy();
     let certificates = vec![
         Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
@@ -376,6 +376,7 @@ const MAX_RESOURCE_REGEN: Duration = Duration::from_secs(15);
 const MAX_RESOURCE_WAIT: Duration = Duration::from_secs(30);
 
 pub struct ResourceManager<T: Resource> {
+    name: &'static str,
     pub resource: Arc<T>,
     refreshed_at: Mutex<SystemTime>,
     request_retries: mpsc::Sender<oneshot::Sender<Result<(), ResourceFailure>>>,
@@ -425,7 +426,7 @@ pub enum ResourceState {
 }
 
 impl<T: Resource + 'static> ResourceManager<T> {
-    pub fn new<B: BackoffBuilder + 'static>(resource: Arc<T>, backoff: B, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
+    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
         let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), ResourceFailure>>>(99999);
         let (sig_send, mut sig_recv) = mpsc::channel(99999);
         let (retry_now_send, mut retry_now_recv) = mpsc::channel(99999);
@@ -433,6 +434,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
         let (generated_send, _) = broadcast::channel(99);
 
         let manager = Arc::new(ResourceManager {
+            name,
             resource,
             refreshed_at: Mutex::new(SystemTime::UNIX_EPOCH),
             request_retries: retry_send,
@@ -456,6 +458,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             };
 
             'stop: loop {
+                debug!("Resource {}: waiting for retry reason", loop_manager.name);
                 select! {
                     _ = &mut current_resource => {},
                     _ = sig_recv.recv() => {},
@@ -464,11 +467,15 @@ impl<T: Resource + 'static> ResourceManager<T> {
                         break // no retries
                     },
                 }
+                debug!("Resource {}: preparing", loop_manager.name);
                 current_resource.abort();
                 let mut backoff = backoff.build();
                 *loop_manager.resource_state.lock().await = ResourceState::Generating;
+                debug!("Resource {}: generating", loop_manager.name);
                 let mut result = loop_manager.resource.generate_unwind_safe().await;
+                debug!("Resource {}: finished_generate", loop_manager.name);
                 while let Err(e) = result {
+                    debug!("Resource {}: failed", loop_manager.name);
                     let shared_err = Arc::new(e);
                     let retry_in = backoff.next().unwrap();
 
@@ -479,10 +486,13 @@ impl<T: Resource + 'static> ResourceManager<T> {
                         error: shared_err
                     };
                     resolve_items(Err(failure.clone()), &mut sig_recv, &mut retry_now_recv);
+                    debug!("Resource {}: resource marking", loop_manager.name);
                     *loop_manager.resource_state.lock().await = ResourceState::Failed(failure);
                     if is_final {
+                        debug!("Resource {}: final error; shutting down", loop_manager.name);
                         break 'stop;
                     }
+                    debug!("Resource {}: task closed", loop_manager.name);
                     select! {
                         _ = tokio::time::sleep(retry_in) => {},
                         _ = retry_now_recv.recv() => {},
@@ -490,16 +500,22 @@ impl<T: Resource + 'static> ResourceManager<T> {
                             break 'stop;
                         }
                     };
+                    debug!("Resource {}: retry generating lock", loop_manager.name);
                     *loop_manager.resource_state.lock().await = ResourceState::Generating;
+                    debug!("Resource {}: retry generating", loop_manager.name);
                     result = loop_manager.resource.generate_unwind_safe().await;
                 }
+                debug!("Resource {}: generated", loop_manager.name);
                 current_resource = result.unwrap();
+                debug!("Resource {}: refreshed", loop_manager.name);
                 *loop_manager.refreshed_at.lock().await = SystemTime::now();
+                debug!("Resource {}: generated", loop_manager.name);
                 *loop_manager.resource_state.lock().await = ResourceState::Generated;
+                debug!("Resource {}: final error; shutting down", loop_manager.name);
                 let _ = generated_send.send(());
                 resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
             }
-            debug!("Resource task closed");
+            debug!("Resource {}: task closed", loop_manager.name);
         });
 
         manager

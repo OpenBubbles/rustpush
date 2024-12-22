@@ -351,6 +351,7 @@ impl IdentityResource {
         });
         
         let resource = ResourceManager::new(
+            "Identity",
             resource,
             ExponentialBuilder::default()
                 .with_max_delay(Duration::from_secs(86400 /* one day */))

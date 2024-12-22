@@ -367,6 +367,7 @@ impl APSConnectionResource {
         };
 
         let resource = ResourceManager::new(
+            "APS",
             connection, 
             ExponentialBuilder::default()
                 .with_max_delay(Duration::from_secs(30))
