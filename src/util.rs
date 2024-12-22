@@ -20,7 +20,7 @@ use serde::de::value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio_rustls::client;
 use uuid::Uuid;
@@ -384,7 +384,7 @@ pub struct ResourceManager<T: Resource> {
     retry_now_signal: mpsc::Sender<()>,
     death_signal: Option<mpsc::Sender<()>>,
     pub generated_signal: broadcast::Sender<()>,
-    pub resource_state: Mutex<ResourceState>,
+    pub resource_state: watch::Sender<ResourceState>,
 }
 
 impl<T: Resource> Deref for ResourceManager<T> {
@@ -442,7 +442,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             retry_now_signal: retry_now_send,
             death_signal: Some(death_send),
             generated_signal: generated_send.clone(),
-            resource_state: Mutex::new(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }),
+            resource_state: watch::channel(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }).0,
         });
 
         let mut current_resource = running_resource.unwrap_or_else(|| tokio::spawn(async {}));
@@ -470,7 +470,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 debug!("Resource {}: preparing", loop_manager.name);
                 current_resource.abort();
                 let mut backoff = backoff.build();
-                *loop_manager.resource_state.lock().await = ResourceState::Generating;
+                loop_manager.resource_state.send_replace(ResourceState::Generating);
                 debug!("Resource {}: generating", loop_manager.name);
                 let mut result = loop_manager.resource.generate_unwind_safe().await;
                 debug!("Resource {}: finished_generate", loop_manager.name);
@@ -487,7 +487,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                     };
                     resolve_items(Err(failure.clone()), &mut sig_recv, &mut retry_now_recv);
                     debug!("Resource {}: resource marking", loop_manager.name);
-                    *loop_manager.resource_state.lock().await = ResourceState::Failed(failure);
+                    loop_manager.resource_state.send_replace(ResourceState::Failed(failure));
                     if is_final {
                         debug!("Resource {}: final error; shutting down", loop_manager.name);
                         break 'stop;
@@ -501,7 +501,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                         }
                     };
                     debug!("Resource {}: retry generating lock", loop_manager.name);
-                    *loop_manager.resource_state.lock().await = ResourceState::Generating;
+                    loop_manager.resource_state.send_replace(ResourceState::Generating);
                     debug!("Resource {}: retry generating", loop_manager.name);
                     result = loop_manager.resource.generate_unwind_safe().await;
                 }
@@ -510,7 +510,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 debug!("Resource {}: refreshed", loop_manager.name);
                 *loop_manager.refreshed_at.lock().await = SystemTime::now();
                 debug!("Resource {}: generated", loop_manager.name);
-                *loop_manager.resource_state.lock().await = ResourceState::Generated;
+                loop_manager.resource_state.send_replace(ResourceState::Generated);
                 debug!("Resource {}: final error; shutting down", loop_manager.name);
                 let _ = generated_send.send(());
                 resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
@@ -522,7 +522,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     pub async fn ensure_not_failed(&self) -> Result<(), PushError> {
-        if let ResourceState::Failed(error) = &*self.resource_state.lock().await {
+        if let ResourceState::Failed(error) = &*self.resource_state.borrow() {
             return Err(error.clone().into())
         }
         Ok(())
