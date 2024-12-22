@@ -89,7 +89,7 @@ pub enum PushError {
     KeyedArchiveError(String),
     #[error("Fetching validation data failed ({0})")]
     RelayError(u16),
-    #[error("Relay code not found!")]
+    #[error("Relay device offline!")]
     DeviceNotFound,
     #[error("Web Tunnel error {0}!")]
     WebTunnelError(u16),

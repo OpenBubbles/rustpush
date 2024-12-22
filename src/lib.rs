@@ -31,7 +31,7 @@ use openssl::conf;
 use util::encode_hex;
 pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray};
 pub use ids::user::{IDSUser, register, IDSUserIdentity, PrivateDeviceInfo, SupportAlert, SupportAction};
-pub use ids::identity_manager::{SendJob, MessageTarget};
+pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager};
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate};
 pub use error::PushError;
 #[cfg(feature = "macOS")]
