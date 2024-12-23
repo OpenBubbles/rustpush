@@ -1268,6 +1268,19 @@ pub struct UpdateExtensionMessage {
     pub ext: PartExtension,
 }
 
+#[derive(Clone)]
+pub enum DeleteTarget {
+    Chat(OperatedChat),
+    Messages(Vec<String>)
+}
+
+#[derive(Clone)]
+pub struct MoveToRecycleBinMessage {
+    pub target: DeleteTarget,
+    pub recoverable_delete_date: u64,
+}
+
+
 #[repr(C)]
 #[derive(Clone)]
 pub enum Message {
@@ -1289,6 +1302,9 @@ pub enum Message {
     PeerCacheInvalidate,
     UpdateExtension(UpdateExtensionMessage),
     Error(ErrorMessage),
+    MoveToRecycleBin(MoveToRecycleBinMessage),
+    RecoverChat(OperatedChat),
+    PermanentDeleteChat(OperatedChat),
 }
 
 pub const SUPPORTED_COMMANDS: &[u8] = &[
@@ -1328,6 +1344,9 @@ impl Message {
             Self::PeerCacheInvalidate => 130,
             Self::UpdateExtension(_) => 122,
             Self::Error(_) => 120,
+            Self::MoveToRecycleBin(_) => 181,
+            Self::PermanentDeleteChat(_) => 181,
+            Self::RecoverChat(_) => 182,
         }
     }
 
@@ -1422,6 +1441,15 @@ impl fmt::Display for Message {
             },
             Message::Error(_) => {
                 write!(f, "failed to receive our message")
+            },
+            Message::MoveToRecycleBin(_) => {
+                write!(f, "Moved a message to the recycle bin")
+            },
+            Message::RecoverChat(_) => {
+                write!(f, "Recovered from the recycle bin")
+            },
+            Message::PermanentDeleteChat(_) => {
+                write!(f, "Permanent delete chat")
             }
         }
     }
@@ -1923,6 +1951,32 @@ impl MessageInst {
                 warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
 
                 plist_to_bin(&raw).unwrap()
+            },
+            Message::MoveToRecycleBin(msg) => {
+                let raw = RawMoveToTrash {
+                    chat: if let DeleteTarget::Chat(chat) = &msg.target { vec![chat.clone()] } else { vec![] },
+                    message: if let DeleteTarget::Messages(messages) = &msg.target { messages.clone() } else { vec![] },
+                    permanent_delete_chat_metadata_array: vec![],
+                    recoverable_delete_date: Some((SystemTime::UNIX_EPOCH + Duration::from_millis(msg.recoverable_delete_date)).clone().into()),
+                    is_permanent_delete: false,
+                };
+                plist_to_bin(&raw).unwrap()
+            },
+            Message::PermanentDeleteChat(msg) => {
+                let raw = RawMoveToTrash {
+                    chat: vec![],
+                    message: vec![],
+                    permanent_delete_chat_metadata_array: vec![msg.clone()],
+                    recoverable_delete_date: None,
+                    is_permanent_delete: true
+                };
+                plist_to_bin(&raw).unwrap()
+            },
+            Message::RecoverChat(msg) => {
+                let raw = RecoverChatMetadataArray {
+                    recover_chat_metadata_array: vec![msg.clone()],
+                };
+                plist_to_bin(&raw).unwrap()
             }
         };
         debug!("sending: {:?}", plist::Value::from_reader(Cursor::new(&binary)));
@@ -1994,6 +2048,26 @@ impl MessageInst {
             if wrapper.command == 111 {
                 return wrapper.to_message(None, Message::MarkUnread);
             }
+        }
+        if let Ok(loaded) = plist::from_value::<RawMoveToTrash>(&value) {
+            return match loaded {
+                RawMoveToTrash { chat, message, recoverable_delete_date: Some(recoverable_delete_date), is_permanent_delete: false, .. } => {
+                    let system_time: SystemTime = recoverable_delete_date.into();
+                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage { 
+                        target: if message.len() > 0 { DeleteTarget::Messages(message) } else { DeleteTarget::Chat(chat.into_iter().next().unwrap()) }, 
+                        recoverable_delete_date: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
+                    }))
+                },
+                RawMoveToTrash { permanent_delete_chat_metadata_array, is_permanent_delete: true, .. } => {
+                    wrapper.to_message(None, Message::PermanentDeleteChat(permanent_delete_chat_metadata_array.into_iter().next().unwrap()))
+                },
+                _ => {
+                    return Err(PushError::BadMsg)
+                }
+            }
+        }
+        if let Ok(loaded) = plist::from_value::<RecoverChatMetadataArray>(&value) {
+            return wrapper.to_message(None, Message::RecoverChat(loaded.recover_chat_metadata_array.into_iter().next().unwrap()))
         }
         if let Ok(loaded) = plist::from_value::<RawUnsendMessage>(&value) {
             return wrapper.to_message(None, Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }));

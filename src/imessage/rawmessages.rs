@@ -1,3 +1,4 @@
+use plist::Date;
 use serde::{Serialize, Deserialize, ser::Serializer};
 use crate::mmcs::MMCSTransferData;
 use crate::util::{NSData, NSUUID, NSURL};
@@ -380,6 +381,37 @@ impl Serialize for RawBalloonData {
         
         serialized.serialize(serializer)
     }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatedChat {
+    #[serde(rename = "ptcpts")]
+    pub participants: Vec<String>,
+    #[serde(rename = "groupID")]
+    pub group_id: String,
+    pub guid: String,
+    pub delete_incoming_messages: Option<bool>,
+    pub was_reported_as_junk: Option<bool>
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawMoveToTrash {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    chat: Vec<OperatedChat>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    message: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    permanent_delete_chat_metadata_array: Vec<OperatedChat>,
+    recoverable_delete_date: Option<Date>,
+    is_permanent_delete: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoverChatMetadataArray {
+    recover_chat_metadata_array: Vec<OperatedChat>,
 }
 
 #[repr(C)]
