@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::IDSService}, imessage::messages::{ErrorMessage, SUPPORTED_COMMANDS}, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::IDSService}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -65,6 +65,7 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-findmy-plugin-messages", Value::Boolean(true)),
         ("supports-stick-moji-backs", Value::Boolean(true)),
         ("supports-emoji-tapbacks", Value::Boolean(true)),
+        ("supports-send-later-messages", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -308,20 +309,18 @@ impl IMClient {
         } else {
             ident_cache.get_participants_targets(topic, &handle, &targets)
         };
-
+        
         let my_handles = self.identity.get_handles().await;
-        let ids_message = IDSSendMessage {
-            sender: message.sender.as_ref().unwrap().to_string(),
-            raw: if message.has_payload() { Some(message.to_raw(&my_handles, &self.conn).await?) } else { None },
-            send_delivered: message.send_delivered,
-            command: message.message.get_c(),
-            ex: message.get_ex(),
-            no_response: message.message.get_nr() == Some(true),
-            id: message.id.clone(),
-            sent_timestamp: message.sent_timestamp,
-            response_for: None,
-        };
 
+        if message.is_queued() {
+            let mut targets = message_targets.clone();
+            targets.retain(|t| t.participant == handle);
+
+            let ids_message = message.get_ids(&my_handles, &self.conn, false).await?;
+            let _ = self.identity.send_message(topic, ids_message, targets).await;
+        }
+
+        let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
 
         self.identity.send_message(topic, ids_message, message_targets).await
     }

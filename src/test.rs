@@ -268,12 +268,14 @@ async fn main() {
                     if filter_target == "" {
                         println!("Usage: filter [target]");
                     } else {
+                        let mut msg = NormalMessage::new(input.trim().to_string(), MessageType::IMessage);
+                        msg.scheduled_ms = Some((SystemTime::now() + Duration::from_secs(60)).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64);
                         let mut msg = MessageInst::new(ConversationData {
                             participants: vec![filter_target.clone()],
                             cv_name: None,
                             sender_guid: Some(Uuid::new_v4().to_string()),
                             after_guid: None,
-                        }, &handle, Message::Message(NormalMessage::new(input.trim().to_string(), MessageType::IMessage)));
+                        }, &handle, Message::Message(msg));
 
                         // msg.scheduled_ms = Some((SystemTime::now() + Duration::from_secs(60)).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64);
 
@@ -281,12 +283,12 @@ async fn main() {
                             error!("Error sending message {err}");
                         }
 
-                        // tokio::time::sleep(Duration::from_secs(10)).await;
+                        tokio::time::sleep(Duration::from_secs(10)).await;
 
-                        // msg.message = Message::Unschedule;
-                        // if let Err(err) = client.send(&mut msg).await {
-                        //     error!("Error sending message {err}");
-                        // }
+                        msg.message = Message::Unschedule;
+                        if let Err(err) = client.send(&mut msg).await {
+                            error!("Error sending message {err}");
+                        }
                     }
                 }
                 print!(">> ");

@@ -91,6 +91,7 @@ impl CachedHandle {
     }
 }
 
+#[derive(Debug)]
 pub struct IDSSendMessage {
     pub sender: String,
     pub raw: Option<Vec<u8>>,
@@ -101,6 +102,8 @@ pub struct IDSSendMessage {
     pub id: String,
     pub sent_timestamp: u64,
     pub response_for: Option<Vec<u8>>,
+    pub scheduled_ms: Option<u64>,
+    pub queue_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -690,9 +693,17 @@ impl IdentityResource {
 
     pub async fn send_message(&self, topic: &'static str, ids_message: IDSSendMessage, mut message_targets: Vec<DeliveryHandle>) -> Result<SendJob, PushError> {
 
-        // do not send to self
-        let my_token = self.aps.get_token().await;
-        message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
+        if ids_message.scheduled_ms.is_some() && ids_message.queue_id.is_none() {
+            return Err(PushError::BadMsg);
+        }
+
+        info!("ID send message {:?}", ids_message);
+
+        if ids_message.queue_id.is_none() {
+            // do not send to self
+            let my_token = self.aps.get_token().await;
+            message_targets.retain(|target| &target.delivery_data.push_token != &my_token);
+        }
 
         if message_targets.is_empty() {
             return Ok(SendJob {
@@ -793,6 +804,12 @@ pub struct SendMessage {
     pub original_epoch_nanos: Option<u64>,
     #[serde(rename = "rI")]
     pub response_for: Option<Data>,
+    #[serde(rename = "sv")]
+    pub(super) send_version: Option<u8>,
+    #[serde(rename = "dmt")]
+    pub(super) deliver_message_time: Option<u64>,
+    #[serde(rename = "qI")]
+    pub(super) queue_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -866,7 +883,10 @@ impl InnerSendJob {
                 no_response: if message.no_response { Some(true) } else { None },
                 retry_count: if retry_count != 0 { Some(retry_count) } else { None },
                 original_epoch_nanos: if retry_count != 0 { Some(message.sent_timestamp * 1000000) } else { None },
-                response_for: message.response_for.clone().map(|i| i.into())
+                response_for: message.response_for.clone().map(|i| i.into()),
+                deliver_message_time: message.scheduled_ms,
+                send_version: if message.queue_id.is_some() { Some(1) } else { None },
+                queue_id: message.queue_id.clone(),
             };
     
             let binary = plist_to_bin(&complete)?;

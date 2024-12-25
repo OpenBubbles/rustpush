@@ -117,6 +117,8 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                         id: Uuid::new_v4().to_string().to_uppercase(),
                         sent_timestamp: since_the_epoch.as_millis() as u64,
                         response_for: Some(uuid),
+                        scheduled_ms: None,
+                        queue_id: None
                     }, targets).await?;
 
                     debug!("Importing find my token {p}!");

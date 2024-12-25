@@ -3,7 +3,7 @@
 use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
-use openssl::symm::{Cipher, Crypter};
+use openssl::{sha::sha256, symm::{Cipher, Crypter}};
 use plist::{Data, Value};
 use regex::Regex;
 use uuid::Uuid;
@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{ids::{identity_manager::MessageTarget, IDSRecvMessage}, util::{bin_deserialize, bin_serialize, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
+use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget}, IDSRecvMessage}, util::{base64_encode, bin_deserialize, bin_serialize, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -739,6 +739,7 @@ pub struct NormalMessage {
     pub app: Option<ExtensionApp>,
     pub link_meta: Option<LinkMeta>,
     pub voice: bool,
+    pub scheduled_ms: Option<u64>,
 }
 
 #[repr(C)]
@@ -764,6 +765,7 @@ impl NormalMessage {
             app: None,
             link_meta: None,
             voice: false,
+            scheduled_ms: None,
         }
     }
 }
@@ -1280,6 +1282,12 @@ pub struct MoveToRecycleBinMessage {
     pub recoverable_delete_date: u64,
 }
 
+#[derive(Clone)]
+pub struct PermanentDeleteMessage {
+    pub target: DeleteTarget,
+    pub is_scheduled: bool,
+}
+
 
 #[repr(C)]
 #[derive(Clone)]
@@ -1304,12 +1312,10 @@ pub enum Message {
     Error(ErrorMessage),
     MoveToRecycleBin(MoveToRecycleBinMessage),
     RecoverChat(OperatedChat),
-    PermanentDeleteChat(OperatedChat),
+    PermanentDelete(PermanentDeleteMessage),
+    Unschedule,
 }
 
-pub const SUPPORTED_COMMANDS: &[u8] = &[
-    100, 101, 102, 190, 118, 111, 130, 122, 145, 143, 146, 144, 140, 141, 149
-];
 
 impl Message {
     // also add new C values to client.rs raw_inbound
@@ -1345,8 +1351,9 @@ impl Message {
             Self::UpdateExtension(_) => 122,
             Self::Error(_) => 120,
             Self::MoveToRecycleBin(_) => 181,
-            Self::PermanentDeleteChat(_) => 181,
+            Self::PermanentDelete(_) => 181,
             Self::RecoverChat(_) => 182,
+            Self::Unschedule => 103,
         }
     }
 
@@ -1366,6 +1373,13 @@ impl Message {
         }
     }
 
+    pub fn scheduled_ms(&self) -> Option<u64> {
+        match &self {
+            Message::Message(NormalMessage { scheduled_ms, .. }) => *scheduled_ms,
+            _ => None,
+        }
+    }
+    
     pub fn get_nr(&self) -> Option<bool> {
         if self.is_sms() {
             return Some(true)
@@ -1448,8 +1462,11 @@ impl fmt::Display for Message {
             Message::RecoverChat(_) => {
                 write!(f, "Recovered from the recycle bin")
             },
-            Message::PermanentDeleteChat(_) => {
+            Message::PermanentDelete(_) => {
                 write!(f, "Permanent delete chat")
+            },
+            Message::Unschedule => {
+                write!(f, "Unscheduled a message")
             }
         }
     }
@@ -1552,6 +1569,7 @@ impl MessageInst {
             Message::Typing => false,
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
+            Message::Unschedule => false,
             _ => true
         }
     }
@@ -1614,7 +1632,53 @@ impl MessageInst {
         target_participants
     }
 
-    pub async fn to_raw(&self, my_handles: &[String], apns: &APSConnectionResource) -> Result<Vec<u8>, PushError> {
+    // if *schedule* is false, returns the local [user devices] representation of the message
+    #[async_recursion]
+    pub async fn get_ids(&self, my_handles: &[String], apns: &APSConnectionResource, schedule: bool) -> Result<IDSSendMessage, PushError> {
+        if !schedule {
+            if let Message::Unschedule = &self.message {
+                let message = MessageInst {
+                    sender: self.sender.clone(),
+                    id: Uuid::new_v4().to_string().to_uppercase(),
+                    sent_timestamp: 0,
+                    send_delivered: false,
+                    conversation: Some(ConversationData { participants: vec![], cv_name: None, sender_guid: None, after_guid: None, }),
+                    message: Message::PermanentDelete(PermanentDeleteMessage {
+                        is_scheduled: true,
+                        target: DeleteTarget::Messages(vec![self.id.clone()]),
+                    }),
+                    target: None,
+                    verification_failed: false,
+                };
+                return message.get_ids(my_handles, apns, schedule).await;
+            }
+        }
+
+        Ok(IDSSendMessage {
+            sender: self.sender.as_ref().unwrap().to_string(),
+            raw: if self.has_payload() { Some(self.to_raw(&my_handles, apns, schedule).await?) } else { None },
+            send_delivered: self.send_delivered,
+            command: self.message.get_c(),
+            ex: self.get_ex(),
+            no_response: self.message.get_nr() == Some(true),
+            id: self.id.clone(),
+            sent_timestamp: self.sent_timestamp,
+            response_for: None,
+            scheduled_ms: if schedule { self.message.scheduled_ms() } else { None },
+            queue_id: if schedule && self.is_queued() { Some(self.queue_id()) } else { None },
+        })
+    }
+
+    pub fn is_queued(&self) -> bool {
+        matches!(self.message, Message::Message(NormalMessage { scheduled_ms: Some(_), .. }) | Message::Unschedule)
+    }
+
+    pub fn queue_id(&self) -> String {
+        let data = self.id.to_uppercase();
+        base64_encode(&sha256(data.as_bytes()))
+    }
+
+    pub async fn to_raw(&self, my_handles: &[String], apns: &APSConnectionResource, scheduled: bool) -> Result<Vec<u8>, PushError> {
         let mut should_gzip = false;
         let conversation = self.conversation.as_ref().unwrap();
         let binary = match &self.message {
@@ -1687,6 +1751,8 @@ impl MessageInst {
                     app_info: None,
                     voice_audio: None,
                     voice_e: None,
+                    schedule_date: None,
+                    schedule_type: None,
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -1801,6 +1867,8 @@ impl MessageInst {
                             balloon_part_mmcs,
                             voice_audio: if normal.voice { Some(true) } else { None },
                             voice_e: if normal.voice { Some(true) } else { None },
+                            schedule_date: if !scheduled { normal.scheduled_ms.clone().map(|i| (SystemTime::UNIX_EPOCH + Duration::from_millis(i)).into()) } else { None },
+                            schedule_type: if normal.scheduled_ms.is_some() && !scheduled { Some(2) } else { None },
                         };
         
                         if normal.parts.is_multipart() {
@@ -1904,6 +1972,7 @@ impl MessageInst {
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),
+            Message::Unschedule => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {
                     rs: true,
@@ -1959,16 +2028,18 @@ impl MessageInst {
                     permanent_delete_chat_metadata_array: vec![],
                     recoverable_delete_date: Some((SystemTime::UNIX_EPOCH + Duration::from_millis(msg.recoverable_delete_date)).clone().into()),
                     is_permanent_delete: false,
+                    is_scheduled_message: None,
                 };
                 plist_to_bin(&raw).unwrap()
             },
-            Message::PermanentDeleteChat(msg) => {
+            Message::PermanentDelete(msg) => {
                 let raw = RawMoveToTrash {
                     chat: vec![],
-                    message: vec![],
-                    permanent_delete_chat_metadata_array: vec![msg.clone()],
+                    message: if let DeleteTarget::Messages(messages) = &msg.target { messages.clone() } else { vec![] },
+                    permanent_delete_chat_metadata_array: if let DeleteTarget::Chat(chat) = &msg.target { vec![chat.clone()] } else { vec![] },
                     recoverable_delete_date: None,
-                    is_permanent_delete: true
+                    is_permanent_delete: true,
+                    is_scheduled_message: if msg.is_scheduled { Some(true) } else { None }
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -2058,8 +2129,15 @@ impl MessageInst {
                         recoverable_delete_date: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
                     }))
                 },
-                RawMoveToTrash { permanent_delete_chat_metadata_array, is_permanent_delete: true, .. } => {
-                    wrapper.to_message(None, Message::PermanentDeleteChat(permanent_delete_chat_metadata_array.into_iter().next().unwrap()))
+                RawMoveToTrash { permanent_delete_chat_metadata_array, message, is_permanent_delete: true, is_scheduled_message, .. } => {
+                    wrapper.to_message(None, Message::PermanentDelete(PermanentDeleteMessage {
+                        target: if permanent_delete_chat_metadata_array.len() > 0 {
+                            DeleteTarget::Chat(permanent_delete_chat_metadata_array.into_iter().next().unwrap())
+                        } else {
+                            DeleteTarget::Messages(message)
+                        },
+                        is_scheduled: is_scheduled_message == Some(true),
+                    }))
                 },
                 _ => {
                     return Err(PushError::BadMsg)
@@ -2219,6 +2297,7 @@ impl MessageInst {
                     app: None,
                     link_meta: None,
                     voice: false,
+                    scheduled_ms: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2248,6 +2327,7 @@ impl MessageInst {
                 app: None,
                 link_meta: None,
                 voice: false,
+                scheduled_ms: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -2328,6 +2408,10 @@ impl MessageInst {
                 app,
                 link_meta,
                 voice: loaded.voice_audio == Some(true),
+                scheduled_ms: loaded.schedule_date.clone().map(|i| {
+                    let system_time: SystemTime = i.into();
+                    system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+                }),
             }))
         }
         Err(PushError::BadMsg)

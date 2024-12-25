@@ -330,6 +330,10 @@ struct RawIMessage {
     voice_audio: Option<bool>,
     #[serde(rename = "e")]
     voice_e: Option<bool>,
+    #[serde(rename = "sd")]
+    schedule_date: Option<Date>,
+    #[serde(rename = "st")]
+    schedule_type: Option<u32>,
 }
 
 
@@ -406,6 +410,7 @@ struct RawMoveToTrash {
     permanent_delete_chat_metadata_array: Vec<OperatedChat>,
     recoverable_delete_date: Option<Date>,
     is_permanent_delete: bool,
+    is_scheduled_message: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
