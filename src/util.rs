@@ -69,7 +69,7 @@ fn build_proxy() -> Client {
 
     reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://localhost:8080").unwrap())
+        .proxy(Proxy::https("https://192.168.86.25:8080").unwrap())
         .default_headers(headers)
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true)
@@ -78,7 +78,7 @@ fn build_proxy() -> Client {
 
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
-    // return build_proxy();
+    return build_proxy();
     let certificates = vec![
         Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
@@ -364,8 +364,15 @@ pub trait Resource: Send + Sync + Sized {
             std::panic::AssertUnwindSafe(self.generate())
                 .catch_unwind().await
                 .map_err(|e| {
-                    println!("paniced with {:?}", e.downcast_ref::<&str>());
-                    PushError::ResourcePanic(e.downcast_ref::<&str>().unwrap_or(&"failed to str!").to_string())
+                    let string = if let Some(str) = e.downcast_ref::<&str>() {
+                        str.to_string()
+                    } else if let Some(str) = e.downcast_ref::<String>() {
+                        str.clone()
+                    } else {
+                        "failed to str!".to_string()
+                    };
+                    println!("paniced with {:?}", string);
+                    PushError::ResourcePanic(string)
                 })
                 .and_then(|a| a)
         }
@@ -475,7 +482,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let mut result = loop_manager.resource.generate_unwind_safe().await;
                 debug!("Resource {}: finished_generate", loop_manager.name);
                 while let Err(e) = result {
-                    debug!("Resource {}: failed", loop_manager.name);
+                    debug!("Resource {} {e}", loop_manager.name);
                     let shared_err = Arc::new(e);
                     let retry_in = backoff.next().unwrap();
 
@@ -511,7 +518,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 *loop_manager.refreshed_at.lock().await = SystemTime::now();
                 debug!("Resource {}: generated", loop_manager.name);
                 loop_manager.resource_state.send_replace(ResourceState::Generated);
-                debug!("Resource {}: final error; shutting down", loop_manager.name);
+                debug!("Resource {}: done", loop_manager.name);
                 let _ = generated_send.send(());
                 resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
             }

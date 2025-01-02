@@ -258,7 +258,7 @@ impl Drop for APSInterestToken {
 }
 
 pub struct APSConnectionResource {
-    os_config: Arc<dyn OSConfig>,
+    pub os_config: Arc<dyn OSConfig>,
     pub state: RwLock<APSState>,
     socket: Mutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
     messages: RwLock<Option<broadcast::Sender<APSMessage>>>,

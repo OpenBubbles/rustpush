@@ -103,11 +103,7 @@ impl OSConfig for RelayConfig {
     }
 
     fn get_login_url(&self) -> &'static str {
-        if self.version.software_name == "iPhone OS" {
-            "https://setup.icloud.com/setup/iosbuddy/loginDelegates"
-        } else {
-            "https://setup.icloud.com/setup/prefpane/loginDelegates"
-        }
+        "https://setup.icloud.com/setup/prefpane/loginDelegates"
     }
 
     fn get_activation_device(&self) -> String {

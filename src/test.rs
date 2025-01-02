@@ -1,13 +1,13 @@
 
-use std::{io::Cursor, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
+use std::{fs::File, io::Cursor, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 
 use base64::engine::general_purpose;
 use icloud_auth::AppleAccount;
 use log::{debug, error, info};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, register, APSConnectionResource, APSState, Attachment, ConversationData, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, RelayConfig, MADRID_SERVICE};
-use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}};
+use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, FFMpegFilePackager}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
+use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
@@ -16,6 +16,7 @@ use base64::Engine;
 use std::str::FromStr;
 use std::io::Seek;
 use rustpush::OSConfig;
+use std::fmt::{Display, Write as FmtWrite};
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
@@ -170,6 +171,12 @@ async fn main() {
 
         let id_path = PathBuf::from_str("findmy.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&findmy).unwrap()).unwrap();
+
+        let sharedstreams = SharedStreamsState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
+
+        let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
+        std::fs::write(id_path, plist_to_string(&sharedstreams).unwrap()).unwrap();
+
         vec![user]
     };
     
@@ -201,6 +208,111 @@ async fn main() {
 
     let findmy_client = FindMyClient::new(connection.clone(), config.clone(), state, anisette_client.clone(), client.identity.clone()).await.unwrap();
 
+
+    let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
+    let state: SharedStreamsState = plist::from_file(&id_path).unwrap();
+
+    let shared_streams = SharedStreamClient::new(state, Box::new(move |update| {
+        plist::to_file_xml(&id_path, update).unwrap();
+    }), connection.clone(), anisette_client.clone(), config.clone()).await;
+    shared_streams.get_changes().await.unwrap();
+    let album = shared_streams.state.read().await.albums[0].albumguid.clone();
+    shared_streams.get_album_summary(&album).await.unwrap();
+
+
+
+    let manager = SyncController::new(shared_streams, PathBuf::from_str("syncstate.plist").unwrap(), FFMpegFilePackager::default(), Duration::from_secs(60 * 30)).await;
+
+
+    
+    // plist::to_file_xml("syncstate.plist", &syncstate).unwrap();
+
+
+
+    // pub fn encode_hex(bytes: &[u8]) -> String {
+    //     let mut s = String::with_capacity(bytes.len() * 2);
+    //     for &b in bytes {
+    //         write!(&mut s, "{:02x}", b).unwrap();
+    //     }
+    //     s
+    // }
+
+
+    // let batch_date_created = SystemTime::now();
+    // let batch_guid = Uuid::new_v4().to_string().to_uppercase();
+
+    // let mut file = File::open("IMG_0153.HEIC").unwrap();
+    // let mut file_container = FileContainer::new(None, Some(&mut file));
+    // let derivative_pre = prepare_put(&mut file_container, true, 0x01).await.unwrap();
+
+    // let mut file = File::open("thumbnail_B0E9F348-BE67-4AE6-B7B6-18220D6A7AE1.HEIC").unwrap();
+    // let mut file_container = FileContainer::new(None, Some(&mut file));
+    // let thumb_pre = prepare_put(&mut file_container, true, 0x01).await.unwrap();
+
+    // let asset = AssetDetails {
+    //     filename: format!("{}.HEIC", Uuid::new_v4().to_string().to_uppercase()),
+    //     assetguid: Uuid::new_v4().to_string().to_uppercase(),
+    //     createdbyme: "1".to_string(),
+    //     candelete: "1".to_string(),
+    //     collectionmetadata: CollectionMetadata {
+    //         batch_date_created: round_seconds(batch_date_created).into(),
+    //         batch_guid,
+    //         date_created: round_seconds(fs::metadata("149E5C12-E3BD-4A82-B8B8-5F2E44DA0260.HEIC").await.unwrap().created().unwrap()).into(),
+    //         playback_variation: 0,
+    //     },
+    //     files: vec![AssetFile {
+    //         size: derivative_pre.total_len.to_string(),
+    //         checksum: encode_hex(&derivative_pre.total_sig),
+    //         width: "1536".to_string(),
+    //         height: "2048".to_string(),
+    //         file_type: "public.jpeg".to_string(),
+    //         url: Default::default(),
+    //         token: Default::default(),
+    //         metadata: AssetMetadata {
+    //             asset_type: "derivative".to_string(),
+    //             asset_type_flags: 2,
+    //         }
+    //     },AssetFile {
+    //         size: thumb_pre.total_len.to_string(),
+    //         checksum: encode_hex(&thumb_pre.total_sig),
+    //         width: "257".to_string(),
+    //         height: "342".to_string(),
+    //         file_type: "public.jpeg".to_string(),
+    //         url: Default::default(),
+    //         token: Default::default(),
+    //         metadata: AssetMetadata {
+    //             asset_type: "thumbnail".to_string(),
+    //             asset_type_flags: 1,
+    //         }
+    //     }]
+    // };
+
+    // let mut der = File::open("IMG_0153.HEIC").unwrap();
+    // let mut thum = File::open("thumbnail_B0E9F348-BE67-4AE6-B7B6-18220D6A7AE1.HEIC").unwrap();
+    // shared_streams.create_asset(&shared_streams.albums[0].albumguid.clone(), vec![asset], vec![(derivative_pre, &mut der), (thumb_pre, &mut thum)], &mut |_a, _b| {}).await.unwrap();
+
+
+    // let batch_date_created = SystemTime::now();
+    // let batch_guid = Uuid::new_v4().to_string().to_uppercase();
+
+    // let mut der = File::open("JPG_Test.jpg").unwrap();
+    // let (asset, prepared) = AssetDetails::from_file(PathBuf::from_str("JPG_Test.jpg").unwrap(), batch_date_created, batch_guid).await.unwrap();
+    // shared_streams.create_asset(&shared_streams.albums[0].albumguid.clone(), vec![asset], vec![(prepared, &mut der)], &mut |_a, _b| {}).await;
+
+
+    // shared_streams.get_album_summary(&shared_streams.albums[0].albumguid.clone()).await.unwrap();
+    // let assets = shared_streams.get_assets(&shared_streams.albums[0].albumguid.clone(), &shared_streams.albums[0].assets.clone()).await.unwrap();
+    // let mut files: Vec<_> = assets.iter().flat_map(|a| {
+    //     a.files.iter().map(|file| (file, File::create(format!("mine{}_{}", file.metadata.asset_type, &a.filename)).unwrap()))
+    // }).collect();
+    // let mut copy: Vec<_> = files.iter_mut().map::<(&AssetFile, &mut (dyn Write + Send + Sync)), _>(|a| {
+    //     (a.0, &mut a.1)
+    // }).collect();
+    // shared_streams.get_file(&mut copy, &mut |_a, _b| {}).await.unwrap();
+
+
+    // println!("here {:?}", shared_streams.albums);
+
     // client.identity.refresh_now().await.unwrap();
 
 
@@ -220,6 +332,7 @@ async fn main() {
             msg = subscription.recv() => {
                 let msg = msg.unwrap();
                 let _ = findmy_client.handle(msg.clone()).await;
+                let _ = manager.handle(msg.clone()).await;
                 let msg = client.handle(msg).await;
                 if msg.is_err() {
                     error!("Failed to receive {}", msg.err().unwrap());

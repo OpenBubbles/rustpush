@@ -7,19 +7,20 @@ message AuthorizePut {
     message PutData {
         message Chunk {
             bytes sig = 1;
+            optional bytes encryption_key = 2;
             uint32 size = 3;
         }
         message Footer {
             uint32 chunk_count = 1;
             string profile_type = 101;
-            uint32 f103 = 103;
+            optional uint32 f103 = 103;
         }
         bytes sig = 1;
         string token = 2;
         repeated Chunk chunks = 3;
         Footer footer = 8;
     }
-    PutData data = 1;
+    repeated PutData data = 1;
     uint32 f3 = 3;
 }
 
@@ -63,6 +64,7 @@ message HTTPRequest {
 message Container {
     message ChunkMeta {
         bytes checksum = 1;
+        optional bytes encryption_key = 2;
         uint64 size = 3;
         uint64 offset = 4;
     }
@@ -73,6 +75,14 @@ message Container {
     string clAuthP1 = 3;
     string clAuthP2 = 4;
     repeated ChunkWrapper chunks = 5;
+}
+
+message AuthorizeGet {
+    message Item {
+        bytes signature = 1;
+        string object = 2;
+    }
+    repeated Item item = 1;
 }
 
 message AuthorizeGetResponse {
@@ -87,7 +97,7 @@ message AuthorizeGetResponse {
             uint32 f5 = 5;
         }
         repeated Container containers = 1;
-        ChunkReferences references = 2;
+        repeated ChunkReferences references = 2;
     }
     message Error {
         message F2 {
@@ -100,6 +110,14 @@ message AuthorizeGetResponse {
     uint32 f = 4;
 }
 
+message PutCompleteResponse {
+    message FinishedObject {
+        bytes signature = 1;
+        string receipt = 3;
+    }
+    repeated FinishedObject finished = 3;
+}
+
 message AuthorizePutResponse {
     message UploadTarget {
         message ChunkIdentifier {
@@ -110,13 +128,14 @@ message AuthorizePutResponse {
         string clAuthP2 = 4;
         repeated ChunkIdentifier chunks = 5;
     }
-    message F4 {
+    message State {
         bytes signature = 1;
+        optional string receipt = 3;
         uint32 f2 = 2;
     }
     repeated UploadTarget targets = 1;
     uint32 f3 = 3;
-    F4 f4 = 4;
+    repeated State currentStates = 4;
     optional bytes confirm_data = 6;
 }
 

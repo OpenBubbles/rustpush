@@ -55,8 +55,8 @@ pub enum PushError {
     MMCSUploadFailed(u16),
     #[error("MMCS GET failed {0:?}")]
     MMCSGetFailed(Option<String>),
-    #[error("Failed to authenticate. Try logging in to appleid.apple.com to fix your Apple ID or create a new one.")]
-    LoginUnauthorized,
+    #[error("Failed to authenticate. Try logging in to icloud.com to fix your Apple Account or create a new one: {1:?}")]
+    MobileMeError(String, Option<String>),
     #[error("Bad auth cert {0}")]
     AuthInvalid(u64),
     #[error("APS parse error {0}")]
@@ -99,4 +99,10 @@ pub enum PushError {
     AnisetteError(#[from] AnisetteError),
     #[error("JSON Error {0}!")]
     JsonError(#[from] serde_json::Error),
+    #[error("Stream failed! {0:?}")]
+    SSFailed(plist::Value),
+    #[error("File Package Error {0}")]
+    FilePackageError(String),
+    #[error("Watch error {0}")]
+    WatchError(#[from] notify::Error),
 }

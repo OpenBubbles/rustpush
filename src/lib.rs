@@ -7,6 +7,7 @@ mod mmcs;
 mod error;
 mod auth;
 mod ids;
+pub mod sharedstreams;
 pub mod findmy;
 
 #[cfg(feature = "macOS")]
@@ -24,12 +25,13 @@ use std::fmt::Debug;
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
+pub use mmcs::{FileContainer, prepare_put};
 use icloud_auth::LoginClientInfo;
 pub use imessage::messages::{MessageInst, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use openssl::conf;
 use util::encode_hex;
-pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray};
+pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure};
 pub use ids::user::{IDSUser, register, IDSUserIdentity, PrivateDeviceInfo, SupportAlert, SupportAction};
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager};
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate};

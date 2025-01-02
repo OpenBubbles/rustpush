@@ -51,6 +51,8 @@ pub struct IDSDelegateResponse {
 #[derive(Deserialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
+    #[serde(default)]
+    pub config: Dictionary,
 }
 
 pub struct DelegateResponses {
@@ -69,6 +71,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     let validation_data = os_config.generate_validation_data().await?;
 
     let base_headers = anisette.get_headers().await?;
+    let anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
     let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")
@@ -76,7 +79,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
             .header("X-Mme-Client-Info", os_config.get_mme_clientinfo(&os_config.get_aoskit_version()))
             .header("X-Mme-Nas-Qualify", base64_encode(&validation_data))
             .header("X-Apple-ADSID", adsid)
-            .headers(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect())
+            .headers(anisette_headers.clone())
             .basic_auth(username, Some(pet))
             .body(plist_to_string(&request)?)
             .send()
@@ -88,9 +91,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
 
     if let Some(error) = parsed_dict.get("ErrorID") {
         let error = error.as_string().unwrap();
-        if error == "UNAUTHORIZED" {
-            return Err(PushError::LoginUnauthorized)
-        }
+        return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
     }
 
     if parsed_dict.get("status").unwrap().as_unsigned_integer().unwrap() != 0 {
