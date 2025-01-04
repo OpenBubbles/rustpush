@@ -608,6 +608,41 @@ pub enum SyncStatus {
     Syncing, // deleting remote/local
 }
 
+struct ForegroundLock {
+    foreground_update_locked: Arc<std::sync::Mutex<()>>,
+    foreground_locked: tokio::sync::watch::Sender<u32>,
+}
+
+impl ForegroundLock {
+    fn new(lock: Arc<std::sync::Mutex<()>>, channel: tokio::sync::watch::Sender<u32>) -> Self {
+        info!("Locked");
+        let locked = lock.lock().expect("Can't lock mutex??");
+        info!("Droppeda");
+        let new_count = *channel.borrow() + 1;
+        channel.send_replace(new_count);
+        info!("Droppedb");
+        drop(locked);
+        info!("Dropped");
+        Self {
+            foreground_update_locked: lock,
+            foreground_locked: channel,
+        }
+    }
+}
+
+impl Drop for ForegroundLock {
+    fn drop(&mut self) {
+        info!("Locked");
+        let locked = self.foreground_update_locked.lock().expect("Dropping can't lock mutex?");
+        info!("Droppeda");
+        let new_count = *self.foreground_locked.borrow() - 1;
+        self.foreground_locked.send_replace(new_count);
+        info!("Droppedb");
+        drop(locked);
+        info!("Dropped");
+    }
+}
+
 pub struct SyncController<P: AnisetteProvider + Send + Sync + 'static, F: FilePackager + Send + Sync + 'static> {
     pub client: SharedStreamClient<P>,
     pub sync_states: Mutex<HashMap<String, SyncState>>,
@@ -619,6 +654,8 @@ pub struct SyncController<P: AnisetteProvider + Send + Sync + 'static, F: FilePa
     watcher: Mutex<RecommendedWatcher>,
     receiver: Mutex<tokio::sync::mpsc::Receiver<notify::Result<Event>>>,
     state_location: PathBuf,
+    foreground_update_locked: Arc<std::sync::Mutex<()>>,
+    foreground_locked: tokio::sync::watch::Sender<u32>,
 }
 
 pub type SyncManager<P, F> = Arc<ResourceManager<SyncController<P, F>>>;
@@ -648,6 +685,8 @@ impl<P, F> SyncController<P, F>
             watcher: Mutex::new(watcher),
             receiver: Mutex::new(rx),
             state_location,
+            foreground_update_locked: Arc::new(std::sync::Mutex::new(())),
+            foreground_locked: tokio::sync::watch::channel(0).0,
         });
         let resource = ResourceManager::new(
             "Shared Streams Sync",
@@ -664,23 +703,46 @@ impl<P, F> SyncController<P, F>
         resource
     }
 
+    fn foreground_lock(&self) -> ForegroundLock {
+        ForegroundLock::new(self.foreground_update_locked.clone(), self.foreground_locked.clone())
+    }
+
+    pub async fn unsubscribe(&self, album: &str) -> Result<(), PushError> {
+        self.client.unsubscribe(album).await?;
+        let _lock = self.foreground_lock();
+        let mut state = self.sync_states.lock().await;
+        state.remove(album);
+        plist::to_file_xml(&self.state_location, &*state).expect("Couldn't save state?");
+        Ok(())
+    }
+
     pub async fn add_album(&self, guid: String, folder: PathBuf) {
         let new_state = SyncState::new(guid.clone(), folder.clone());
+        info!("adsfa");
+        let _lock = self.foreground_lock();
+        info!("adsfa b");
         let mut state = self.sync_states.lock().await;
         state.insert(guid.clone(), new_state);
         plist::to_file_xml(&self.state_location, &*state).expect("Couldn't save state?");
+        info!("adsfa c");
         self.dirty_map.lock().await.insert(guid, true);
         drop(state);
         debug!("aew");
         let mut lock_item = self.watcher.lock().await;
         debug!("af");
+        // disable on android because it tends to stall indefinitiley
+        #[cfg(not(target_os = "android"))]
         if let Err(e) = lock_item.watch(&folder, RecursiveMode::NonRecursive) {
             warn!("Failed to watch folder! {e}");
         }
+        debug!("afd");
         self.manager().await.request_update().await;
     }
     
     pub async fn remove_album(&self, guid: String) {
+        debug!("fore");
+        let _lock = self.foreground_lock();
+        debug!("sync");
         let mut s0 = self.sync_states.lock().await;
         debug!("aa");
         let Some(state) = s0.remove(&guid) else { return };
@@ -748,13 +810,8 @@ impl<P, F> SyncController<P, F>
         }
         Ok(inner)
     }
-}
 
-impl<P, F> Resource for SyncController<P, F>
-    where P: AnisetteProvider + Send + Sync + 'static,
-        F: FilePackager + Send + Sync + 'static {
-    async fn generate(self: &std::sync::Arc<Self>) -> Result<tokio::task::JoinHandle<()>, PushError> {
-        info!("Syncing now!");
+    async fn do_sync(&self) -> Result<(), PushError> {
         let mut sync_states = self.sync_states.lock().await;
         let mut packager_lock = self.packager.lock().await;
         // while anyone is dirty.
@@ -785,6 +842,27 @@ impl<P, F> Resource for SyncController<P, F>
             if !changed { break }
             plist::to_file_xml(&self.state_location, &*sync_states).expect("Couldn't save state?");
         }
+        Ok(())
+    }
+}
+
+impl<P, F> Resource for SyncController<P, F>
+    where P: AnisetteProvider + Send + Sync + 'static,
+        F: FilePackager + Send + Sync + 'static {
+    async fn generate(self: &std::sync::Arc<Self>) -> Result<tokio::task::JoinHandle<()>, PushError> {
+        info!("Syncing now!");
+        
+        let mut locked_receiver = self.foreground_locked.subscribe();
+        loop {
+            locked_receiver.wait_for(|locked| *locked == 0).await.map_err(|_| PushError::NotConnected)?;
+            select! {
+                finished = self.do_sync() => {
+                    finished?;
+                    break
+                },
+                _locked = locked_receiver.wait_for(|locked| *locked > 0) => { }
+            }
+        }
         
         let respawn_ref = self.clone();
         let sync_interval = self.sync_interval;
@@ -807,7 +885,7 @@ impl<P, F> Resource for SyncController<P, F>
 #[derive(Serialize, Deserialize)]
 pub struct SyncState {
     album_guid: String,
-    folder: PathBuf,
+    pub folder: PathBuf,
     asset_map: HashMap<String, String>,
 }
 
