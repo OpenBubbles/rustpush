@@ -163,7 +163,7 @@ async fn main() {
         let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
-        let delegates = login_apple_delegates(&user_trimmed, &pet, spd["adsid"].as_string().unwrap(), &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
+        let delegates = login_apple_delegates(&user_trimmed, &pet, spd["adsid"].as_string().unwrap(), None, &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
         let mobileme = delegates.mobileme.unwrap();

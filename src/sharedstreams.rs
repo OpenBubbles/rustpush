@@ -374,7 +374,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         let response: Response = self.get_album(album, "albumsummary", Request { albumguid: album.to_string() }).await?;
 
         let mut state = self.state.write().await;
-        let location = state.albums.iter_mut().find(|a| a.albumguid == album).unwrap();
+        let location = state.albums.iter_mut().find(|a| a.albumguid == album).ok_or(PushError::AlbumNotFound)?;
         location.name = Some(response.attributes.name);
         location.assets = response.assets.into_iter().map(|asset| asset.assetguid).collect();
         Ok(location.assets.clone())
@@ -776,6 +776,7 @@ impl<P, F> Resource for SyncController<P, F>
 
                 progress(SyncStatus::Syncing);
                 if let Err(e) = state.do_sync(&self.client, &mut *packager_lock, progress).await {
+                    if matches!(e, PushError::AlbumNotFound) { continue };
                     self.dirty_map.lock().await.insert(asset.clone(), true);
                     plist::to_file_xml(&self.state_location, &*sync_states).expect("Couldn't save state?");
                     return Err(e)

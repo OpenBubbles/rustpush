@@ -105,4 +105,6 @@ pub enum PushError {
     FilePackageError(String),
     #[error("Watch error {0}")]
     WatchError(#[from] notify::Error),
+    #[error("Album not found")]
+    AlbumNotFound,
 }

@@ -92,6 +92,7 @@ pub trait OSConfig: Sync + Send {
             browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
             hardware_headers: self.get_gsa_hardware_headers(),
             push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
+            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)"),
         }
     }
 }

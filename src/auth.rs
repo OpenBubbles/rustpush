@@ -4,7 +4,7 @@ use log::debug;
 use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
 use plist::{Data, Dictionary, Value};
-use reqwest::{header::{HeaderMap, HeaderName}, Client, Method, Request, RequestBuilder, Response, Url};
+use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client, Method, Request, RequestBuilder, Response, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
@@ -51,7 +51,7 @@ pub struct IDSDelegateResponse {
 #[derive(Deserialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(rename = "com.apple.mobileme")]
     pub config: Dictionary,
 }
 
@@ -60,7 +60,7 @@ pub struct DelegateResponses {
     pub mobileme: Option<MobileMeDelegateResponse>,
 }
 
-pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &str, adsid: &str, anisette: &mut AnisetteClient<T>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
+pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &str, adsid: &str, cookie: Option<&str>, anisette: &mut AnisetteClient<T>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
     let request = AuthRequest {
         apple_id: username.to_string(),
         client_id: Uuid::new_v4().to_string(),
@@ -71,7 +71,11 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     let validation_data = os_config.generate_validation_data().await?;
 
     let base_headers = anisette.get_headers().await?;
-    let anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+    let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+
+    if let Some(cookie) = cookie {
+        anisette_headers.insert("Cookie", HeaderValue::from_str(cookie).unwrap());
+    }
 
     let resp = REQWEST.post(os_config.get_login_url())
             .header("Accept-Encoding", "gzip")

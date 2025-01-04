@@ -945,14 +945,14 @@ impl InnerSendJob {
                     for target in remain_targets {
                         let _ = self.status.send((target, SendResult::TimedOut));
                     }
-                    info!("Retry failed");
+                    info!("Retry failed {}", encode_hex(&uuid));
                     return Ok(())
                 }
 
                 self.send_targets(remain_targets, retry_count + 1).await?;
             }
         }
-        info!("Sending done!");
+        info!("Sending done! {}", encode_hex(&uuid));
         Ok(())
     }
 }
