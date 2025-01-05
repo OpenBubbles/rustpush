@@ -129,6 +129,7 @@ pub struct CollectionMetadata {
     #[serde(rename = "playback-variation")]
     pub playback_variation: u32,
     pub video_duration: Option<f64>,
+    pub video_compl_still_display_time: Option<f64>,
 }
 
 pub fn round_seconds(date: SystemTime) -> SystemTime {
@@ -163,6 +164,7 @@ impl AssetDetails {
                 date_created: round_seconds(prepared.date_created).into(),
                 playback_variation: 0,
                 video_duration: prepared.video_duration,
+                video_compl_still_display_time: None,
             },
             files: prepared.files.iter().map(|file| file.asset.clone()).collect(),
             media_asset_type: if prepared.video_duration.is_some() { Some("video".to_string()) } else { None },
@@ -520,8 +522,8 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
         let parsed: Vec<ResponseAsset> = plist::from_value(&response)?;
         if parsed.iter().any(|val| &val.success != "1") {
-            info!("delete failed {response:?}");
-            return Err(PushError::SSFailed(response))
+            info!("delete failed for some asset {response:?}");
+            // return Err(PushError::SSFailed(response))
         }
         
         Ok(())
@@ -981,14 +983,19 @@ impl SyncState {
         // 3.1 Build query
         let mut files = vec![];
         for asset in &deltas.new_remote {
-            // download largest file... usually is the right one :P
-            let Some(main) = asset.files.iter().max_by_key(|a| a.size.parse::<u64>().unwrap()) else { continue };
+            let is_live = asset.collectionmetadata.video_compl_still_display_time.is_some();
+            // download largest file... usually is the right one :P, unless we're live and it's a quicktime movie :)
+            let Some(main) = asset.files.iter().filter(|a| !is_live || a.file_type != "com.apple.quicktime-movie").max_by_key(|a| a.size.parse::<u64>().unwrap()) else { continue };
             match File::create(self.folder.join(&asset.filename)) {
                 Ok(file) => {
                     files.push((main, file));
                 },
                 Err(e) => {
-                    warn!("Failed to sync file, marking as synced");
+                    if !fs::exists(self.folder.join(&asset.filename))? {
+                        warn!("Failed to create asset");
+                        return Err(e.into());
+                    }
+                    warn!("Failed to sync file, marking as synced {e}");
                     self.asset_map.insert(asset.assetguid.clone(), asset.filename.clone());
                 }
             }
