@@ -254,6 +254,7 @@ impl IMClient {
 
                 if new_device_token.identites.len() != self.identity.get_handles().await.len() {
                     info!("New handles; reregistering!");
+                    drop(cache_lock);
                     self.identity.refresh().await?;
                 }
 
@@ -309,6 +310,7 @@ impl IMClient {
         } else {
             ident_cache.get_participants_targets(topic, &handle, &targets)
         };
+        drop(ident_cache);
         
         let my_handles = self.identity.get_handles().await;
 

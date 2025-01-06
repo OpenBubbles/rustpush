@@ -307,8 +307,13 @@ impl Resource for IdentityResource {
             })
         }
         debug!("Register success!");
+        // drop, not downgrade, to process any readers holding cache lock right now
+        drop(users_lock);
 
-        self.cache.lock().await.verity(&self.aps, &users_lock, self.services).await;
+        
+        let mut cache_lock = self.cache.lock().await;
+        cache_lock.verity(&self.aps, &self.users.read().await, self.services).await;
+        drop(cache_lock);
 
         info!("Successfully reregistered!");
 
