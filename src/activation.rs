@@ -38,6 +38,7 @@ macro_rules! include_cert {
     };
 }
 
+#[cfg(not(feature = "dummy-fairplay"))]
 const FAIRPLAY_KEYS: &[(&'static [u8], &'static [u8])] = &[
     include_cert!("4056631661436364584235346952193"),
     include_cert!("4056631661436364584235346952194"),
@@ -50,6 +51,12 @@ const FAIRPLAY_KEYS: &[(&'static [u8], &'static [u8])] = &[
     include_cert!("4056631661436364584235346952201"),
     include_cert!("4056631661436364584235346952208"),
 ];
+
+#[cfg(feature = "dummy-fairplay")]
+const FAIRPLAY_KEYS: &[(&'static [u8], &'static [u8])] = &[(
+    include_bytes!("../certs/dummy_fairplay.crt"),
+    include_bytes!("../certs/dummy_fairplay.pem"),
+)];
 
 fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
     let (cert, key) = FAIRPLAY_KEYS.choose(&mut thread_rng()).expect("no keys!");

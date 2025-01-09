@@ -44,6 +44,7 @@ serde_json = "1.0.128"
 [features]
 default = ["macOS"]
 macOS = ["dep:open-absinthe"]
+dummy-fairplay = []
 
 
 [build-dependencies]
