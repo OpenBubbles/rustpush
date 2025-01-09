@@ -32,14 +32,12 @@ flume = "0.11.0"
 open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, features = ["serde"] }
 omnisette = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
 icloud_auth = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
-apple-dev-apis = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
-apple-codesign-wrapper = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
 backon = "0.4.4"
 futures = "0.3.30"
-serde_json = "1.0.128"
+serde_json = "1.0.133"
 
 [features]
 default = ["macOS"]
@@ -61,5 +59,3 @@ path = "src/lib.rs"
 [patch."https://github.com/OpenBubbles/apple-private-apis"]
 omnisette = { path = "../apple-private-apis/omnisette"}
 icloud_auth = { path = "../apple-private-apis/icloud-auth"}
-apple-dev-apis = { path = "../apple-private-apis/apple-dev-apis"}
-apple-codesign-wrapper = { path = "../apple-private-apis/apple-codesign-wrapper"}
