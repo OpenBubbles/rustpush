@@ -30,8 +30,8 @@ pretty_env_logger = "0.5.0"
 async-trait = "0.1.73"
 flume = "0.11.0"
 open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, features = ["serde"] }
-icloud_auth = { path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth" }
-omnisette = { path = "/home/tae/Documents/GitHub/apple-private-apis/omnisette" }
+omnisette = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
+icloud_auth = { git = "https://github.com/OpenBubbles/apple-private-apis", branch = "master" }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
@@ -42,6 +42,7 @@ serde_json = "1.0.133"
 [features]
 default = ["macOS"]
 macOS = ["dep:open-absinthe"]
+dummy-fairplay = []
 
 
 [build-dependencies]
@@ -54,3 +55,7 @@ path = "src/test.rs"
 [lib]
 name = "rustpush"
 path = "src/lib.rs"
+
+[patch."https://github.com/OpenBubbles/apple-private-apis"]
+omnisette = { path = "../apple-private-apis/omnisette"}
+icloud_auth = { path = "../apple-private-apis/icloud-auth"}
