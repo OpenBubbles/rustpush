@@ -107,4 +107,8 @@ pub enum PushError {
     WatchError(#[from] notify::Error),
     #[error("Album not found")]
     AlbumNotFound,
+    #[error("Bad compact EC key!")]
+    BadCompactECKey,
+    #[error("Protobuf error {0}")]
+    ProtobufError(#[from] prost::DecodeError),
 }

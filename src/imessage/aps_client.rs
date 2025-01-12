@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::IDSService}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -104,7 +104,7 @@ pub struct IMClient {
 }
 
 impl IMClient {
-    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSUserIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
+    pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSNGMIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
         let interest = conn.request_topics(vec!["com.apple.private.alloy.sms", "com.apple.madrid"]).await.0;
         let _ = Self::setup_conn(&conn).await;
 

@@ -31,6 +31,7 @@ use rand::thread_rng;
 use rand::seq::SliceRandom;
 use futures::FutureExt;
 
+use crate::ids::CompactECKey;
 use crate::PushError;
 
 pub const APNS_BAG: &str = "http://init-p01st.push.apple.com/bag";
@@ -124,6 +125,15 @@ where
     EcKey::private_key_from_der(s.as_ref()).map_err(Error::custom)
 }
 
+pub fn ec_deserialize_priv_compact<'de, D>(d: D) -> Result<CompactECKey<Private>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    EcKey::private_key_from_der(s.as_ref()).map_err(Error::custom).and_then(|a| a.try_into().map_err(Error::custom))
+}
+
 pub fn rsa_serialize_priv<S>(x: &Rsa<Private>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -189,6 +199,13 @@ where
 {
     let s: Option<Data> = Deserialize::deserialize(d)?;
     Ok(s.map(|i| i.into()))
+}
+
+pub fn bin_serialize_opt_vec<S>(x: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    x.clone().map(|i| Data::new(i)).serialize(s)
 }
 
 // both in der

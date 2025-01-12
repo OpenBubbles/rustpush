@@ -6,7 +6,7 @@ use icloud_auth::AppleAccount;
 use log::{debug, error, info};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, FFMpegFilePackager}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
+use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use std::fmt::{Display, Write as FmtWrite};
 struct SavedState {
     push: APSState,
     users: Vec<IDSUser>,
-    identity: IDSUserIdentity,
+    identity: IDSNGMIdentity,
 }
 
 pub fn plist_to_buf<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, plist::Error> {
@@ -182,7 +182,7 @@ async fn main() {
     
     let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE];
 
-    let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSUserIdentity::new().unwrap());
+    let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSNGMIdentity::new().unwrap());
 
     if users[0].registration.is_empty() {
         info!("Registering new identity...");
@@ -200,7 +200,8 @@ async fn main() {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
-    let handle = client.identity.get_handles().await[0].clone();
+    let handle = client.identity.get_handles().await[1].clone();
+    println!("handle {}", handle);
 
 
     let id_path = PathBuf::from_str("findmy.plist").unwrap();
@@ -216,8 +217,8 @@ async fn main() {
         plist::to_file_xml(&id_path, update).unwrap();
     }), connection.clone(), anisette_client.clone(), config.clone()).await;
     shared_streams.get_changes().await.unwrap();
-    let album = shared_streams.state.read().await.albums[0].albumguid.clone();
-    shared_streams.get_album_summary(&album).await.unwrap();
+    // let album = shared_streams.state.read().await.albums[0].albumguid.clone();
+    // shared_streams.get_album_summary(&album).await.unwrap();
 
 
 
@@ -382,7 +383,7 @@ async fn main() {
                         println!("Usage: filter [target]");
                     } else {
                         let mut msg = NormalMessage::new(input.trim().to_string(), MessageType::IMessage);
-                        msg.scheduled_ms = Some((SystemTime::now() + Duration::from_secs(60)).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64);
+                        // msg.scheduled_ms = Some((SystemTime::now() + Duration::from_secs(60)).duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64);
                         let mut msg = MessageInst::new(ConversationData {
                             participants: vec![filter_target.clone()],
                             cv_name: None,
@@ -396,12 +397,12 @@ async fn main() {
                             error!("Error sending message {err}");
                         }
 
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        // tokio::time::sleep(Duration::from_secs(10)).await;
 
-                        msg.message = Message::Unschedule;
-                        if let Err(err) = client.send(&mut msg).await {
-                            error!("Error sending message {err}");
-                        }
+                        // msg.message = Message::Unschedule;
+                        // if let Err(err) = client.send(&mut msg).await {
+                        //     error!("Error sending message {err}");
+                        // }
                     }
                 }
                 print!(">> ");

@@ -1,14 +1,26 @@
-use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use log::{debug, error, info};
-use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey}, error::ErrorStack, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, rsa::{self, Rsa}, sha::sha256, x509::X509};
+use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
+use hkdf::Hkdf;
+use log::{debug, error, info, warn};
+use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey}, encrypt::{Decrypter, Encrypter}, error::ErrorStack, hash::MessageDigest, md::Md, nid::Nid, pkey::{HasPublic, Id, PKey, Private, Public}, pkey_ctx::PkeyCtx, rsa::{self, Padding, Rsa}, sha::sha256, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}, x509::X509};
 use plist::{Data, Dictionary, Value};
+use prost::Message;
 use rasn::{AsnType, Decode, Encode};
 use reqwest::Method;
 use async_recursion::async_recursion;
 use serde::{de, ser::Error, Deserialize, Deserializer, Serialize, Serializer};
+use aes::cipher::KeyIvInit;
+use sha2::Sha256;
+use aes::cipher::StreamCipher;
+use super::identity_manager::KeyCache;
 
-use crate::{auth::{KeyType, SignedRequest}, util::{base64_encode, bin_deserialize, bin_serialize, ec_deserialize_priv, ec_serialize_priv, gzip, gzip_normal, plist_to_bin, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+use rand::{Rng, RngCore};
+use tokio::sync::Mutex;
+
+use crate::{auth::{KeyType, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+
+use super::CompactECKey;
 
 
 #[repr(C)]
@@ -212,6 +224,24 @@ pub struct IDSUserIdentity {
     encryption_key: Rsa<Private>
 }
 
+#[derive(DekuRead, DekuWrite)]
+#[deku(endian = "big")]
+struct EncryptedPayload {
+    header: u8, // 0x2
+    #[deku(update = "self.body.len()")]
+    body_len: u16,
+    #[deku(count = "body_len")]
+    body: Vec<u8>,
+    #[deku(update = "self.sig.len()")]
+    sig_len: u8,
+    #[deku(count = "sig_len")]
+    sig: Vec<u8>,
+}
+
+const IDS_IV: [u8; 16] = [
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1
+];
+
 impl IDSUserIdentity {
     pub fn new() -> Result<IDSUserIdentity, PushError> {
         let enc = Rsa::generate(1280)?;
@@ -221,6 +251,89 @@ impl IDSUserIdentity {
             signing_key: sig,
             encryption_key: enc,
         })
+    }
+
+    pub fn decrypt_payload(&self, from: Option<&IDSPublicIdentity>, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
+        let (_, payload) = EncryptedPayload::from_bytes((raw_payload, 0))?;
+
+        if let Some(from) = from {
+            let from_signing = from.pkey_signing()?;
+            let mut verifier = Verifier::new(MessageDigest::sha1(), &from_signing.as_ref())?;
+
+            if !verifier.verify_oneshot(&payload.sig, &payload.body)? {
+                warn!("Failed to verify payload!");
+                return Err(PushError::VerificationFailed)
+            }
+        }
+
+        let handle_enc = self.pkey_enc()?;
+        let mut decrypter = Decrypter::new(&handle_enc)?;
+        decrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
+        decrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
+        decrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
+        let rsa_len = self.enc().size() as usize;
+        let len = decrypter.decrypt_len(&payload.body[..rsa_len]).unwrap();
+        let mut rsa_body = vec![0; len];
+        let decrypted_len = decrypter.decrypt(&payload.body[..rsa_len], &mut rsa_body[..])?;
+        rsa_body.truncate(decrypted_len);
+
+        let aes_body = [
+            rsa_body[16..116.min(rsa_body.len())].to_vec(),
+            payload.body[rsa_len..].to_vec(),
+        ].concat();
+
+        let result = decrypt(Cipher::aes_128_ctr(), &rsa_body[..16], Some(&IDS_IV), &aes_body)?;
+
+        Ok(result)
+    }
+
+    fn encrypt_payload(&self, to: &IDSPublicIdentity, body: &[u8]) -> Result<Vec<u8>, PushError> {
+        let key_bytes = rand::thread_rng().gen::<[u8; 11]>();
+        let hmac = PKey::hmac(&key_bytes)?;
+        let signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&[
+            body.to_vec(),
+            vec![0x2],
+            self.hash()?.to_vec(),
+            to.hash()?.to_vec(),
+        ].concat())?;
+
+        let aes_key = [
+            key_bytes.to_vec(),
+            signature[..5].to_vec(),
+        ].concat();
+
+        let aes_body = encrypt(Cipher::aes_128_ctr(), &aes_key, Some(&IDS_IV), body)?;
+
+        let target_key = to.pkey_enc()?;
+        let mut encrypter = Encrypter::new(&target_key.as_ref())?;
+        encrypter.set_rsa_padding(Padding::PKCS1_OAEP)?;
+        encrypter.set_rsa_oaep_md(MessageDigest::sha1())?;
+        encrypter.set_rsa_mgf1_md(MessageDigest::sha1())?;
+
+        let rsa_body = [
+            aes_key,
+            aes_body[..100.min(aes_body.len())].to_vec(),
+        ].concat();
+        let len = encrypter.encrypt_len(&rsa_body)?;
+        let mut rsa_cipher = vec![0; len];
+        let encrypted_len = encrypter.encrypt(&rsa_body, &mut rsa_cipher)?;
+        rsa_cipher.truncate(encrypted_len);
+
+        rsa_cipher.extend_from_slice(&aes_body[100.min(aes_body.len())..]);
+
+        let mut my_signer = Signer::new(MessageDigest::sha1(), &self.pkey_signing()?.as_ref())?;
+        let my_sig = my_signer.sign_oneshot_to_vec(&rsa_cipher)?;
+
+        let mut payload = EncryptedPayload {
+            header: 0x2,
+            body_len: 0,
+            body: rsa_cipher,
+            sig_len: 0,
+            sig: my_sig,
+        };
+        payload.update()?;
+
+        Ok(payload.to_bytes()?)
     }
 }
 
@@ -233,6 +346,237 @@ impl IDSIdentity<Private> for IDSUserIdentity {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct IDSNGMPrekeyIdentity {
+    key: CompactECKey<Public>,
+    signature: [u8; 64],
+    timestamp: f64,
+}
+
+impl IDSNGMPrekeyIdentity {
+    fn verify(&self, device: &CompactECKey<Public>) -> Result<(), PushError> {
+        let data = [
+            "NGMPrekeySignature".as_bytes().to_vec(),
+            self.key.compress().to_vec(),
+            self.timestamp.to_le_bytes().to_vec(),
+        ].concat();
+
+        device.verify(MessageDigest::sha256(), &data, self.signature)
+    }
+}
+
+impl<'de> Deserialize<'de> for IDSNGMPrekeyIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de> {
+        let s: Data = Deserialize::deserialize(deserializer)?;
+        let vec: Vec<u8> = s.into();
+        let decoded = idsp::PreKeyData::decode(&mut Cursor::new(&vec)).map_err(de::Error::custom)?;
+
+        Ok(IDSNGMPrekeyIdentity {
+            key: CompactECKey::decompress(decoded.key.try_into().expect("Bad key length!")),
+            signature: decoded.signature.try_into().expect("Bad signature length!"),
+            timestamp: decoded.timestamp,
+        })
+    }
+}
+
+impl Serialize for IDSNGMPrekeyIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer {
+        Data::new(idsp::PreKeyData {
+            key: self.key.compress().to_vec(),
+            signature: self.signature.to_vec(),
+            timestamp: self.timestamp,
+        }.encode_to_vec()).serialize(serializer)
+    }
+}
+
+fn derive_hkdf_key_iv(secret: &[u8]) -> Result<([u8; 32], [u8; 16]), PushError> {
+    let hk = Hkdf::<Sha256>::new(Some("LastPawn-MessageKeys".as_bytes()), &secret);
+    let mut key = [0u8; 48];
+    hk.expand(&[], &mut key).expect("Failed to expand key!");
+    Ok((key[..32].try_into().unwrap(), key[32..].try_into().unwrap()))
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct IDSNGMIdentity {
+    legacy: IDSUserIdentity,
+    #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
+    device_key: CompactECKey<Private>,
+    #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
+    pre_key: CompactECKey<Private>,
+}
+
+impl IDSNGMIdentity {
+    pub fn new() -> Result<Self, PushError> {
+        Ok(Self {
+            legacy: IDSUserIdentity::new()?,
+            device_key: CompactECKey::new()?,
+            pre_key: CompactECKey::new()?,
+        })
+    }
+
+    pub fn new_with_legacy(legacy: IDSUserIdentity) -> Result<Self, PushError> {
+        Ok(Self {
+            legacy,
+            device_key: CompactECKey::new()?,
+            pre_key: CompactECKey::new()?,
+        })
+    }
+
+    fn build_prekey_data(&self) -> Result<Vec<u8>, PushError> {
+        let since_the_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+        let timestamp = since_the_epoch.as_secs() as f64;
+
+        let data = [
+            "NGMPrekeySignature".as_bytes().to_vec(),
+            self.pre_key.compress().to_vec(),
+            timestamp.to_le_bytes().to_vec(),
+        ].concat();
+
+        let signed = self.device_key.sign_raw(MessageDigest::sha256(), &data)?;
+
+        let data = idsp::PreKeyData {
+            key: self.pre_key.compress().to_vec(),
+            signature: signed.to_vec(),
+            timestamp,
+        };
+
+        Ok(data.encode_to_vec())
+    }
+
+    pub fn decrypt_payload(&self, from: Option<&IDSDeliveryData>, format: &str, raw_payload: &[u8]) -> Result<Vec<u8>, PushError> {
+        if format == "pair" {
+            return self.legacy.decrypt_payload(from.map(|p| &p.client_data.public_message_identity_key), raw_payload)
+        }
+
+        let outer = idsp::OuterMessage::decode(&mut Cursor::new(raw_payload))?;
+
+        let ephemeral_pub = CompactECKey::decompress(outer.key.clone().try_into().expect("Bad key size decrypt!"));
+        let a = self.pre_key.get_pkey();
+        let b = ephemeral_pub.get_pkey();
+        let mut deriver = Deriver::new(&a)?;
+        deriver.set_peer(&b)?;
+        let secret = deriver.derive_to_vec()?;
+
+        if let Some(from) = from {
+            // verify payload
+            let (Some(device), Some(prekey)) = (from.get_device_key(), &from.client_data.public_message_ngm_device_prekey_data_key) else {
+                return Err(PushError::BadMsg)
+            };
+            let validator = [
+                device.compress()[..2].to_vec(),
+                self.device_key.compress()[..2].to_vec(),
+                self.pre_key.compress()[..2].to_vec(),
+            ].concat();
+            if &validator != &outer.validator[..6] {
+                return Err(PushError::BadMsg);
+            }
+
+            let signature_data = [
+                secret.clone(),
+                self.pre_key.compress().to_vec(),
+                ephemeral_pub.compress().to_vec(),
+                self.device_key.compress().to_vec(),
+                outer.payload.clone(),
+            ].concat();
+
+            device.verify(MessageDigest::sha256(), &signature_data, outer.signature.try_into().expect("Bad signature size!"))?;
+        }
+
+        let (key, iv) = derive_hkdf_key_iv(&secret)?;
+        let mut cipher = ctr::Ctr64BE::<aes::Aes256>::new(&key.into(), &iv.into());
+        let mut decrypted = outer.payload.clone();
+        cipher.apply_keystream(&mut decrypted);
+
+        let padding_len = u32::from_le_bytes(decrypted[decrypted.len()-4..].try_into().unwrap());
+        let message = &decrypted[..(decrypted.len()-(padding_len as usize)-4)];
+
+        let inner = idsp::InnerMessage::decode(&mut Cursor::new(&message))?;
+
+        info!("Counter {}", inner.counter);
+
+        Ok(inner.message)
+    }
+
+    pub async fn encrypt_payload(&self, target: &IDSDeliveryData, cache: &Mutex<KeyCache>, body: &[u8]) -> Result<(Vec<u8>, &'static str), PushError> {
+        let (Some(device), Some(prekey)) = (target.get_device_key(), &target.client_data.public_message_ngm_device_prekey_data_key) else {
+            // fall back to legacy encryption
+            return Ok((self.legacy.encrypt_payload(&target.client_data.public_message_identity_key, body)?, "pair"));
+        };
+
+        prekey.verify(&device)?; // verify the device signed the key
+
+        // increment the counter
+        let mut hasher = DefaultHasher::new();
+        self.device_key.compress().hash(&mut hasher);
+        device.compress().hash(&mut hasher);
+        prekey.key.compress().hash(&mut hasher);
+        let entry_hash = hasher.finish();
+
+        let mut cache_lock = cache.lock().await;
+        let cache_entry = cache_lock.message_counter.entry(entry_hash.to_string()).or_default();
+        let my_counter = *cache_entry;
+        *cache_entry += 1;
+        cache_lock.save();
+        drop(cache_lock);
+
+        let padding_bytes = body.len().wrapping_neg() % 16;
+        let mut padding = vec![0u8; padding_bytes];
+        rand::thread_rng().fill_bytes(&mut padding);
+        padding.extend_from_slice(&(padding_bytes as u32).to_le_bytes());
+
+        let mut message = idsp::InnerMessage {
+            message: body.to_vec(),
+            counter: my_counter,
+            kt_gossip_data: vec![],
+            debug_info: vec![],
+        }.encode_to_vec();
+        message.extend(padding);
+
+        let ephermeral_key = CompactECKey::new()?;
+        let a = ephermeral_key.get_pkey();
+        let b = prekey.key.get_pkey();
+        let mut deriver = Deriver::new(&a)?;
+        deriver.set_peer(&b)?; 
+        let secret = deriver.derive_to_vec()?;
+
+        let (key, iv) = derive_hkdf_key_iv(&secret)?;
+
+        let mut cipher = ctr::Ctr64BE::<aes::Aes256>::new(&key.into(), &iv.into());
+        cipher.apply_keystream(&mut message);
+
+        let signature_data = [
+            secret.clone(),
+            prekey.key.compress().to_vec(),
+            ephermeral_key.compress().to_vec(),
+            device.compress().to_vec(),
+            message.clone(),
+        ].concat();
+
+        let signature = self.device_key.sign_raw(MessageDigest::sha256(), &signature_data)?;
+
+        let validator = [
+            self.device_key.compress()[..2].to_vec(),
+            device.compress()[..2].to_vec(),
+            prekey.key.compress()[..2].to_vec(),
+            vec![0xc],
+        ].concat();
+
+        let outer_msg = idsp::OuterMessage {
+            payload: message,
+            key: ephermeral_key.compress().to_vec(),
+            signature: signature.to_vec(),
+            validator,
+        };
+
+        Ok((outer_msg.encode_to_vec(), "pair-ec"))
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct LookupReq {
@@ -280,6 +624,36 @@ struct IDSLookupResp {
 #[serde(rename_all = "kebab-case")]
 pub struct ParsedClientData {
     pub public_message_identity_key: IDSPublicIdentity,
+    pub public_message_ngm_device_prekey_data_key: Option<IDSNGMPrekeyIdentity>,
+    #[serde(default, deserialize_with = "deserialize_kt_data", serialize_with = "serialize_kt_data")]
+    pub ngm_public_identity: Option<CompactECKey<Public>>,
+}
+
+pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Data> = Deserialize::deserialize(d)?;
+    let Some(s) = s else { return Ok(None) };
+    println!("kt data {}", encode_hex(s.as_ref()));
+    let decoded = idsp::KtLoggableData::decode(&mut Cursor::new(s.as_ref())).map_err(de::Error::custom)?;
+
+    let Some(identity) = decoded.device_identity.and_then(|i| i.public_key) else { return Ok(None) };
+
+    Ok(Some(CompactECKey::decompress(identity.try_into().expect("Bad EC key length!"))))
+}
+
+pub fn serialize_kt_data<S>(x: &Option<CompactECKey<Public>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    x.clone().map(|i: CompactECKey<Public>| Data::new(idsp::KtLoggableData {
+        device_identity: Some(idsp::kt_loggable_data::NgmPublicIdentity {
+            public_key: Some(i.compress().to_vec()),
+        }),
+        ngm_version: Some(0), // don't matter cause this is only for local decoding
+        kt_version: Some(0),
+    }.encode_to_vec())).serialize(s)
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]
@@ -292,6 +666,14 @@ pub struct IDSDeliveryData {
     pub session_token: Vec<u8>,
     pub session_token_expires_seconds: u64,
     pub session_token_refresh_seconds: u64,
+    #[serde(default, deserialize_with = "deserialize_kt_data", serialize_with = "serialize_kt_data")]
+    pub kt_loggable_data: Option<CompactECKey<Public>>,
+}
+
+impl IDSDeliveryData {
+    pub fn get_device_key(&self) -> Option<&CompactECKey<Public>> {
+        self.kt_loggable_data.as_ref().or(self.client_data.ngm_public_identity.as_ref())
+    }
 }
 
 #[derive(Default)]
@@ -425,7 +807,7 @@ impl IDSService {
     }
 }
 
-pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'static IDSService], users: &mut [IDSUser], identity: &IDSUserIdentity) -> Result<(), PushError> {
+pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'static IDSService], users: &mut [IDSUser], identity: &IDSNGMIdentity) -> Result<(), PushError> {
     info!("registering!");
 
     let mut possible_handles: HashMap<String, Vec<String>> = HashMap::new();
@@ -433,7 +815,16 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
         possible_handles.insert(user.user_id.clone(), user.get_possible_handles(aps).await?);
     }
 
-    let identity_key = identity.encode()?;
+    let identity_key = identity.legacy.encode()?;
+    let predata_key = identity.build_prekey_data()?;
+    // versions also in registration
+    let kt_data = idsp::KtLoggableData {
+        device_identity: Some(idsp::kt_loggable_data::NgmPublicIdentity {
+            public_key: Some(identity.device_key.compress().to_vec()),
+        }),
+        ngm_version: Some(13),
+        kt_version: Some(5),
+    };
 
     let services = id_services.iter().map(|service| {
         let mut user_list = vec![];
@@ -443,7 +834,12 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 ("client-data", Value::Dictionary(Dictionary::from_iter([
                     ("public-message-identity-key", Value::Data(identity_key.clone())),
                     ("public-message-identity-version", Value::Integer(2.into())),
+                    ("ec-version", Value::Integer(1.into())),
+                    ("public-message-identity-ngm-version", Value::Integer(13.into())),
+                    ("public-message-ngm-device-prekey-data-key", Value::Data(predata_key.clone())),
+                    ("kt-version", Value::Integer(5.into())),
                 ].into_iter().chain(service.client_data.iter().map(|(a, b)| (*a, b.clone())))))),
+                ("kt-loggable-data", Value::Data(kt_data.encode_to_vec())),
                 ("uris", Value::Array(
                     handles.iter().map(|handle| Value::Dictionary(Dictionary::from_iter([
                         ("uri", Value::String(handle.clone()))
@@ -489,7 +885,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             .header("accept-encoding", "gzip")
             .body(gzip_normal(&plist_to_buf(&body)?)?)
             .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
-    
+
     for (idx, user) in users.iter().enumerate() {
         request = request.header(&format!("x-auth-user-id-{idx}"), &user.user_id)
             .sign(&user.auth_keypair, KeyType::Auth, aps, Some(idx))?;
@@ -508,7 +904,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     // update registrations
     let service_list = resp.as_dictionary().unwrap().get("services").unwrap().as_array().unwrap();
-    
+
     for service in service_list {
         let dict = service.as_dictionary().unwrap();
         let service_name = dict.get("service").unwrap().as_string().unwrap();
@@ -520,7 +916,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             // TODO turn this into a struct
             let user_dict = user.as_dictionary().unwrap();
             let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
-    
+
             if status != 0 {
                 if status == 6009 {
                     if let Some(alert) = user_dict.get("alert") {
@@ -529,9 +925,9 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 }
                 return Err(PushError::RegisterFailed(status));
             }
-    
+
             let mut my_handles = vec![];
-    
+
             let cert = user_dict.get("cert").unwrap().as_data().unwrap();
             for uri in user_dict.get("uris").unwrap().as_array().unwrap() {
                 let status = uri.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
@@ -542,7 +938,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 }
                 my_handles.push(uri.to_string());
             }
-    
+
             let heartbeat_interval = user_dict.get("next-hbi").and_then(|i| i.as_unsigned_integer());
             let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
             let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
@@ -553,11 +949,10 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 heartbeat_interval_s: heartbeat_interval,
                 data_hash: service.hash_data(),
             };
-    
+
             user.registration.insert(service_name.to_string(), registration);
         }
     }
 
     Ok(())
 }
-
