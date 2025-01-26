@@ -3,7 +3,7 @@ use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use base64::engine::general_purpose;
@@ -303,6 +303,12 @@ pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoded_data = Vec::new();
     decoder.read_to_end(&mut decoded_data)?;
     Ok(decoded_data)
+}
+
+pub fn duration_since_epoch() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
 }
 
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {

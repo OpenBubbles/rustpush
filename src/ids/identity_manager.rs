@@ -15,7 +15,7 @@ use rand::RngCore;
 use uuid::Uuid;
 use std::str::FromStr;
 
-use crate::{aps::{get_message, APSConnection}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
 
@@ -180,9 +180,7 @@ impl KeyCache {
 
     // verify integrity
     pub async fn verity(&mut self, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) {
-        let secs_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards").as_secs_f64();
+        let secs_now = duration_since_epoch().as_secs_f64();
         for user in users {
             for main_service in services {
                 let Some(reg) = user.registration.get(main_service.name) else { continue };
@@ -290,9 +288,7 @@ impl KeyCache {
         let Some(handle_cache) = self.cache.get_mut(service).and_then(|a| a.get_mut(handle)) else {
             panic!("No handle cache for service {service} handle {handle}!");
         };
-        let ms_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards").as_millis();
+        let ms_now = duration_since_epoch().as_millis();
         handle_cache.keys.insert(keys_for.to_string(), CachedKeys {
             keys,
             at_ms: ms_now as u64
@@ -750,10 +746,7 @@ impl IdentityResource {
 
         let mut progress = receiver.resubscribe();
 
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+        let since_the_epoch = duration_since_epoch();
 
         let job = InnerSendJob {
             conn: self.aps.clone(),

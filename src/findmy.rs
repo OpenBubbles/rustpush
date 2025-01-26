@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget}, user::IDSService, IDSRecvMessage}, util::{encode_hex, REQWEST}, APSConnection, APSMessage, OSConfig, PushError};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget}, user::IDSService, IDSRecvMessage}, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
@@ -277,7 +277,7 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             .headers(get_find_my_headers(config, "3.0", &mut *self.anisette.lock().await, "Find%20My/375.20").await?)
             .basic_auth(&self.state.dsid, Some(&self.state.fmip_token));
 
-        let ms_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as f64 / 1000f64;
+        let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
         let meta = config.get_debug_meta();
 
         let token = self.aps.get_token().await;
@@ -356,7 +356,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
             .header("X-FMF-Model-Version", "1")
             .basic_auth(&self.state.dsid, Some(&self.state.fmf_token));
 
-        let ms_since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as f64 / 1000f64;
+        let ms_since_epoch = duration_since_epoch().as_millis() as f64 / 1000f64;
         let meta = config.get_debug_meta();
         let reg = config.get_register_meta();
 

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget}, IDSRecvMessage}, mmcs::{MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget}, IDSRecvMessage}, mmcs::{MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1610,11 +1610,7 @@ impl MessageInst {
             conversation.participants.push(self.sender.as_ref().unwrap().clone());
         }
 
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        self.sent_timestamp = since_the_epoch.as_millis() as u64;
+        self.sent_timestamp = duration_since_epoch().as_millis() as u64;
 
         self.get_send_participants(my_handles)
     }
@@ -2018,10 +2014,7 @@ impl MessageInst {
                 plist_to_bin(&raw).unwrap()
             },
             Message::IconChange(msg) => {
-                let start = SystemTime::now();
-                let since_the_epoch = start
-                    .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards");
+                let since_the_epoch = duration_since_epoch();
                 let random_guid = Uuid::new_v4().to_string().to_uppercase();
                 let raw = RawIconChangeMessage {
                     group_version: msg.group_version,

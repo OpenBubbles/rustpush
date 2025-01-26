@@ -9,7 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 use rand::Rng;
 
-use crate::{aps::get_message, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, encode_hex, get_bag, gzip, gzip_normal, REQWEST, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{aps::get_message, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -212,9 +212,7 @@ impl NonceType {
 pub fn generate_nonce(typ: NonceType) -> Vec<u8> {
     [
         vec![typ.get_header()],
-        (SystemTime::now()
-            .duration_since(UNIX_EPOCH).unwrap()
-            .as_secs() * 1000).to_be_bytes().to_vec(),
+        (duration_since_epoch().as_secs() * 1000).to_be_bytes().to_vec(),
         rand::thread_rng().gen::<[u8; 8]>().to_vec(),
     ].concat()
 }

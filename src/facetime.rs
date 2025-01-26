@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{aps::{get_message, APSInterestToken}, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource}, user::{IDSService, QueryOptions}, CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}, APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError};
+use crate::{aps::{get_message, APSInterestToken}, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource}, user::{IDSService, QueryOptions}, CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}, APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError};
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -104,10 +104,7 @@ impl FTLink {
     }
 
     pub fn is_expired(&self) -> bool {
-        let since_the_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        self.expiry_time < since_the_epoch.as_secs_f64()
+        self.expiry_time < duration_since_epoch().as_secs_f64()
     }
 }
 
@@ -441,9 +438,7 @@ impl FTClient {
 
     // warning: Doesn't save the link
     async fn new_link(&self, handle: &str, usage: Option<String>) -> Result<FTLink, PushError> {
-        let since_the_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+        let since_the_epoch = duration_since_epoch();
         
         let in_a_year = since_the_epoch + Duration::from_secs(31536000);
         
@@ -548,9 +543,7 @@ impl FTClient {
 
     // group is random uuid
     pub async fn create_session(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
-        let since_the_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+        let since_the_epoch = duration_since_epoch();
 
         let session = FTSession {
             group_id: for_group,

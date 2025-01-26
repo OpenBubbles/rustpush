@@ -239,7 +239,7 @@ async fn main() {
     // let link = facetime.generate_link(&handle).await.expect("Failed to create facetime link!");
     // info!("Facetime link {}", link);
 
-    
+
 
     // facetime.create_session(Uuid::new_v4().to_string().to_uppercase(), handle.clone(), &["".to_string()]).await.expect("Failed to create session!");
     // info!("Rung!");
@@ -376,14 +376,14 @@ async fn main() {
                                 }
                             },
                             FTMessage::JoinEvent { guid, ring, .. } => {
-                                if ring {
-                                    warn!("Preparing to decline!");
-                                    tokio::time::sleep(Duration::from_secs(10)).await;
-                                    let mut lock = facetime.state.write().await;
-                                    let state = lock.sessions.values_mut().find(|a| a.group_id == guid).expect("state");
-                                    facetime.ensure_allocations(state, &[]).await.expect("state");
-                                    facetime.decline_invite(state).await.expect("failed to unprop?");
-                                }
+                                // if ring {
+                                //     warn!("Preparing to decline!");
+                                //     tokio::time::sleep(Duration::from_secs(10)).await;
+                                //     let mut lock = facetime.state.write().await;
+                                //     let state = lock.sessions.values_mut().find(|a| a.group_id == guid).expect("state");
+                                //     facetime.ensure_allocations(state, &[]).await.expect("state");
+                                //     facetime.decline_invite(state).await.expect("failed to unprop?");
+                                // }
                                 last_ft_guid = guid;
                             },
                             _ => {}

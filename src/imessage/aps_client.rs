@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -159,13 +159,9 @@ impl IMClient {
                 e: u64,
             }
 
-            let start = SystemTime::now();
-            let since_the_epoch = start
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards");
             let msg = FlushCacheMsg {
                 c: 160,
-                e: since_the_epoch.as_nanos() as u64,
+                e: duration_since_epoch().as_nanos() as u64,
             };
 
             conn.send_message("com.apple.madrid", plist_to_bin(&msg).unwrap(), None).await?;

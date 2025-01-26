@@ -18,7 +18,7 @@ use super::identity_manager::KeyCache;
 use rand::{Rng, RngCore};
 use tokio::sync::Mutex;
 
-use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
 
 use super::CompactECKey;
 
@@ -82,10 +82,7 @@ impl IDSRegistration {
         let x509 = X509::from_der(&self.id_keypair.cert)?;
         let expiration = x509.not_after();
 
-        let start = SystemTime::now();
-        let since_the_epoch = start
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
+        let since_the_epoch = duration_since_epoch();
 
         let unix = Asn1Time::from_unix(since_the_epoch.as_secs().try_into().unwrap())?.as_ref().diff(expiration)?;
         Ok((unix.days as i64) * 86400 + (unix.secs as i64))
@@ -93,7 +90,7 @@ impl IDSRegistration {
 
     pub fn calculate_rereg_time_s(&self) -> Result<i64, PushError> {
         Ok(if let Some(heartbeat_interval) = self.heartbeat_interval_s {
-            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as i64;
+            let now = duration_since_epoch().as_secs() as i64;
             (self.registered_at_s + heartbeat_interval) as i64 - now
         } else {
             // reregister 5 minutes before exp
@@ -431,10 +428,7 @@ impl IDSNGMIdentity {
     }
 
     fn build_prekey_data(&self) -> Result<Vec<u8>, PushError> {
-        let since_the_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        let timestamp = since_the_epoch.as_secs() as f64;
+        let timestamp = duration_since_epoch().as_secs() as f64;
 
         let data = [
             "NGMPrekeySignature".as_bytes().to_vec(),
@@ -1021,7 +1015,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let registration = IDSRegistration {
                 id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
                 handles: my_handles,
-                registered_at_s: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+                registered_at_s: duration_since_epoch().as_secs(),
                 heartbeat_interval_s: heartbeat_interval,
                 data_hash: service.hash_data(),
             };
