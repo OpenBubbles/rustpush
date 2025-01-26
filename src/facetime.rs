@@ -456,7 +456,8 @@ impl FTClient {
 
     pub async fn use_link_for(&self, old_usage: &str, usage: &str) -> Result<(), PushError> {
         let state = self.state.read().await;
-        let pseud = state.links.values().find(|a| a.usage == Some(old_usage.to_string())).expect("No old link??").pseud.clone();
+        let Some(existing) = state.links.values().find(|a| a.usage == Some(old_usage.to_string())) else { return Ok(()) };
+        let pseud = existing.pseud.clone();
         if state.links[&pseud].usage == Some(usage.to_string()) {
             return Ok(())
         }
