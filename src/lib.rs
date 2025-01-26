@@ -9,6 +9,7 @@ mod auth;
 mod ids;
 pub mod sharedstreams;
 pub mod findmy;
+pub mod facetime;
 
 #[cfg(feature = "macOS")]
 mod macos;

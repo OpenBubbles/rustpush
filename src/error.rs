@@ -111,4 +111,14 @@ pub enum PushError {
     BadCompactECKey,
     #[error("Protobuf error {0}")]
     ProtobufError(#[from] prost::DecodeError),
+    #[error("Alias error {0}")]
+    AliasError(u32),
+    #[error("Handle not found {0}")]
+    HandleNotFound(String),
+    #[error("AES GCM error")]
+    AESGCMError,
+    #[error("Missing handle")]
+    NoHandle,
+    #[error("NoParticipantTokenIndex")]
+    NoParticipantTokenIndex,
 }

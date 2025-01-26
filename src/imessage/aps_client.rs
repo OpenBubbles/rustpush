@@ -282,7 +282,7 @@ impl IMClient {
             return Ok(None);
         }
 
-        match MessageInst::from_raw(payload.message_unenc.take().unwrap(), &payload, &self.conn).await {
+        match MessageInst::from_raw(payload.message_unenc.take().unwrap().plist()?, &payload, &self.conn).await {
             Err(PushError::BadMsg) => Ok(None),
             Err(err) => Err(err),
             Ok(msg) => Ok(Some(msg))

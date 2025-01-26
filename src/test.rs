@@ -3,10 +3,10 @@ use std::{fs::File, io::Cursor, path::PathBuf, sync::Arc, time::{Duration, Syste
 
 use base64::engine::general_purpose;
 use icloud_auth::AppleAccount;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
+use rustpush::{authenticate_apple, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -180,7 +180,7 @@ async fn main() {
         vec![user]
     };
     
-    let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE];
+    let services = &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE];
 
     let identity = saved_state.as_ref().map(|state| state.identity.clone()).unwrap_or(IDSNGMIdentity::new().unwrap());
 
@@ -200,7 +200,9 @@ async fn main() {
         state.users = updated_keys;
         std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
     })).await;
-    let handle = client.identity.get_handles().await[1].clone();
+    let handle = client.identity.get_handles().await[0].clone();
+
+    // client.identity.refresh_now().await.unwrap();
     println!("handle {}", handle);
 
 
@@ -216,10 +218,31 @@ async fn main() {
     let shared_streams = SharedStreamClient::new(state, Box::new(move |update| {
         plist::to_file_xml(&id_path, update).unwrap();
     }), connection.clone(), anisette_client.clone(), config.clone()).await;
-    shared_streams.get_changes().await.unwrap();
+    // shared_streams.get_changes().await.unwrap();
     // let album = shared_streams.state.read().await.albums[0].albumguid.clone();
     // shared_streams.get_album_summary(&album).await.unwrap();
 
+    let state: FTState = plist::from_file(&PathBuf::from_str("facetime.plist").unwrap()).expect("Bad format!");
+    let facetime = FTClient::new(state, Box::new(|state| {
+        plist::to_file_xml(&PathBuf::from_str("facetime.plist").unwrap(), state).expect("Failed to serialize plist!");
+    }), connection.clone(), client.identity.clone(), config.clone()).await;
+
+    // let mut ft_lock = facetime.state.write().await;
+    // facetime.remove_members(&mut ft_lock.sessions.values_mut().next().unwrap(), vec![
+    //     FTMember {
+    //         nickname: None,
+    //         handle: "tel:+18183857117".to_string(),
+    //     }
+    // ]).await.expect("Could not remove");
+    // drop(ft_lock);
+
+    // let link = facetime.generate_link(&handle).await.expect("Failed to create facetime link!");
+    // info!("Facetime link {}", link);
+
+    
+
+    // facetime.create_session(Uuid::new_v4().to_string().to_uppercase(), handle.clone(), &["".to_string()]).await.expect("Failed to create session!");
+    // info!("Rung!");
 
 
     let manager = SyncController::new(shared_streams, PathBuf::from_str("syncstate.plist").unwrap(), FFMpegFilePackager::default(), Duration::from_secs(60 * 30)).await;
@@ -327,6 +350,7 @@ async fn main() {
     std::io::stdout().flush().unwrap();
 
     let mut received_msgs = vec![];
+    let mut last_ft_guid = "AE271F00-2F67-42C4-8EF2-74600055A2B7".to_string();
     
     loop {
         tokio::select! {
@@ -334,6 +358,38 @@ async fn main() {
                 let msg = msg.unwrap();
                 let _ = findmy_client.handle(msg.clone()).await;
                 let _ = manager.handle(msg.clone()).await;
+                match facetime.handle(msg.clone()).await {
+                    Err(e) => {
+                        error!("Failed to receive {}", e);
+                        continue;
+                    },
+                    Ok(None) => {},
+                    Ok(Some(a)) => {
+                        info!("Got ftmessage {a:?}");
+                        match a {
+                            FTMessage::LetMeInRequest(request) => {
+                                if request.delegation_uuid.is_none() {
+                                    if let Err(e) = facetime.respond_letmein(request, Some(&last_ft_guid)).await {
+                                        warn!("Failed {e}");
+                                    }
+                                    // facetime.respond_letmein(request, None).await.expect("Request failed");
+                                }
+                            },
+                            FTMessage::JoinEvent { guid, ring, .. } => {
+                                if ring {
+                                    warn!("Preparing to decline!");
+                                    tokio::time::sleep(Duration::from_secs(10)).await;
+                                    let mut lock = facetime.state.write().await;
+                                    let state = lock.sessions.values_mut().find(|a| a.group_id == guid).expect("state");
+                                    facetime.ensure_allocations(state, &[]).await.expect("state");
+                                    facetime.decline_invite(state).await.expect("failed to unprop?");
+                                }
+                                last_ft_guid = guid;
+                            },
+                            _ => {}
+                        }
+                    }
+                }
                 let msg = client.handle(msg).await;
                 if msg.is_err() {
                     error!("Failed to receive {}", msg.err().unwrap());

@@ -44,6 +44,7 @@ ctr = "0.9.2"
 aes = "0.8.4"
 sha2 = "0.10.8"
 hkdf = "0.12.4"
+aes-gcm = "0.10.3"
 
 [features]
 default = ["macOS"]

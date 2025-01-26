@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
 
 use log::debug;
 use omnisette::{AnisetteClient, AnisetteProvider};
@@ -250,34 +250,46 @@ impl KeyType {
     }
 }
 
-pub struct SignedRequest {
+pub enum Signed {}
+pub enum Unsigned {}
+
+pub trait RequestState {}
+impl RequestState for Signed {}
+impl RequestState for Unsigned {}
+
+pub struct SignedRequest<S: RequestState = Unsigned> {
     headers: HeaderMap,
     method: Method,
     body: Vec<u8>,
     bag: &'static str,
+    marker: PhantomData<S>,
 }
 
-impl SignedRequest {
-    pub fn new(bag: &'static str, method: Method) -> SignedRequest {
-        SignedRequest {
+impl SignedRequest<Unsigned> {
+    pub fn new(bag: &'static str, method: Method) -> Self {
+        Self {
             headers: Default::default(),
             method,
             body: vec![],
             bag,
+            marker: PhantomData
         }
     }
+    
+    pub fn body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self
+    }
+}
 
-    pub fn header(mut self, name: &str, val: &str) -> SignedRequest {
+impl<S: RequestState> SignedRequest<S> {
+
+    pub fn header(mut self, name: &str, val: &str) -> Self {
         self.headers.append::<HeaderName>(name.try_into().unwrap(), val.parse().unwrap());
         self
     }
 
-    pub fn body(mut self, body: Vec<u8>) -> SignedRequest {
-        self.body = body;
-        self
-    }
-
-    pub fn sign(mut self, pair: &KeyPair, key_type: KeyType, aps: &APSState, item: Option<usize>) -> Result<SignedRequest, PushError> {
+    pub fn sign(mut self, pair: &KeyPair, key_type: KeyType, aps: &APSState, item: Option<usize>) -> Result<SignedRequest<Signed>, PushError> {
         let key = PKey::private_key_from_der(&pair.private)?;
         let name = key_type.name();
         let nonce = generate_nonce(NonceType::HTTP);
@@ -292,7 +304,13 @@ impl SignedRequest {
         ]);   
         self.headers.append::<HeaderName>(format!("x-{name}-sig{postfix}").try_into().unwrap(), base64_encode(&do_signature(&key, &payload)?).parse().unwrap());
         self.headers.append::<HeaderName>(format!("x-{name}-cert{postfix}").try_into().unwrap(), base64_encode(&pair.cert).parse().unwrap());
-        Ok(self)
+        Ok(SignedRequest {
+            headers: self.headers,
+            method: self.method,
+            body: self.body,
+            bag: self.bag,
+            marker: PhantomData
+        })
     }
 
     pub async fn send(self, client: &Client) -> Result<Response, PushError> {

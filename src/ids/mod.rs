@@ -3,12 +3,33 @@ use std::{fmt::Debug, ops::{Deref, DerefMut}};
 use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{HasPublic, PKey, Private, Public}, sign::{Signer, Verifier}};
 use plist::Value;
 use rasn::{types::Integer, AsnType, Decode, Encode};
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use crate::{util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, PushError};
 use num_bigint::{BigInt, Sign};
 
 pub mod user;
 pub mod identity_manager;
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum MessageBody {
+    Plist(Value),
+    Bytes(Vec<u8>),
+}
+
+impl MessageBody {
+    pub fn plist<T: DeserializeOwned>(self) -> Result<T, PushError> {
+        Ok(match self {
+            Self::Plist(plist) => plist::from_value(&plist)?,
+            Self::Bytes(bytes) => plist::from_bytes(&bytes)?,
+        })
+    }
+
+    pub fn bytes(self) -> Result<Vec<u8>, PushError> {
+        let Self::Bytes(bytes) = self else { return Err(PushError::BadMsg) };
+        Ok(bytes)
+    }
+}
 
 #[derive(Deserialize, Debug)]
 pub struct IDSRecvMessage {
@@ -37,7 +58,7 @@ pub struct IDSRecvMessage {
 
     // old iOS participants change
     #[serde(rename = "p")]
-    pub message_unenc: Option<Value>,
+    pub message_unenc: Option<MessageBody>,
 
     #[serde(default, rename = "P", deserialize_with = "bin_deserialize_opt_vec")]
     pub message: Option<Vec<u8>>,
@@ -60,7 +81,7 @@ pub struct IDSRecvMessage {
     #[serde(skip)]
     pub verification_failed: bool,
     #[serde(skip)]
-    pub topic: String,
+    pub topic: &'static str,
 }
 
 #[derive(AsnType, Encode, Decode)]
@@ -107,7 +128,7 @@ impl<T: HasPublic> TryFrom<EcKey<T>> for CompactECKey<T> {
 }
 
 impl CompactECKey<Private> {
-    fn new() -> Result<Self, PushError> {
+    pub fn new() -> Result<Self, PushError> {
         let mut ctx = BigNumContext::new()?;
         let mut y = BigNum::new()?;
         let mut p = BigNum::new()?;
@@ -142,7 +163,7 @@ impl CompactECKey<Private> {
 }
 
 impl<T: HasPublic> CompactECKey<T> {
-    fn compress(&self) -> [u8; 32] {
+    pub fn compress(&self) -> [u8; 32] {
         let mut ctx = BigNumContext::new().unwrap();
         let mut x = BigNum::new().unwrap();
         self.public_key().affine_coordinates(&self.group(), &mut x, &mut BigNum::new().unwrap(), &mut ctx).unwrap();
@@ -164,13 +185,13 @@ impl<T: HasPublic> CompactECKey<T> {
         Ok(())
     }
 
-    fn get_pkey(&self) -> PKey<T> {
+    pub fn get_pkey(&self) -> PKey<T> {
         PKey::from_ec_key(self.0.clone()).expect("Couldn't create pkey!")
     }
 }
 
 impl CompactECKey<Public> {
-    fn decompress(key: [u8; 32]) -> Self {
+    pub fn decompress(key: [u8; 32]) -> Self {
         let mut ctx = BigNumContext::new().unwrap();
         let mut unpacked_key = [0u8; 33];
         unpacked_key[0] = 0x3;
@@ -191,7 +212,6 @@ impl CompactECKey<Public> {
         y.mul_word(2).expect("What");
         if y >= p {
             result.expect("Sub failed!");
-            println!("Flipping!");
             point.set_affine_coordinates_gfp(&group, &x, &scratch, &mut ctx).expect("Set affine coordinates failed!");
         }
 

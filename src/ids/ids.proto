@@ -19,7 +19,7 @@ message KtLoggableData {
 
 message InnerMessage {
     bytes message = 1;
-	uint32 counter = 2;
+	optional uint32 counter = 2;
 	bytes ktGossipData = 3;
 	bytes debugInfo = 99;
 }

@@ -4,7 +4,7 @@ use backon::{ConstantBuilder, ExponentialBuilder};
 use deku::{DekuContainerRead, DekuRead, DekuWrite};
 use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
-use plist::{Data, Value};
+use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{Mutex, RwLock}, task::JoinHandle};
 use backon::Retryable;
@@ -15,7 +15,7 @@ use rand::RngCore;
 use uuid::Uuid;
 use std::str::FromStr;
 
-use crate::{aps::{get_message, APSConnection}, ids::user::IDSIdentity, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
 
@@ -74,6 +74,8 @@ pub struct CachedHandle {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize_sha")]
     env_hash: [u8; 20],
     pub private_data: Vec<PrivateDeviceInfo>,
+    pub real_handle: Option<String>,
+    pub expiry: Option<f64>, // ms since epoch
 }
 
 impl CachedHandle {
@@ -92,18 +94,42 @@ impl CachedHandle {
 }
 
 #[derive(Debug)]
+pub struct IDSQuickRelaySettings {
+    pub reason: u32,
+    pub group_id: String,
+    pub request_type: u32,
+    pub member_count: u32,
+}
+
+#[derive(Debug)]
 pub struct IDSSendMessage {
     pub sender: String,
     pub raw: Option<Vec<u8>>,
     pub send_delivered: bool,
     pub command: u8,
-    pub ex: Option<u32>,
     pub no_response: bool,
+    pub extras: Dictionary,
     pub id: String,
-    pub sent_timestamp: u64,
-    pub response_for: Option<Vec<u8>>,
     pub scheduled_ms: Option<u64>,
     pub queue_id: Option<String>,
+    pub relay: Option<IDSQuickRelaySettings>,
+}
+
+impl IDSSendMessage {
+    pub fn quickrelay(sender: String, uuid: Uuid, relay: IDSQuickRelaySettings) -> Self {
+        IDSSendMessage {
+            sender,
+            raw: None,
+            send_delivered: false,
+            command: 200,
+            no_response: false,
+            id: uuid.to_string().to_uppercase(),
+            relay: Some(relay),
+            scheduled_ms: None,
+            queue_id: None,
+            extras: Default::default(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -154,6 +180,9 @@ impl KeyCache {
 
     // verify integrity
     pub async fn verity(&mut self, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) {
+        let secs_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards").as_secs_f64();
         for user in users {
             for main_service in services {
                 let Some(reg) = user.registration.get(main_service.name) else { continue };
@@ -161,6 +190,19 @@ impl KeyCache {
                     for handle in &reg.handles {
                         self.cache.entry(service.to_string()).or_default().entry(handle.clone()).or_default().verity(conn, user, &main_service.name).await;
                     }
+                    let hashes = self.cache.entry(service.to_string()).or_default().into_iter().map(|(a, b)| (a.clone(), b.env_hash)).collect::<HashMap<_, _>>();
+                    self.cache.entry(service.to_string()).or_default().retain(|_key, value| {
+                        let Some(real) = &value.real_handle else { return true };
+
+                        // prune expired pseudonyms
+                        if let Some(expiry) = value.expiry {
+                            if secs_now > expiry {
+                                return false;
+                            }
+                        }
+
+                        hashes.get(real) == Some(&value.env_hash) // our real hash must match our created hash
+                    });
                 }
             }
         }
@@ -267,7 +309,7 @@ pub struct IdentityResource {
     aps: APSConnection,
     query_lock: Mutex<()>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
-    services: &'static [&'static IDSService]
+    services: &'static [&'static IDSService],
 }
 
 pub type IdentityManager = Arc<ResourceManager<IdentityResource>>;
@@ -323,8 +365,8 @@ impl IdentityResource {
                             } else {
                                 false
                             }
-                        }).unwrap_or(false)));
-
+                        }).unwrap_or(true))); // if not exist, reregister!
+        
         let resource = Arc::new(IdentityResource {
             cache: Mutex::new(KeyCache::new(cache_path, &conn, &users, services).await),
             users: RwLock::new(users),
@@ -408,8 +450,69 @@ impl IdentityResource {
         // return indicates reregister
     }
 
-    pub fn user_by_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> &'t IDSUser {
-        users.iter().find(|user| user.registration["com.apple.madrid"].handles.contains(&handle.to_string())).expect(&format!("Cannot find identity for sender {}!", handle))
+    pub fn user_by_real_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> Result<&'t IDSUser, PushError> {
+        users.iter().find(|user| user.registration["com.apple.madrid"].handles.contains(&handle.to_string())).ok_or(PushError::HandleNotFound(handle.to_string()))
+    }
+
+    pub async fn user_by_handle<'t>(&self, service: &str, users: &'t Vec<IDSUser>, mut handle: &str) -> Result<&'t IDSUser, PushError> {
+        let cache_lock = self.cache.lock().await;
+        if let Some(real) = cache_lock.cache.get(service).and_then(|service| service.get(handle)).and_then(|s| s.real_handle.as_ref()) {
+            handle = real.as_str();
+        }
+        Self::user_by_real_handle(users, handle)
+    }
+
+    pub async fn register_pseudonym(&self, services: &[&str], handle: &str, pseud: &str, exp: f64) {
+        let mut cache_lock = self.cache.lock().await;
+        for service in services {
+            let Some(service) = cache_lock.cache.get_mut(*service) else { panic!("No service {service}!") };
+            let real_hash = service[handle].env_hash;
+            let mut cache = CachedHandle::default();
+            cache.real_handle = Some(handle.to_string());
+            cache.expiry = Some(exp);
+            cache.env_hash = real_hash;
+            service.insert(pseud.to_string(), cache);
+        }
+        cache_lock.save();
+    }
+
+    pub async fn create_pseudonym(&self, handle: &str, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, expiry_seconds: f64) -> Result<String, PushError> {
+        let users = self.users.read().await;
+        let user = IdentityResource::user_by_real_handle(&*users, handle)?;
+
+        let mut new_alias = None;
+        user.provision_alias(&*self.config, &*self.aps.state.read().await, handle, 
+            services.clone(), &mut new_alias, feature, "create", expiry_seconds).await?;
+        drop(users);
+
+        let new_alias = new_alias.expect("No new alias!!!");
+        let items = services.iter().flat_map(|(a, b)| std::iter::once(*a).chain(b.iter().map(|a| *a))).collect::<Vec<_>>();
+        self.register_pseudonym(&items, handle, &new_alias, expiry_seconds).await;
+
+        Ok(new_alias)
+    }
+    
+    pub async fn delete_pseudonym(&self, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, pseud: String, expiry_seconds: f64) -> Result<(), PushError> {
+        let a_service = services.keys().next().unwrap();
+        let cache_lock = self.cache.lock().await;
+        let handle = cache_lock.cache[*a_service][&pseud].real_handle.as_ref().expect("Not a pseud?").clone();
+        drop(cache_lock);
+        
+        let users = self.users.read().await;
+        let user = IdentityResource::user_by_real_handle(&*users, &handle)?;
+
+        let mut new_alias = Some(pseud.clone());
+        user.provision_alias(&*self.config, &*self.aps.state.read().await, &handle, 
+            services.clone(), &mut new_alias, feature, "delete", expiry_seconds).await?;
+        drop(users);
+
+        let mut cache_lock = self.cache.lock().await;
+        for service in services.iter().flat_map(|(a, b)| std::iter::once(*a).chain(b.iter().map(|a| *a))) {
+            cache_lock.cache.get_mut(service).unwrap().remove(&pseud);
+        }
+        cache_lock.save();
+
+        Ok(())
     }
 
     async fn manager(&self) -> IdentityManager {
@@ -422,7 +525,7 @@ impl IdentityResource {
             return Ok(())
         }
         let user_lock = self.users.read().await;
-        let my_user = Self::user_by_handle(&user_lock, handle);
+        let my_user = Self::user_by_real_handle(&user_lock, handle)?;
         let regs = my_user.get_dependent_registrations(&*self.aps.state.read().await).await?;
         if my_cache.private_data.len() != 0 && regs.len() != my_cache.private_data.len() {
             // something changed, requery IDS too
@@ -471,7 +574,7 @@ impl IdentityResource {
        for chunk in fetch.chunks(18) {
            debug!("Fetching keys for chunk {:?}", chunk);
            let users = self.users.read().await;
-           let results = match Self::user_by_handle(&users, handle).query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
+           let results = match self.user_by_handle(topic, &users, handle).await?.query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
                    if let PushError::LookupFailed(6005) = err {
@@ -508,7 +611,7 @@ impl IdentityResource {
         let mut payload = plist::from_bytes::<IDSRecvMessage>(&payload)?;
 
 
-        payload.topic = topic.to_string();
+        payload.topic = *topic;
 
         if let IDSRecvMessage {
             sender: Some(sender),
@@ -533,8 +636,7 @@ impl IdentityResource {
             let decrypted = self.identity.decrypt_payload(ident.as_ref(), &encryption, &message)?;
             let ungzipped = ungzip(&decrypted).unwrap_or_else(|_| decrypted);
 
-            let parsed: Value = plist::from_bytes(&ungzipped)?;
-            payload.message_unenc = Some(parsed);
+            payload.message_unenc = Some(MessageBody::Bytes(ungzipped));
         }
 
         Ok(Some(payload))
@@ -546,6 +648,19 @@ impl IdentityResource {
 
     pub fn is_subservice(&self, topic: &'static str) -> bool {
         self.get_main_service(topic) != topic
+    }
+
+    pub async fn targets_for_handles(&self, topic: &'static str, targets: &[String], handle: &str) -> Result<Vec<DeliveryHandle>, PushError> {
+        self.cache_keys(
+            topic,
+            &targets,
+            handle,
+            false,
+            &QueryOptions { required_for_message: true, result_expected: true }
+        ).await?;
+
+        let ident_cache = self.cache.lock().await;
+        Ok(ident_cache.get_participants_targets(topic, &handle, &targets))
     }
 
     pub async fn cache_keys(&self, topic: &'static str, participants: &[String], handle: &str, refresh: bool, meta: &QueryOptions) -> Result<(), PushError> {
@@ -635,6 +750,11 @@ impl IdentityResource {
 
         let mut progress = receiver.resubscribe();
 
+        let start = SystemTime::now();
+        let since_the_epoch = start
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards");
+
         let job = InnerSendJob {
             conn: self.aps.clone(),
             identity: self.manager().await.clone(),
@@ -642,6 +762,7 @@ impl IdentityResource {
             message: ids_message,
             status: sender,
             topic,
+            sent_timestamp: since_the_epoch.as_millis() as u64,
         };
 
         let mut job_spawned = tokio::spawn(job.send_targets(message_targets, 0));
@@ -698,14 +819,14 @@ pub struct BundledPayload {
 #[derive(Serialize, Deserialize)]
 pub struct SendMessage {
     #[serde(rename = "fcn")]
-    pub batch: u8,
+    pub batch: Option<u8>,
     #[serde(rename = "c")]
     pub command: u8,
     #[serde(rename = "E")]
     pub encryption: Option<String>,
     #[serde(rename = "ua")]
     pub user_agent: String,
-    pub v: u8,
+    pub v: Option<u8>,
     #[serde(rename = "i")]
     pub message_id: u32,
     #[serde(rename = "U")]
@@ -714,22 +835,32 @@ pub struct SendMessage {
     pub payloads: Vec<BundledPayload>,
     #[serde(rename = "sP")]
     pub sender: String,
-    #[serde(rename = "eX")]
-    pub ex: Option<u32>,
     #[serde(rename = "nr")]
     pub no_response: Option<bool>,
     #[serde(rename = "rc")]
     pub retry_count: Option<u8>,
     #[serde(rename = "oe")]
     pub original_epoch_nanos: Option<u64>,
-    #[serde(rename = "rI")]
-    pub response_for: Option<Data>,
     #[serde(rename = "sv")]
     pub(super) send_version: Option<u8>,
     #[serde(rename = "dmt")]
     pub(super) deliver_message_time: Option<u64>,
     #[serde(rename = "qI")]
     pub(super) queue_id: Option<String>,
+    #[serde(rename = "qr")]
+    pub relay_reason: Option<u32>,
+    #[serde(rename = "qids")]
+    pub relay_ids_session_id: Option<Data>,
+    #[serde(rename = "qgid")]
+    pub relay_group_id: Option<String>,
+    #[serde(rename = "qgmc")]
+    pub relay_group_member_count: Option<u32>,
+    #[serde(rename = "qai")]
+    pub relay_topic: Option<String>,
+    #[serde(rename = "qat")]
+    pub relay_request_type: Option<u32>,
+    #[serde(rename = "qv")]
+    pub relay_version: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -751,6 +882,7 @@ struct InnerSendJob {
     pub message: IDSSendMessage,
     pub status: tokio::sync::broadcast::Sender<(DeliveryHandle, SendResult)>,
     pub topic: &'static str,
+    pub sent_timestamp: u64,
 }
 
 impl InnerSendJob {
@@ -786,30 +918,44 @@ impl InnerSendJob {
 
         let msg_id = rand::thread_rng().next_u32();
         let uuid = Uuid::from_str(&message.id).unwrap().as_bytes().to_vec();
+        let is_relay_message = message.relay.is_some();
+        let apns_topic = if is_relay_message {
+            "com.apple.private.alloy.quickrelay"
+        } else {
+            self.topic
+        };
         debug!("send_uuid {}", encode_hex(&uuid));
         for (batch, group) in groups.into_iter().enumerate() {
             let complete = SendMessage {
-                batch: batch as u8 + 1,
+                batch: if is_relay_message { Some(batch as u8 + 1) } else { None },
                 command: message.command,
                 encryption: if message.raw.is_some() { Some("pair".to_string()) } else { None },
                 user_agent: self.user_agent.clone(),
-                v: 8,
+                v: if is_relay_message { Some(8) } else { None },
                 message_id: msg_id,
                 uuid: uuid.clone().into(),
                 payloads: group,
                 sender: message.sender.clone(),
-                ex: message.ex,
                 no_response: if message.no_response { Some(true) } else { None },
                 retry_count: if retry_count != 0 { Some(retry_count) } else { None },
-                original_epoch_nanos: if retry_count != 0 { Some(message.sent_timestamp * 1000000) } else { None },
-                response_for: message.response_for.clone().map(|i| i.into()),
+                original_epoch_nanos: if retry_count != 0 { Some(self.sent_timestamp * 1000000) } else { None },
                 deliver_message_time: message.scheduled_ms,
                 send_version: if message.queue_id.is_some() { Some(1) } else { None },
                 queue_id: message.queue_id.clone(),
+                relay_reason: message.relay.as_ref().map(|relay| relay.reason),
+                relay_ids_session_id: message.relay.as_ref().map(|relay| Uuid::from_str(&relay.group_id).expect("bad guid").into_bytes().to_vec().into()),
+                relay_group_id: message.relay.as_ref().map(|relay| relay.group_id.clone()),
+                relay_group_member_count: message.relay.as_ref().map(|relay| relay.member_count),
+                relay_topic: if is_relay_message { Some(self.topic.to_string()) } else { None },
+                relay_request_type: message.relay.as_ref().map(|relay| relay.request_type),
+                relay_version: if is_relay_message { Some(25) } else { None },
             };
 
-            let binary = plist_to_bin(&complete)?;
-            self.conn.send_message(&self.topic, binary, Some(msg_id)).await?
+            let mut value = plist::to_value(&complete)?;
+            value.as_dictionary_mut().expect("Not a dictionary?").extend(message.extras.clone());
+
+            let binary = plist_to_bin(&value)?;
+            self.conn.send_message(apns_topic, binary, Some(msg_id)).await?
         }
 
         if !message.no_response {
@@ -819,7 +965,7 @@ impl InnerSendJob {
             info!("payload {payloads_cnt}");
 
             while !remain_targets.is_empty() {
-                let filter_list = &[self.topic];
+                let filter_list = &[apns_topic];
                 let filter = get_message(|load| {
                     debug!("got {:?}", load);
                     let result: IDSRecvMessage = plist::from_value(&load).ok()?;
@@ -834,7 +980,13 @@ impl InnerSendJob {
                     self.conn.wait_for(&mut messages, filter)).await else {
                     break;
                 };
-                let load = msg?;
+                let load: IDSRecvMessage = msg?;
+
+                if is_relay_message {
+                    remain_targets.clear();
+                    refresh_targets.clear();
+                    break; // we only need once
+                }
 
                 let Some(target_idx) = remain_targets.iter().position(|target| Some(&target.delivery_data.push_token) == load.token.as_ref()) else { continue };
                 match load.status.unwrap() {

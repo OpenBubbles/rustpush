@@ -4,7 +4,7 @@ use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromSt
 
 use log::{debug, error, info, warn};
 use openssl::{sha::sha256, symm::{Cipher, Crypter}};
-use plist::{Data, Value};
+use plist::{Data, Dictionary, Value};
 use regex::Regex;
 use uuid::Uuid;
 use rand::Rng;
@@ -1673,18 +1673,22 @@ impl MessageInst {
             }
         }
 
+        let mut extras = Dictionary::new();
+        if let Some(ex) = self.get_ex() {
+            extras.insert("eX".to_string(), Value::Integer(ex.into()));
+        }
+
         Ok(IDSSendMessage {
             sender: self.sender.as_ref().unwrap().to_string(),
             raw: if self.has_payload() { Some(self.to_raw(&my_handles, apns, schedule).await?) } else { None },
             send_delivered: self.send_delivered,
             command: self.message.get_c(),
-            ex: self.get_ex(),
             no_response: self.message.get_nr() == Some(true),
             id: self.id.clone(),
-            sent_timestamp: self.sent_timestamp,
-            response_for: None,
             scheduled_ms: if schedule { self.message.scheduled_ms() } else { None },
             queue_id: if schedule && self.is_queued() { Some(self.queue_id()) } else { None },
+            relay: None,
+            extras: extras,
         })
     }
 

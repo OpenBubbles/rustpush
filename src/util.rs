@@ -14,6 +14,7 @@ use openssl::pkey::{Private, Public};
 use openssl::rsa::Rsa;
 use plist::{Data, Dictionary, Error, Uid, Value};
 use base64::Engine;
+use prost::Message;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
 use serde::de::value;
@@ -70,7 +71,7 @@ fn build_proxy() -> Client {
 
     reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://192.168.86.25:8080").unwrap())
+        .proxy(Proxy::https("https://192.168.0.200:8080").unwrap())
         .default_headers(headers)
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true)
@@ -79,7 +80,6 @@ fn build_proxy() -> Client {
 
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
-    // return build_proxy();
     let certificates = vec![
         Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
@@ -149,6 +149,47 @@ where
     use serde::de::Error;
     let s: Data = Deserialize::deserialize(d)?;
     Rsa::private_key_from_der(s.as_ref()).map_err(Error::custom)
+}
+
+pub fn proto_serialize<S, T>(x: &T, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Message,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.encode_to_vec())
+}
+
+pub fn proto_deserialize<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Message + Default,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)
+}
+
+pub fn proto_serialize_opt<S, T>(x: &Option<T>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Message,
+{
+    x.as_ref().map(|a| Data::new(a.encode_to_vec())).serialize(s)
+}
+
+pub fn proto_deserialize_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Message + Default,
+{
+    use serde::de::Error;
+    let s: Option<Data> = Deserialize::deserialize(d)?;
+    Ok(if let Some(s) = s {
+        Some(T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)?)
+    } else {
+        None
+    })
 }
 
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>

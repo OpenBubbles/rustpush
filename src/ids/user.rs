@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher
 use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
 use hkdf::Hkdf;
 use log::{debug, error, info, warn};
-use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey}, encrypt::{Decrypter, Encrypter}, error::ErrorStack, hash::MessageDigest, md::Md, nid::Nid, pkey::{HasPublic, Id, PKey, Private, Public}, pkey_ctx::PkeyCtx, rsa::{self, Padding, Rsa}, sha::sha256, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}, x509::X509};
+use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, encrypt::{Decrypter, Encrypter}, error::ErrorStack, hash::MessageDigest, md::Md, nid::Nid, pkey::{HasPublic, Id, PKey, Private, Public}, pkey_ctx::PkeyCtx, rsa::{self, Padding, Rsa}, sha::sha256, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}, x509::X509};
 use plist::{Data, Dictionary, Value};
 use prost::Message;
 use rasn::{AsnType, Decode, Encode};
@@ -18,7 +18,7 @@ use super::identity_manager::KeyCache;
 use rand::{Rng, RngCore};
 use tokio::sync::Mutex;
 
-use crate::{auth::{KeyType, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
 
 use super::CompactECKey;
 
@@ -127,6 +127,14 @@ impl Serialize for IDSPublicIdentity {
     }
 }
 
+#[derive(DekuRead, DekuWrite)]
+#[deku(endian = "big")]
+struct IDSPublicIdentityKey {
+    #[deku(update = "self.key.len()")]
+    key_len: u16,
+    #[deku(count = "key_len")]
+    key: Vec<u8>,
+}
 
 pub trait IDSIdentity<T>
     where T: HasPublic {
@@ -143,21 +151,19 @@ pub trait IDSIdentity<T>
 
     fn encode_sig(&self) -> Result<Vec<u8>, PushError> {
         let mut ctx = BigNumContext::new().unwrap();
-        let mut x = BigNum::new().unwrap();
-        let mut y = BigNum::new().unwrap();
-        self.signing().public_key().affine_coordinates(&self.signing().group(), &mut x, &mut y, &mut ctx).unwrap();
-        Ok([
-            vec![0x00, 0x41, 0x04],
-            x.to_vec_padded(32).unwrap(),
-            y.to_vec_padded(32).unwrap(),
-        ].concat())
+        let key = self.signing().public_key().to_bytes(&self.signing().group(), PointConversionForm::UNCOMPRESSED, &mut ctx)?;
+        Ok(IDSPublicIdentityKey {
+            key_len: key.len() as u16,
+            key,
+        }.to_bytes()?)
     }
 
     fn encode_enc(&self) -> Result<Vec<u8>, PushError> {
-        Ok([
-            vec![0x00, 0xAC],
-            self.enc().public_key_to_der_pkcs1()?, // TODO is this correct??
-        ].concat())
+        let key = self.enc().public_key_to_der_pkcs1()?;
+        Ok(IDSPublicIdentityKey {
+            key_len: key.len() as u16,
+            key,
+        }.to_bytes()?)
     }
 
     fn encode(&self) -> Result<Vec<u8>, PushError> {
@@ -175,6 +181,7 @@ pub trait IDSIdentity<T>
     }
 }
 
+
 #[derive(AsnType, Encode, Decode)]
 struct IDSPublicIdentityFormat {
     #[rasn(tag(context, 1))]
@@ -187,18 +194,15 @@ impl IDSPublicIdentity {
     fn decode(data: &[u8]) -> Result<IDSPublicIdentity, PushError> {
         let parsed: IDSPublicIdentityFormat = rasn::der::decode(data).unwrap();
 
-        if &parsed.signing_key[..2] != &[0x00, 0x41] {
-            panic!("bad format!");
-        }
+        let (_, signing_key) = IDSPublicIdentityKey::from_bytes((&parsed.signing_key, 0))?;
 
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-        let ec_key = EcKey::from_public_key_affine_coordinates(&group, BigNum::from_slice(&parsed.signing_key[3..35])?.as_ref(), BigNum::from_slice(&parsed.signing_key[35..67])?.as_ref())?;
+        let mut bignumctx = BigNumContext::new()?;
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
+        let ec_point = EcPoint::from_bytes(&group, &signing_key.key, &mut bignumctx)?;
+        let ec_key = EcKey::from_public_key(&group, &ec_point)?;
 
-        if &parsed.encryption_key[..2] != &[0x00, 0xAC] {
-            panic!("bad format!");
-        }
-
-        let rsa_key = Rsa::public_key_from_der_pkcs1(&parsed.encryption_key[2..])?;
+        let (_, encryption_key) = IDSPublicIdentityKey::from_bytes((&parsed.encryption_key, 0))?;
+        let rsa_key = Rsa::public_key_from_der_pkcs1(&encryption_key.key)?;
 
         Ok(IDSPublicIdentity {
             signing_key: ec_key,
@@ -498,7 +502,7 @@ impl IDSNGMIdentity {
 
         let inner = idsp::InnerMessage::decode(&mut Cursor::new(&message))?;
 
-        info!("Counter {}", inner.counter);
+        info!("Counter {}", inner.counter.unwrap_or(u32::MAX));
 
         Ok(inner.message)
     }
@@ -525,17 +529,20 @@ impl IDSNGMIdentity {
         cache_lock.save();
         drop(cache_lock);
 
-        let padding_bytes = body.len().wrapping_neg() % 16;
+        info!("Sending counter {my_counter}");
+
+        let mut message = idsp::InnerMessage {
+            message: body.to_vec(),
+            counter: Some(my_counter),
+            kt_gossip_data: vec![],
+            debug_info: vec![],
+        }.encode_to_vec();
+        
+        let padding_bytes = message.len().wrapping_neg() % 16;
         let mut padding = vec![0u8; padding_bytes];
         rand::thread_rng().fill_bytes(&mut padding);
         padding.extend_from_slice(&(padding_bytes as u32).to_le_bytes());
 
-        let mut message = idsp::InnerMessage {
-            message: body.to_vec(),
-            counter: my_counter,
-            kt_gossip_data: vec![],
-            debug_info: vec![],
-        }.encode_to_vec();
         message.extend(padding);
 
         let ephermeral_key = CompactECKey::new()?;
@@ -635,7 +642,6 @@ where
 {
     let s: Option<Data> = Deserialize::deserialize(d)?;
     let Some(s) = s else { return Ok(None) };
-    println!("kt data {}", encode_hex(s.as_ref()));
     let decoded = idsp::KtLoggableData::decode(&mut Cursor::new(s.as_ref())).map_err(de::Error::custom)?;
 
     let Some(identity) = decoded.device_identity.and_then(|i| i.public_key) else { return Ok(None) };
@@ -697,13 +703,83 @@ impl QueryOptions {
 
 impl IDSUser {
 
-    fn base_request(&self, aps: &APSState, bag: &'static str) -> Result<SignedRequest, PushError> {
+    fn base_request(&self, aps: &APSState, bag: &'static str) -> Result<SignedRequest<Signed>, PushError> {
         Ok(SignedRequest::new(bag, Method::GET)
             .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header("x-auth-user-id", &self.user_id)
             .sign(&self.auth_keypair, KeyType::Auth, aps, None)?
             .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?)
+    }
+
+    pub async fn provision_alias(&self,
+            config: &dyn OSConfig,
+            aps: &APSState, 
+            handle: &str, 
+            services: HashMap<&'static str, Vec<&'static str>>, 
+            alias: &mut Option<String>,
+            feature: &'static str,
+            operation: &'static str,
+            expiry_seconds: f64) -> Result<(), PushError> {
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ProvisionAttributes {
+            allowed_services: HashMap<&'static str, Vec<&'static str>>,
+            #[serde(rename = "expiry-epoch-seconds")]
+            expiry_epoch_seconds: f64,
+            feature_id: &'static str,
+        }
+        
+        #[derive(Serialize)]
+        struct ProvisionRequest {
+            alias: Option<String>,
+            attributes: ProvisionAttributes,
+            operation: &'static str
+        }
+
+        let body = ProvisionRequest {
+            alias: alias.clone(),
+            attributes: ProvisionAttributes {
+                allowed_services: services.clone(),
+                expiry_epoch_seconds: expiry_seconds,
+                feature_id: feature,
+            },
+            operation,
+        };
+
+        let mut request = SignedRequest::new("id-provision-alias", Method::POST)
+            .header("x-id-self-uri", handle)
+            .header("content-type", "application/x-apple-plist")
+            .header("x-protocol-version", &self.protocol_version.to_string())
+            .header("content-encoding", "gzip")
+            .header("accept-encoding", "gzip")
+            .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
+            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .body(gzip_normal(&plist_to_buf(&body)?)?)
+            .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
+
+        for topic in services.keys() {
+            request = request.sign(&self.registration[*topic].id_keypair, KeyType::Id, aps, None)?;
+        }
+        
+        let bytes = request
+            .send(&REQWEST).await?
+            .bytes().await?;
+
+        #[derive(Deserialize)]
+        struct AliasResult {
+            alias: String,
+            status: u32,
+        }
+
+        let parsed: AliasResult = plist::from_bytes(&bytes)?;
+        *alias = Some(parsed.alias);
+        if parsed.status != 0 {
+            return Err(PushError::AliasError(parsed.status))
+        }
+
+        Ok(())
     }
 
     pub async fn get_possible_handles(&self, aps: &APSState) -> Result<Vec<String>, PushError> {

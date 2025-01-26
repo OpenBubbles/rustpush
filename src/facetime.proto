@@ -1,0 +1,213 @@
+syntax = "proto3";
+
+package facetimep;
+
+enum ConversationMessageType {
+    Unknown = 0;
+    Invitation = 1;
+    Upgrade = 2;
+    AddMember = 3;
+    ResendAVCBlobRequest = 4;
+    ResendAVCBlobResponse = 5;
+    RespondedElsewhere = 6;
+    RequestShareScreen = 7;
+    AddActivitySession = 8;
+    Decline = 9;
+    LetMeInRequest = 10;
+    LinkCreated = 11;
+    NicknameUpdated = 12;
+    EncryptedMessage = 13;
+    LetMeInDelegation = 14;
+    LetMeInDelegationResponse = 15;
+    LetMeInResponse = 16;
+    RemoveMember = 19;
+    UnicastConnector = 20;
+    RemoveActivitySession = 21;
+    RequestVideoUpgrade = 22;
+    UpdateActivity = 23;
+    LinkInvalidated = 24;
+    AddLightweightMember = 25;
+    LinkChanged = 26;
+    UpdateActivityImage = 27;
+    GuestModeUpdated = 28;
+    Endorse = 29;
+    AddHighlight = 30;
+}
+
+enum HandleType {
+    None = 0;
+    Generic = 1;
+    PhoneNumber = 2;
+    EmailAddress = 3;
+}
+
+message Handle {
+    HandleType type = 1;
+    string value = 2;
+    string normalizedValue = 3;
+    string isoCountryCode = 4;
+}
+
+message ConversationMember {
+    uint32 version = 1;
+    Handle handle = 2;
+    optional string nickname = 3;
+    Handle lightweightPrimary = 4;
+    uint64 lightweightPrimaryParticipantID = 5;
+    int32 validationSource = 6;
+}
+
+message ConversationParticipantAssociation {
+    uint32 version = 1;
+    uint64 identifier = 2;
+    string avcIdentifier = 3;
+}
+
+message ConversationParticipant {
+    uint32 version = 1;
+    uint64 identifier = 2;
+    Handle handle = 3;
+    bytes avcData = 4;
+    optional bool isMomentsAvailable = 5;
+    optional bool isScreenSharingAvailable = 6;
+    optional bool isGondolaCallingAvailable = 7;
+    optional bool isMirageAvailable = 8;
+    optional bool isLightweight = 9;
+    uint32 sharePlayProtocolVersion = 10;
+    uint32 options = 11;
+    optional bool isGFTDowngradeToOneToOneAvailable = 12;
+    optional bool guestModeEnabled = 13;
+    ConversationParticipantAssociation association = 14;
+    optional bool isUPlusNDowngradeAvailable = 15;
+}
+
+message ConversationActivityContext {
+    string contextIdentifier = 1;
+    string actionDescription = 2;
+    string ongoingDescription = 3;
+    string completedDescription = 4;
+}
+
+message ConversationParticipantDidJoinContext {
+    uint32 version = 1;
+    repeated ConversationMember members = 2;
+    ConversationMessage message = 3;
+    string messagesGroupUUIDString = 4;
+    string messagesGroupName = 5;
+    bool isMomentsAvailable = 6;
+    ConversationActivitySession activitySession = 7;
+    optional bool video = 8;
+    bool isScreenSharingAvailable = 9;
+    string providerIdentifier = 10;
+    repeated Handle otherInvitedHandles = 11;
+    bool isMirageAvailable = 12;
+    repeated ConversationMember lightweightMembers = 13;
+    bool isLightweight = 14;
+    bool isGondolaCallingAvailable = 15;
+    optional bool videoEnabled = 16;
+    uint32 sharePlayProtocolVersion = 17;
+    optional bool isGFTDowngradeToOneToOneAvailable = 18;
+    ConversationParticipantAssociation participantAssociation = 19;
+    optional bool isUPlusNDowngradeAvailable = 20;
+    optional uint32 avMode = 21;
+    optional bool isUPlusOneAVLessAvailable = 25;
+}
+
+message ConversationActivity {
+    string identifierUUIDString = 1;
+    bytes applicationContext = 2;
+    string bundleIdentifier = 3;
+    string activityIdentifier = 4;
+    bytes metadata = 5;
+    ConversationActivityContext activityContext = 7;
+    Handle originatorHandle = 8;
+    double updatedDateEpochTime = 9;
+    string fallbackApplicationName = 10;
+    ConversationActivityMetadata activityMetadata = 11;
+    bool isSystemActivity = 12;
+}
+
+message ConversationActivityMetadata {
+    string fallbackURL = 1;
+    bool supportsContinuationOnTV = 2;
+    string title = 3;
+    string subtitle = 4;
+    bytes image = 5;
+    uint32 preferredBroadcastingAttributes = 6;
+}
+
+message ConversationActivitySession {
+    string identifierUUIDString = 1;
+    ConversationActivity activity = 2;
+    double creationDateEpochTime = 3;
+}
+
+enum ConversationLinkLifetimeScope {
+    Indefinite = 0;
+    CallDuration = 1;
+}
+
+message ConversationLinkGeneratorDescriptor {
+    string generatorID = 1;
+    uint32 generatorVersion = 2;
+}
+
+message ConversationLink {
+    string pseudonym = 1;
+    bytes publicKey = 2;
+    bytes privateKey = 3;
+    repeated Handle invitedHandles = 4;
+    double creationDateEpochTime = 5;
+    string groupUUIDString = 6;
+    Handle originatorHandle = 7;
+    double pseudonymExpirationDateEpochTime = 8;
+    bool isActivated = 9;
+    ConversationLinkGeneratorDescriptor generatorDescriptor = 10;
+    string linkName = 11;
+    ConversationLinkLifetimeScope linkLifetimeScope = 12;
+}
+
+message ConversationReport {
+    string conversationID = 1;
+    double timebase = 2;
+}
+
+message EncryptedConversationMessage {
+    bytes publicKey = 1;
+    bytes conversationMessageBytes = 2;
+}
+
+message ConversationInvitationPreference {
+    uint32 version = 1;
+    HandleType handleType = 2;
+    uint32 notificationStyles = 3;
+}
+
+message ConversationMessage {
+    uint32 version = 1;
+    ConversationMessageType type = 2;
+    bool shouldSuppressInCallUI = 3;
+    repeated ConversationParticipant activeParticipants = 4;
+    string conversationGroupUUIDString = 5;
+    repeated ConversationMember addedMembers = 6;
+    uint32 disconnectedReason = 7;
+    string protoUpgradeSessionUUID = 8;
+    repeated ConversationActivitySession activitySessions = 9;
+    optional string nickname = 10;
+    ConversationLink link = 11;
+    ConversationReport reportData = 12;
+    optional bool isLetMeInApproved = 13;
+    EncryptedConversationMessage encryptedMessage = 14;
+    string letMeInDelegationHandle = 15;
+    string letMeInDelegationUUID = 16;
+    ConversationMessageType enclosedEncryptedType = 17;
+    repeated ConversationInvitationPreference invitationPreferences = 19;
+    repeated ConversationMember removedMembers = 20;
+    bytes unicastConnectorBlob = 21;
+    repeated ConversationMember lightweightMembers = 22;
+    repeated ConversationParticipant activeLightweightParticipants = 23;
+    bool guestModeEnabled = 24;
+    string highlightIdentifier = 25;
+    optional int32 avMode = 28;
+}
+

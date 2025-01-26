@@ -99,26 +99,25 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
     pub async fn handle(&self, msg: APSMessage) -> Result<(), PushError> {
         if let Some(IDSRecvMessage { message_unenc: Some(message), topic, token: Some(token), target: Some(target), sender: Some(sender), uuid: Some(uuid), .. }) = self.identity.receive_message(msg, &["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"]).await? {
-            let parsed: FMFPayload = plist::from_value(&message)?;
+            let parsed: FMFPayload = message.plist()?;
             debug!("Find my IDS message came in as {}", encode_hex(&uuid));
             match parsed {
                 FMFPayload::MappingPacket { p } => {
-                    let since_the_epoch = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .expect("Time went backwards");
                     let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender], &[MessageTarget::Token(token)])?;
-                    self.identity.send_message(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"].into_iter().find(|i| i == &topic).unwrap(), IDSSendMessage {
+                    self.identity.send_message(topic, IDSSendMessage {
                         sender: target,
                         raw: None,
                         send_delivered: false,
                         command: 244,
-                        ex: None,
                         no_response: true,
                         id: Uuid::new_v4().to_string().to_uppercase(),
-                        sent_timestamp: since_the_epoch.as_millis() as u64,
-                        response_for: Some(uuid),
                         scheduled_ms: None,
-                        queue_id: None
+                        queue_id: None,
+                        relay: None,
+                        extras: Dictionary::from_iter([
+                            // response for
+                            ("rI".to_string(), Value::Data(uuid.to_vec()))
+                        ]),
                     }, targets).await?;
 
                     debug!("Importing find my token {p}!");
