@@ -178,16 +178,37 @@ pub struct FTSession {
     #[serde(skip)]
     pub is_ringing_inaccurate: bool,
     pub mode: Option<FTMode>,
+    #[serde(skip)]
+    pub recent_member_adds: HashMap<String, u64>,
 }
 
+// time to track recently added members
+const RECENT_MEMBER_TRACK_TIME: Duration = Duration::from_secs(15);
+
 impl FTSession {
-    fn unpack_members(&mut self, members: &[ConversationMember]) {
-        self.members.clear();
-        self.new_members(members);
+
+    fn prune_recent_members(&mut self) {
+        let sweep_time = duration_since_epoch();
+        self.recent_member_adds.retain(|_, ms| Duration::from_millis(*ms) + RECENT_MEMBER_TRACK_TIME > sweep_time);
+    }
+
+    // returns recently added members that were excluded from this message
+    // so the caller knows who may have been cut off from a state change
+    fn unpack_members(&mut self, members: &[ConversationMember]) -> Vec<FTMember> {
+        self.prune_recent_members();
+
+        let stand_up_for = self.members.iter().filter(|a| self.recent_member_adds.contains_key(&a.handle) 
+            && !members.iter().any(|i| handle_to_ids(i.handle.as_ref().expect("No handle?")) == a.handle))
+            .cloned().collect::<Vec<_>>();
+
+        // don't remove members that were recently added
+        self.members.retain(|a| stand_up_for.contains(a));
+        self.new_members(&members);
         // remove extraneous participants
         self.participants.retain(|a, p| {
             self.members.iter().any(|member| member.handle == p.handle)
         });
+        stand_up_for
     }
 
     fn get_participant(&self, token: [u8; 32]) -> Option<&FTParticipant> {
@@ -222,7 +243,7 @@ impl FTSession {
         removed_members
     }
 
-    fn unpack_participants(&mut self, participants: &[ConversationParticipant]) {
+    fn unpack_participants(&mut self, participants: &[ConversationParticipant], token: &[u8]) {
         for participant in self.participants.values_mut() {
             participant.active = None;
         }
@@ -230,7 +251,10 @@ impl FTSession {
             let ftparticipant = self.participants.entry(participant.identifier.to_string()).or_default();
             ftparticipant.handle = handle_to_ids(participant.handle.as_ref().expect("No handle?"));
             ftparticipant.participant_id = participant.identifier;
-            ftparticipant.active = Some(participant.clone());
+            // don't let other participants tell us whether we are active or not
+            if Some(base64_encode(&token)) != ftparticipant.token {
+                ftparticipant.active = Some(participant.clone());                
+            }
         }
     }
 }
@@ -557,6 +581,7 @@ impl FTClient {
             is_propped: false,
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
+            recent_member_adds: HashMap::new(),
         };
 
         let mut my_session = self.state.write().await;
@@ -588,10 +613,10 @@ impl FTClient {
         Ok(())
     }
 
-    pub async fn update_conversation(&self, session: &mut FTSession, join_type: u32, message: ConversationMessage, new_members: &HashSet<FTMember>) -> Result<(), PushError> {
+    pub async fn update_conversation(&self, session: &mut FTSession, join_type: u32, message: ConversationMessage, before_members: &HashSet<FTMember>, to_people: &[String]) -> Result<(), PushError> {
 
         let mut update_context = ConversationParticipantDidJoinContext::default();
-        update_context.members = session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
+        update_context.members = before_members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
         update_context.message = Some(message);
         update_context.is_screen_sharing_available = true;
         update_context.is_gondola_calling_available = true;
@@ -609,7 +634,7 @@ impl FTClient {
             client_context_data_key: Some(update_context.encode_to_vec().into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
             is_initiator_key: Some(is_initiator),
-            fanout_groupmembers: Some(new_members.iter().map(|a| a.handle.clone()).collect()),
+            fanout_groupmembers: Some(to_people.to_vec()),
             is_u_plus_one_key: Some(is_u_plus_one),
             join_notification_key: Some(join_type),
             participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
@@ -620,23 +645,22 @@ impl FTClient {
         };
 
 
-        let relevant_people: Vec<String> = new_members.union(&session.members).map(|m| m.handle.clone()).collect();
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity.cache_keys(
             topic,
-            &relevant_people,
+            to_people,
             &handle,
             false,
             &QueryOptions { required_for_message: true, result_expected: true }
         ).await?;
 
-        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
+        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, to_people);
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
             raw: Some(plist_to_bin(&wire_message)?),
             send_delivered: false,
-            command: 208,
+            command: 209,
             no_response: false,
             id: Uuid::new_v4().to_string().to_uppercase(),
             scheduled_ms: None,
@@ -826,24 +850,31 @@ impl FTClient {
                 ("H", Value::Integer(3.into())),
             ]),
         }, targets).await?;
+
+        let base64_encoded = Some(base64_encode(&self.conn.get_token().await));
+        let my_participant = session.participants.values_mut().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?;
+        my_participant.active = None; // we left, remember?
+
         session.is_propped = false;
         Ok(())
     }
 
-    pub async fn add_members(&self, session: &mut FTSession, mut new_members: Vec<FTMember>, letmein: bool) -> Result<(), PushError> {
-        new_members.retain(|member| {
-            !session.members.iter().any(|m| &m.handle == &member.handle)
-        });
-        if new_members.is_empty() {
-            warn!("(add_members) all new members already in call!");
-            return Ok(())
+    pub async fn add_members(&self, session: &mut FTSession, mut new_members: Vec<FTMember>, letmein: bool, to_members: Option<Vec<String>>) -> Result<(), PushError> {
+        // if to_members is some this is a re-broadcast and they will already be in the call
+        if to_members.is_none() {
+            new_members.retain(|member| {
+                !session.members.iter().any(|m| &m.handle == &member.handle)
+            });
+            if new_members.is_empty() {
+                warn!("(add_members) all new members already in call!");
+                return Ok(())
+            }
         }
+
+        info!("Adding members {new_members:?} for session {}", session.group_id);
 
         // make sure we have quickrelay ids for our new guest!
         self.ensure_allocations(session, &new_members).await?;
-
-
-
 
         let mut message = ConversationMessage::default();
         message.set_type(ConversationMessageType::AddMember);
@@ -859,12 +890,27 @@ impl FTClient {
             ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
         ];
 
-        let mut new = session.members.clone();
-        new.extend(new_members);
-        
-        self.update_conversation(session, 3, message, &new).await?;
+        let mut all_members_inclusive = session.members.clone();
+        all_members_inclusive.extend(new_members.clone());
 
-        session.members = new;
+        let to_members = if let Some(members) = to_members {
+            members
+        } else {
+            all_members_inclusive.clone().into_iter().map(|a| a.handle).collect()
+        };
+
+        let mut before_members = session.members.clone();
+        before_members.retain(|m| !new_members.contains(m));
+        
+        self.update_conversation(session, 3, message, &before_members, &to_members).await?;
+
+        
+        let added_time = duration_since_epoch().as_millis() as u64;
+        for new_member in new_members {
+            session.recent_member_adds.insert(new_member.handle, added_time);
+        }
+
+        session.members = all_members_inclusive;
         Ok(())
     }
 
@@ -881,9 +927,9 @@ impl FTClient {
 
 
         let mut new = session.members.clone();
-        new.retain(|x| !remove.contains(x));
+        let new_members = session.members.iter().map(|m| m.handle.clone()).collect::<Vec<_>>();
         
-        self.update_conversation(session, 3, message, &new).await?;
+        self.update_conversation(session, 3, message, &new, &new_members).await?;
 
         session.members = new;
         Ok(())
@@ -1047,7 +1093,7 @@ impl FTClient {
         if session.members.contains(&member) {
             self.ring(session, &[letmein.requestor.clone()], true).await?;
         } else {
-            self.add_members(session, vec![member], true).await?;
+            self.add_members(session, vec![member], true, None).await?;
             (self.update_state)(&state);
         }
         Ok(())
@@ -1232,7 +1278,7 @@ impl FTClient {
                 (209, Some(context), meta, _) => {
                     info!("Group Updated!");
                     let decoded_context = ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context.as_ref()))?;
-                    session.unpack_members(&decoded_context.members);
+                    let stand_up_for = session.unpack_members(&decoded_context.members);
 
                     let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
                     if let Some(link) = &message.link {
@@ -1242,11 +1288,19 @@ impl FTClient {
                         session.report_id = report.conversation_id.clone();
                         session.start_time = Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
                     }
-                    session.unpack_participants(&message.active_participants);
+                    session.unpack_participants(&message.active_participants, &self.conn.get_token().await);
                     let result: Option<FTMessage> = match message.r#type() {
                         ConversationMessageType::AddMember => {
                             info!("Added a member!");
                             let new = session.new_members(&message.added_members);
+
+                            if !stand_up_for.is_empty() {
+                                info!("Standing up for {:?} to {:?}", stand_up_for, new);
+                                // if some members we recently added were left out of this state change, we must tell
+                                // the new member that these members *do* exist and should be included in the session
+                                self.add_members(session, stand_up_for, false, Some(new.iter().map(|a| a.handle.clone()).collect())).await?;
+                            }
+
                             // if we were added, ring
                             let ring = new.iter().any(|i| session.my_handles.contains(&i.handle));
                             session.mode = Some(FTMode::Incoming);
