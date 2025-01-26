@@ -177,6 +177,7 @@ pub struct FTSession {
     #[serde(skip)]
     pub is_propped: bool,
     // WARNING: this value may not accurately represent state. It's just used as a temporary store to see if we need to prop it up
+    // also represents ringing from other (our) devices
     #[serde(skip)]
     pub is_ringing_inaccurate: bool,
     pub mode: Option<FTMode>,
@@ -1178,8 +1179,7 @@ impl FTClient {
                         session.start_time = Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
                     }
 
-                    let is_ringing = message.r#type() == ConversationMessageType::Invitation && sender != target;
-                    session.is_ringing_inaccurate = is_ringing;
+                    session.is_ringing_inaccurate = message.r#type() == ConversationMessageType::Invitation;
 
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
@@ -1216,8 +1216,12 @@ impl FTClient {
                         self.unprop_conv(session).await?;
                     }
 
-                    if is_ringing {
-                        session.mode = Some(FTMode::Incoming)
+                    if message.r#type() == ConversationMessageType::Invitation {
+                        if sender != target {
+                            session.mode = Some(FTMode::Incoming)
+                        } else {
+                            session.mode = Some(FTMode::Outgoing)
+                        }
                     }
 
                     let guid = session.group_id.clone();
@@ -1229,7 +1233,7 @@ impl FTClient {
                         guid,
                         participant: participant.into(),
                         handle: sender.clone(),
-                        ring: is_ringing,
+                        ring: message.r#type() == ConversationMessageType::Invitation && sender != target,
                     })
                 },
                 (209, Some(context), meta, _) => {
@@ -1294,7 +1298,11 @@ impl FTClient {
 
                     if session.participants.values().all(|a| a.active.is_none()) {
                         if session.is_ringing_inaccurate {
-                            session.mode = Some(FTMode::Missed);
+                            if sender == target {
+                                session.mode = Some(FTMode::MissedOutgoing);
+                            } else {
+                                session.mode = Some(FTMode::Missed);
+                            }
                         }
                         session.is_ringing_inaccurate = false;
                     }
