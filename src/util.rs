@@ -420,7 +420,7 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
 
 
 pub trait Resource: Send + Sync + Sized {
-    // resolve when resource is done
+    // resolve when resource is done, on a timeout of RESOURCE_GENERATE_TIMEOUT (currently 5 minutes)
     fn generate(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send;
 
     fn generate_unwind_safe(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send {
@@ -488,6 +488,8 @@ impl Display for ResourceFailure {
     }
 }
 
+// 5 minutes timeout, in case of deadlock
+const RESOURCE_GENERATE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub enum ResourceState {
@@ -543,7 +545,9 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let mut backoff = backoff.build();
                 loop_manager.resource_state.send_replace(ResourceState::Generating);
                 debug!("Resource {}: generating", loop_manager.name);
-                let mut result = loop_manager.resource.generate_unwind_safe().await;
+                let mut result = tokio::time::timeout(RESOURCE_GENERATE_TIMEOUT, 
+                loop_manager.resource.generate_unwind_safe()).await
+                    .map_err(|e| PushError::ResourceGenTimeout(e)).and_then(|e| e);
                 debug!("Resource {}: finished_generate", loop_manager.name);
                 while let Err(e) = result {
                     debug!("Resource {} {e}", loop_manager.name);

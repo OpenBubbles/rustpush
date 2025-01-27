@@ -6,7 +6,7 @@ use omnisette::AnisetteError;
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
-use tokio::sync::{broadcast::{self, error::SendError}, Mutex};
+use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Elapsed};
 
 use crate::{aps::APSMessage, ids::user::SupportAlert, util::ResourceFailure};
 
@@ -121,4 +121,6 @@ pub enum PushError {
     NoHandle,
     #[error("NoParticipantTokenIndex")]
     NoParticipantTokenIndex,
+    #[error("Resource generate timeout {0}")]
+    ResourceGenTimeout(Elapsed),
 }

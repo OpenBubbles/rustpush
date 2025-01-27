@@ -3,7 +3,7 @@ use std::{borrow::BorrowMut, cmp::min, collections::HashMap, io::Cursor, net::To
 
 use backon::ExponentialBuilder;
 use deku::prelude::*;
-use log::{debug, error};
+use log::{debug, error, info};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer};
 use plist::Value;
 use rand::{Rng, RngCore};
@@ -299,6 +299,7 @@ async fn open_socket() -> Result<TlsStream<TcpStream>, PushError> {
 
 impl Resource for APSConnectionResource {
     async fn generate(self: &Arc<Self>) -> Result<JoinHandle<()>, PushError> {
+        info!("Generating APS");
         let socket = match open_socket().await {
             Ok(e) => e,
             Err(err) => {
@@ -306,13 +307,17 @@ impl Resource for APSConnectionResource {
                 return Err(err);
             }
         };
+        info!("Generating Opened socket");
 
         let (read, write) = split(socket);
 
         let (send, _) = tokio::sync::broadcast::channel(999);
         *self.messages.write().await = Some(send.clone());
+        info!("Locked messages");
         *self.socket.lock().await = Some(write);
+        info!("Locked socket");
         *self.reader.lock().await = Some(read);
+        info!("Locked reader");
 
         let maintenance_self = self.clone();
         let maintenence_handle = task::spawn(async move {
@@ -429,9 +434,12 @@ impl APSConnectionResource {
     }
 
     async fn do_connect(self: &Arc<Self>) -> Result<(), PushError> {
+        info!("Locking state");
         let mut state = self.state.write().await;
+        info!("Locked state");
 
         if state.keypair.is_none() {
+            info!("Activating");
             state.keypair = Some(activate(self.os_config.as_ref()).await?);
         }
         let pair = state.keypair.as_ref().unwrap();
@@ -439,7 +447,9 @@ impl APSConnectionResource {
         let nonce = generate_nonce(NonceType::APNS);
         let signature = do_signature(&PKey::private_key_from_der(&pair.private).unwrap(), &nonce)?;
 
+        info!("Subscribing APS");
         let recv = self.subscribe().await;
+        info!("Sending");
         self.send(APSMessage::Connect {
             flags: 0b01000001,
             certificate: pair.cert.clone(),
@@ -448,6 +458,7 @@ impl APSConnectionResource {
             token: state.token.clone(),
         }).await?;
 
+        info!("Waiting for connect response");
         let (token, status) = 
             self.wait_for_timeout(recv, |msg| if let APSMessage::ConnectResponse { token, status } = msg { Some((token, status)) } else { None }).await?;
         
@@ -462,8 +473,11 @@ impl APSConnectionResource {
         }
 
         drop(state);
+        info!("Sending");
         self.send(APSMessage::SetState { state: 1 }).await?;
+        info!("Updating topics");
         self.update_topics(&mut *self.topics.lock().await).await?; // not much we can do
+        info!("Updated");
 
         Ok(())
     }
