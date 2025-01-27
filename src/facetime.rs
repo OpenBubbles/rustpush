@@ -320,6 +320,9 @@ pub enum FTMessage {
     Decline {
         guid: String,
     },
+    RespondedElsewhere {
+        guid: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -679,6 +682,28 @@ impl FTClient {
 
     pub async fn prop_up_conv(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
 
+        let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+        // we are picking up a call (the prop isn't to ring, and we are ringing)
+        if !ring && session.is_ringing_inaccurate {
+            let mut message = ConversationMessage::default();
+            message.set_type(ConversationMessageType::RespondedElsewhere);
+            message.conversation_group_uuid_string = session.group_id.clone();
+            message.disconnected_reason = 4; // :shrug:
+
+            let relevant_people = vec![handle.clone()];
+            let topic = "com.apple.private.alloy.facetime.multi";
+            self.identity.cache_keys(
+                topic,
+                &relevant_people,
+                handle,
+                false,
+                &QueryOptions { required_for_message: true, result_expected: true }
+            ).await?;
+
+            let targets = self.identity.cache.lock().await.get_participants_targets(&topic, handle, &relevant_people);
+            self.identity.send_message(topic, send_for_message(handle.clone(), message, None), targets).await?;
+        }
+
         let mut update_context = ConversationParticipantDidJoinContext::default();
         update_context.members = session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
         // update_context.members.push(ConversationMember {});
@@ -737,7 +762,6 @@ impl FTClient {
 
 
         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
-        let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity.cache_keys(
             topic,
@@ -926,7 +950,7 @@ impl FTClient {
         message.removed_members = remove.iter().map(|a| a.to_conversation()).collect();
 
 
-        let mut new = session.members.clone();
+        let new = session.members.clone();
         let new_members = session.members.iter().map(|m| m.handle.clone()).collect::<Vec<_>>();
         
         self.update_conversation(session, 3, message, &new, &new_members).await?;
@@ -1184,6 +1208,14 @@ impl FTClient {
                         (self.update_state)(&state);
                     }
                     Some(FTMessage::Ring { guid: decoded.conversation_group_uuid_string.clone() })
+                },
+                ConversationMessageType::RespondedElsewhere => {
+                    let mut state = self.state.write().await;
+                    if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
+                        session.is_ringing_inaccurate = false;
+                        (self.update_state)(&state);
+                    }
+                    Some(FTMessage::RespondedElsewhere { guid: decoded.conversation_group_uuid_string.clone() })
                 }
                 _type => {
                     warn!("Couldn't handle message type {_type:?}");
