@@ -726,6 +726,12 @@ impl Balloon {
     }
 }
 
+#[derive(Clone)]
+pub struct ScheduleMode {
+    pub ms: u64,
+    pub schedule: bool,
+}
+
 // a "normal" imessage, containing multiple parts and text
 #[repr(C)]
 #[derive(Clone)]
@@ -739,7 +745,7 @@ pub struct NormalMessage {
     pub app: Option<ExtensionApp>,
     pub link_meta: Option<LinkMeta>,
     pub voice: bool,
-    pub scheduled_ms: Option<u64>,
+    pub scheduled: Option<ScheduleMode>,
 }
 
 #[repr(C)]
@@ -765,7 +771,7 @@ impl NormalMessage {
             app: None,
             link_meta: None,
             voice: false,
-            scheduled_ms: None,
+            scheduled: None,
         }
     }
 }
@@ -1392,9 +1398,9 @@ impl Message {
         }
     }
 
-    pub fn scheduled_ms(&self) -> Option<u64> {
+    pub fn ids_scheduled_ms(&self) -> Option<u64> {
         match &self {
-            Message::Message(NormalMessage { scheduled_ms, .. }) => *scheduled_ms,
+            Message::Message(NormalMessage { scheduled: Some(ScheduleMode { ms, schedule: true }), .. }) => Some(*ms),
             _ => None,
         }
     }
@@ -1681,7 +1687,7 @@ impl MessageInst {
             command: self.message.get_c(),
             no_response: self.message.get_nr() == Some(true),
             id: self.id.clone(),
-            scheduled_ms: if schedule { self.message.scheduled_ms() } else { None },
+            scheduled_ms: if schedule { self.message.ids_scheduled_ms() } else { None },
             queue_id: if schedule && self.is_queued() { Some(self.queue_id()) } else { None },
             relay: None,
             extras: extras,
@@ -1689,7 +1695,7 @@ impl MessageInst {
     }
 
     pub fn is_queued(&self) -> bool {
-        matches!(self.message, Message::Message(NormalMessage { scheduled_ms: Some(_), .. }) | Message::Unschedule)
+        matches!(self.message, Message::Message(NormalMessage { scheduled: Some(_), .. }) | Message::Unschedule)
     }
 
     pub fn queue_id(&self) -> String {
@@ -1886,8 +1892,8 @@ impl MessageInst {
                             balloon_part_mmcs,
                             voice_audio: if normal.voice { Some(true) } else { None },
                             voice_e: if normal.voice { Some(true) } else { None },
-                            schedule_date: if !scheduled { normal.scheduled_ms.clone().map(|i| (SystemTime::UNIX_EPOCH + Duration::from_millis(i)).into()) } else { None },
-                            schedule_type: if normal.scheduled_ms.is_some() && !scheduled { Some(2) } else { None },
+                            schedule_date: if !scheduled { normal.scheduled.clone().map(|i| (SystemTime::UNIX_EPOCH + Duration::from_millis(i.ms)).into()) } else { None },
+                            schedule_type: if normal.scheduled.is_some() && !scheduled { Some(2) } else { None },
                         };
         
                         if normal.parts.is_multipart() {
@@ -2313,7 +2319,7 @@ impl MessageInst {
                     app: None,
                     link_meta: None,
                     voice: false,
-                    scheduled_ms: None,
+                    scheduled: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2343,7 +2349,7 @@ impl MessageInst {
                 app: None,
                 link_meta: None,
                 voice: false,
-                scheduled_ms: None,
+                scheduled: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -2424,9 +2430,10 @@ impl MessageInst {
                 app,
                 link_meta,
                 voice: loaded.voice_audio == Some(true),
-                scheduled_ms: loaded.schedule_date.clone().map(|i| {
+                scheduled: loaded.schedule_date.clone().map(|i| {
                     let system_time: SystemTime = i.into();
-                    system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+                    // we have no way of knowing if it is actually scheduled or not
+                    ScheduleMode { ms: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64, schedule: true }
                 }),
             }))
         }

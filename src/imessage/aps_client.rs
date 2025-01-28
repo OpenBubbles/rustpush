@@ -315,7 +315,12 @@ impl IMClient {
             targets.retain(|t| t.participant == handle);
 
             let ids_message = message.get_ids(&my_handles, &self.conn, false).await?;
-            let _ = self.identity.send_message(topic, ids_message, targets).await;
+            let sendjob = self.identity.send_message(topic, ids_message, targets).await;
+
+            // we aren't actually sending this. It is just a draft
+            if message.message.ids_scheduled_ms().is_none() {
+                return sendjob
+            }
         }
 
         let ids_message = message.get_ids(&my_handles, &self.conn, true).await?;
