@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{aps::{get_message, APSInterestToken}, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource}, user::{IDSService, QueryOptions}, CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}, APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError};
+use crate::{aps::{get_message, APSInterestToken}, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}, CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}, APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError};
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -140,7 +140,7 @@ impl FTMember {
 fn send_for_message(sender: String, message: ConversationMessage, context: Option<u64>) -> IDSSendMessage {
     IDSSendMessage {
         sender,
-        raw: Some(message.encode_to_vec()),
+        raw: Raw::Body(message.encode_to_vec()),
         send_delivered: false,
         command: 242,
         no_response: false,
@@ -495,6 +495,7 @@ impl FTClient {
 
         let mut state = self.state.write().await;
         state.links.get_mut(&pseud).expect("No link??").usage = Some(usage.to_string());
+        (self.update_state)(&*state);
         Ok(())
     }
 
@@ -524,6 +525,7 @@ impl FTClient {
         
         let mut state = self.state.write().await;
         state.links.remove(pseud);
+        (self.update_state)(&*state);
         Ok(())
     }
 
@@ -661,7 +663,7 @@ impl FTClient {
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, to_people);
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
-            raw: Some(plist_to_bin(&wire_message)?),
+            raw: Raw::Body(plist_to_bin(&wire_message)?),
             send_delivered: false,
             command: 209,
             no_response: false,
@@ -704,62 +706,14 @@ impl FTClient {
             self.identity.send_message(topic, send_for_message(handle.clone(), message, None), targets).await?;
         }
 
-        let mut update_context = ConversationParticipantDidJoinContext::default();
-        update_context.members = session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
         // update_context.members.push(ConversationMember {});
+        
+        let self_token = self.conn.get_token().await;
 
-        let mut message = ConversationMessage::default();
-        if ring {
-            message.set_type(ConversationMessageType::Invitation);
-        }
-        message.link = session.link.clone();
-        message.report_data = Some(session.get_report());
-        message.invitation_preferences = vec![
-            ConversationInvitationPreference { version: 0, handle_type: HandleType::PhoneNumber as i32, notification_styles: 1 },
-            ConversationInvitationPreference { version: 0, handle_type: HandleType::Generic as i32, notification_styles: 1 },
-            ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
-        ];
-
-        update_context.message = Some(message);
-        update_context.is_moments_available = true;
-        update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
-        // maybe make these optional/forced
-        update_context.video = Some(true);
-        update_context.video_enabled = Some(false);
-
-        update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
-        update_context.is_u_plus_n_downgrade_available = Some(false);
-        update_context.is_u_plus_one_av_less_available = Some(false);
-
-        update_context.is_screen_sharing_available = true;
-        update_context.is_gondola_calling_available = true;
-        update_context.share_play_protocol_version = 4;
-
-        let participant_map: HashMap<String, Vec<ParticipantID>> = session.participants.values().fold(HashMap::new(), |mut a, i| {
-            a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
-            a
-        });
-
-        let base64_encoded = Some(base64_encode(&self.conn.get_token().await));
-        let my_participant = session.participants.values_mut().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?;
+        let base64_encoded = Some(base64_encode(&self_token));
 
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
-        let wire_message = FTWireMessage {
-            session: session.group_id.clone(),
-            prekey: None,
-            prekey_wrap_mode: None,
-            fanout_groupid: session.group_id.clone(),
-            client_context_data_key: Some(update_context.encode_to_vec().into()),
-            participant_data_key: Some(include_bytes!("sampleavcdata.bplist").to_vec().into()), // should be AV mode, hopefully this doens't give us trouble?
-            is_initiator_key: Some(is_initiator),
-            fanout_groupmembers: Some(session.members.iter().map(|a| a.handle.clone()).collect()),
-            is_u_plus_one_key: Some(is_u_plus_one),
-            join_notification_key: Some(1),
-            participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
-            uri_to_participant_id_key: Some(participant_map),
-        };
-
 
         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
         let topic = "com.apple.private.alloy.facetime.multi";
@@ -771,10 +725,66 @@ impl FTClient {
             &QueryOptions { required_for_message: true, result_expected: true }
         ).await?;
 
+        let builder_session = session.clone();
+        let my_participant = builder_session.participants.values().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?.clone();
+
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
-            raw: Some(plist_to_bin(&wire_message)?),
+            raw: Raw::Builder(Box::new(move |target| {
+                let mut update_context = ConversationParticipantDidJoinContext::default();
+                update_context.members = builder_session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
+
+                let mut message = ConversationMessage::default();
+                // ring not sending to ourselves
+                if ring && target.participant != my_participant.handle {
+                    message.set_type(ConversationMessageType::Invitation);
+                }
+                message.link = builder_session.link.clone();
+                message.report_data = Some(builder_session.get_report());
+                message.invitation_preferences = vec![
+                    ConversationInvitationPreference { version: 0, handle_type: HandleType::PhoneNumber as i32, notification_styles: 1 },
+                    ConversationInvitationPreference { version: 0, handle_type: HandleType::Generic as i32, notification_styles: 1 },
+                    ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
+                ];
+
+                update_context.message = Some(message);
+                update_context.is_moments_available = true;
+                update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
+                // maybe make these optional/forced
+                update_context.video = Some(true);
+                update_context.video_enabled = Some(false);
+
+                update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
+                update_context.is_u_plus_n_downgrade_available = Some(false);
+                update_context.is_u_plus_one_av_less_available = Some(false);
+
+                update_context.is_screen_sharing_available = true;
+                update_context.is_gondola_calling_available = true;
+                update_context.share_play_protocol_version = 4;
+
+                let participant_map: HashMap<String, Vec<ParticipantID>> = builder_session.participants.values().fold(HashMap::new(), |mut a, i| {
+                    a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
+                    a
+                });
+
+
+                let wire_message = FTWireMessage {
+                    session: builder_session.group_id.clone(),
+                    prekey: None,
+                    prekey_wrap_mode: None,
+                    fanout_groupid: builder_session.group_id.clone(),
+                    client_context_data_key: Some(update_context.encode_to_vec().into()),
+                    participant_data_key: Some(include_bytes!("sampleavcdata.bplist").to_vec().into()), // should be AV mode, hopefully this doens't give us trouble?
+                    is_initiator_key: Some(is_initiator),
+                    fanout_groupmembers: Some(builder_session.members.iter().map(|a| a.handle.clone()).collect()),
+                    is_u_plus_one_key: Some(is_u_plus_one),
+                    join_notification_key: Some(1),
+                    participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
+                    uri_to_participant_id_key: Some(participant_map),
+                };
+                Some(plist_to_bin(&wire_message).expect("Failed to serialize plist"))
+            })),
             send_delivered: false,
             command: 207,
             no_response: false,
@@ -857,7 +867,7 @@ impl FTClient {
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
         self.identity.send_message(topic, IDSSendMessage {
             sender: handle.clone(),
-            raw: Some(plist_to_bin(&wire_message)?),
+            raw: Raw::Body(plist_to_bin(&wire_message)?),
             send_delivered: false,
             command: 208,
             no_response: false,

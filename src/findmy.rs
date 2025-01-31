@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget}, user::IDSService, IDSRecvMessage}, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, OSConfig, PushError};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
@@ -106,7 +106,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     let targets = self.identity.cache.lock().await.get_targets(&topic, &target, &[sender], &[MessageTarget::Token(token)])?;
                     self.identity.send_message(topic, IDSSendMessage {
                         sender: target,
-                        raw: None,
+                        raw: Raw::None,
                         send_delivered: false,
                         command: 244,
                         no_response: true,

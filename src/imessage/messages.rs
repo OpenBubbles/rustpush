@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
 
-use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget}, IDSRecvMessage}, mmcs::{MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, IDSRecvMessage}, mmcs::{MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1682,7 +1682,7 @@ impl MessageInst {
 
         Ok(IDSSendMessage {
             sender: self.sender.as_ref().unwrap().to_string(),
-            raw: if self.has_payload() { Some(self.to_raw(&my_handles, apns, schedule).await?) } else { None },
+            raw: if self.has_payload() { Raw::Body(self.to_raw(&my_handles, apns, schedule).await?) } else { Raw::None },
             send_delivered: self.send_delivered,
             command: self.message.get_c(),
             no_response: self.message.get_nr() == Some(true),

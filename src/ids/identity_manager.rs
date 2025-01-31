@@ -14,6 +14,7 @@ use tokio::select;
 use rand::RngCore;
 use uuid::Uuid;
 use std::str::FromStr;
+use std::fmt::Debug;
 
 use crate::{aps::{get_message, APSConnection}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
@@ -101,10 +102,26 @@ pub struct IDSQuickRelaySettings {
     pub member_count: u32,
 }
 
+pub enum Raw {
+    Body(Vec<u8>),
+    None,
+    Builder(Box<dyn (Fn(&DeliveryHandle) -> Option<Vec<u8>>) + Send + Sync>),
+}
+
+impl Debug for Raw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Body(a) => write!(f, "body {}", encode_hex(a)),
+            Self::None => write!(f, "No body"),
+            Self::Builder(_) => write!(f, "Builder"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct IDSSendMessage {
     pub sender: String,
-    pub raw: Option<Vec<u8>>,
+    pub raw: Raw,
     pub send_delivered: bool,
     pub command: u8,
     pub no_response: bool,
@@ -119,7 +136,7 @@ impl IDSSendMessage {
     pub fn quickrelay(sender: String, uuid: Uuid, relay: IDSQuickRelaySettings) -> Self {
         IDSSendMessage {
             sender,
-            raw: None,
+            raw: Raw::None,
             send_delivered: false,
             command: 200,
             no_response: false,
@@ -491,7 +508,8 @@ impl IdentityResource {
     pub async fn delete_pseudonym(&self, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, pseud: String, expiry_seconds: f64) -> Result<(), PushError> {
         let a_service = services.keys().next().unwrap();
         let cache_lock = self.cache.lock().await;
-        let handle = cache_lock.cache[*a_service][&pseud].real_handle.as_ref().expect("Not a pseud?").clone();
+        let Some(cache_handle) = cache_lock.cache[*a_service].get(&pseud) else { return Ok(()) /* handle doesn't exist; probably already deleted */ };
+        let handle = cache_handle.real_handle.as_ref().expect("Not a pseud?").clone();
         drop(cache_lock);
         
         let users = self.users.read().await;
@@ -891,7 +909,12 @@ impl InnerSendJob {
         const GROUP_MAX_SIZE: usize = 10000;
 
         for target in &targets {
-            let encrypted = if let Some(msg) = &message.raw {
+            let encrypted = match &message.raw {
+                Raw::Body(b) => Some(b.clone()),
+                Raw::Builder(b) => b(target),
+                Raw::None => None,
+            };
+            let encrypted = if let Some(msg) = encrypted {
                 Some(self.identity.identity.encrypt_payload(&target.delivery_data, &self.identity.cache, &msg).await?)
             } else { None };
             let send_delivered = if message.send_delivered { &target.participant != &message.sender } else { false };
@@ -922,7 +945,7 @@ impl InnerSendJob {
             let complete = SendMessage {
                 batch: if is_relay_message { Some(batch as u8 + 1) } else { None },
                 command: message.command,
-                encryption: if message.raw.is_some() { Some("pair".to_string()) } else { None },
+                encryption: if !matches!(message.raw, Raw::None) { Some("pair".to_string()) } else { None },
                 user_agent: self.user_agent.clone(),
                 v: if is_relay_message { Some(8) } else { None },
                 message_id: msg_id,
