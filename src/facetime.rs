@@ -2248,9 +2248,9 @@ impl FTClient {
                     return Ok(None);
                 }
                 (208, a, b, FTWireMessage { participant_id_key: Some(participant), .. }) => {
-                    let pid = *participant;
-                    info!("(wire cmd=208) => user left => participant={}", pid);
-                    let part = session.participants.get_mut(&pid.to_string()).ok_or(PushError::BadMsg)?;
+                    let id = *participant;
+                    info!("(wire cmd=208) => user left => participant={}", id);
+                    let part = session.participants.get_mut(&id.to_string()).ok_or(PushError::BadMsg)?;
                     if let Some(last_join_date) = part.last_join_date {
                         if (ns_since_epoch / 1000000) < last_join_date {
                             info!("(wire cmd=208) => ignoring leave => joined after the leave time?");
@@ -2262,7 +2262,7 @@ impl FTClient {
                     if handle_left.starts_with("temp:") {
                         // remove us from the group list too cause we can't join back
                         session.members.retain(|a| a.handle != handle_left);
-                        session.participants.remove(&pid.to_string()).ok_or(PushError::BadMsg)?;
+                        session.participants.remove(&id.to_string()).ok_or(PushError::BadMsg)?;
                     }
                     let guid = session.group_id.clone();
                     if session.participants.values().all(|a| a.active.is_none()) {
@@ -2278,11 +2278,11 @@ impl FTClient {
                     (self.update_state)(&state);
                     info!(
                         "EXIT handle => user left => guid={}, participant={}, handle_left={}",
-                        guid, pid.into(), handle_left
+                        guid, id.into(), handle_left
                     );
                     return Ok(Some(FTMessage::LeaveEvent {
                         guid,
-                        participant: pid.into(),
+                        participant: id.into(),
                         handle: handle_left,
                     }));
                 }
