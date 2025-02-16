@@ -1,4 +1,4 @@
-use std::{path::PathBuf, pin::Pin, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashSet, path::PathBuf, pin::Pin, process::id, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use log::{debug, error, info, warn};
 use plist::{Data, Dictionary, Value};
@@ -220,8 +220,15 @@ impl IMClient {
             error_status: Some(error_status),
             error_string: Some(error_string),
             error_for_str: Some(for_str),
+            sender: Some(sender),
+            target: Some(target),
             ..
         } = &payload {
+            if error_string == "ec-com.apple.messageprotection-802" {
+                // refreshing identity cache can fix this
+                let mut cache_lock = self.identity.cache.lock().await;
+                cache_lock.invalidate(&target, &sender);
+            }
             return Ok(payload.to_message(None, Message::Error(ErrorMessage {
                 for_uuid: for_str.clone(),
                 status: *error_status,
@@ -248,10 +255,15 @@ impl IMClient {
                     return Ok(None)
                 };
 
-                if new_device_token.identites.len() != self.identity.get_handles().await.len() {
-                    info!("New handles; reregistering!");
+                let my_handles: HashSet<String> = self.identity.get_handles().await.into_iter().collect();
+                if new_device_token.identites.len() != my_handles.len() {
+                    info!("New handles; checking handles! {:?} {:?}", new_device_token.identites, my_handles);
                     drop(cache_lock);
-                    self.identity.refresh().await?;
+                    let real_handles = self.identity.get_possible_handles().await?;
+                    if real_handles != my_handles {
+                        info!("New handles; reregistering! {:?} {:?}", real_handles, my_handles);
+                        self.identity.refresh().await?;
+                    }
                 }
 
                 payload.to_message(None, Message::PeerCacheInvalidate).ok()
@@ -307,6 +319,11 @@ impl IMClient {
             ident_cache.get_participants_targets(topic, &handle, &targets)
         };
         drop(ident_cache);
+
+        // if we have multiple people, but not a single target going to not us, we cannot "send" this message.
+        if targets.len() > 1 && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
+            return Err(PushError::NoValidTargets);
+        }
         
         let my_handles = self.identity.get_handles().await;
 

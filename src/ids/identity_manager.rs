@@ -419,6 +419,16 @@ impl IdentityResource {
         users_locked.iter().flat_map(|user| user.registration["com.apple.madrid"].handles.clone()).collect::<Vec<String>>()
     }
 
+    pub async fn get_possible_handles(&self) -> Result<HashSet<String>, PushError> {
+        let users_locked = self.users.read().await;
+        let state = self.aps.state.read().await;
+        let mut possible_handles = HashSet::new();
+        for user in &*users_locked {
+            possible_handles.extend(user.get_possible_handles(&*state).await?);
+        }
+        Ok(possible_handles)
+    }
+
     pub async fn update_users(&self, users: Vec<IDSUser>) -> Result<(), PushError> {
         debug!("Swapping users!");
         *self.users.write().await = users;

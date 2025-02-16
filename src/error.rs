@@ -32,6 +32,8 @@ pub enum PushError {
     KeyError(KeyError),
     #[error("IDS key missing for {0}")]
     KeyNotFound(String),
+    #[error("No valid IDS targets for message")]
+    NoValidTargets,
     #[error("Failed to connect to APS {0}")]
     APSConnectError(u8),
     #[error("TLS error {0}")]
@@ -87,8 +89,8 @@ pub enum PushError {
     BagKeyNotFound,
     #[error("Keyed archive error {0}")]
     KeyedArchiveError(String),
-    #[error("Fetching validation data failed ({0})")]
-    RelayError(u16),
+    #[error("Fetching validation data failed ({0}) {1}")]
+    RelayError(u16, String),
     #[error("Relay device offline!")]
     DeviceNotFound,
     #[error("Web Tunnel error {0}!")]

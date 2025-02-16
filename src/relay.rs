@@ -42,7 +42,8 @@ pub struct RelayConfig {
 impl RelayConfig {
     pub async fn get_versions(host: &str, code: &str, beeper_token: &Option<String>) -> Result<Versions, PushError> {
         let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-version-info", host))
-            .bearer_auth(code);
+            .bearer_auth(code)
+            .header("Content-Length", "0");
 
         if let Some(token) = beeper_token {
             data = data.header("X-Beeper-Access-Token", token.clone());
@@ -124,7 +125,8 @@ impl OSConfig for RelayConfig {
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
         let mut data = REQWEST.post(format!("{}/api/v1/bridge/get-validation-data", self.host))
-            .bearer_auth(&self.code);
+            .bearer_auth(&self.code)
+            .header("Content-Length", "0");
 
         if let Some(token) = &self.beeper_token {
             data = data.header("X-Beeper-Access-Token", token.clone());
@@ -138,7 +140,7 @@ impl OSConfig for RelayConfig {
                 return Err(PushError::DeviceNotFound)
             },
             _status => {
-                return Err(PushError::RelayError(_status))
+                return Err(PushError::RelayError(_status, result.text().await?))
             }
         }
 
