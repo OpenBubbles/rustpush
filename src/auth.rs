@@ -102,10 +102,22 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
         return Err(PushError::AuthError(parsed.clone()));
     }
 
-    fn get_delegate<T: DeserializeOwned>(delegates: &Dictionary, item: &str) -> Result<Option<T>, PushError> {
-        let Some(Value::Dictionary(item)) = delegates.get(item) else { return Ok(None) };
-        let data = item.get("service-data").unwrap();
-        Ok(Some(plist::from_value(data)?))
+    fn get_delegate<T: DeserializeOwned>(delegates: &Dictionary, delegate: &str) -> Result<Option<T>, PushError> {
+        let Some(value) = delegates.get(delegate) else { return Ok(None) };
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct DelegateResponse {
+            service_data: Option<Value>,
+            status: i64,
+            status_message: Option<String>,
+        }
+
+        let response: DelegateResponse = plist::from_value(&value)?;
+
+        let data = response.service_data.ok_or(
+                PushError::DelegateLoginFailed(delegate.to_string(), response.status, response.status_message.unwrap_or("No msg".to_string())))?;
+        Ok(Some(plist::from_value(&data)?))
     }
 
     let delegates = parsed_dict.get("delegates").unwrap().as_dictionary().unwrap();

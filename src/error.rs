@@ -125,4 +125,6 @@ pub enum PushError {
     NoParticipantTokenIndex,
     #[error("Resource generate timeout {0}")]
     ResourceGenTimeout(Elapsed),
+    #[error("Delegate {0} login failed status {1} error {2}")]
+    DelegateLoginFailed(String, i64, String),
 }
