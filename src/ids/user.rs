@@ -773,6 +773,8 @@ impl IDSUser {
             return Err(PushError::AliasError(parsed.status))
         }
 
+        info!("Just took action {operation} on alias {} for handle {handle}", alias.as_ref().expect("No alias!"));
+
         Ok(())
     }
 

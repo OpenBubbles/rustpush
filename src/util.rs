@@ -617,6 +617,10 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     async fn refresh_option(&self, now: bool) -> Result<(), PushError> {
+        if let ResourceState::Failed(ResourceFailure { retry_wait: None, error }) = &*self.resource_state.borrow() {
+            // this is a permanent failure
+            return Err(ResourceFailure { retry_wait: None, error: error.clone() }.into())
+        }
         let elapsed = self.refreshed_at.lock().await.elapsed().unwrap();
         if elapsed < MAX_RESOURCE_REGEN {
             return Ok(())

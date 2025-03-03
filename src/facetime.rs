@@ -472,6 +472,8 @@ impl FTClient {
         let new_alias = self.identity.create_pseudonym(handle, "Gondola", 
         [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect(), in_a_year.as_secs_f64()).await?;
 
+        info!("Creating new link using pseud {new_alias} for handle {handle} with usage {usage:?}");
+
         let key = CompactECKey::new()?;
 
         Ok(FTLink { key, pseud: new_alias.clone(), handle: handle.to_string(), session_link: None, creation_time: since_the_epoch.as_secs_f64(), expiry_time: in_a_year.as_secs_f64(), usage })
@@ -484,6 +486,7 @@ impl FTClient {
         if state.links[&pseud].usage == Some(usage.to_string()) {
             return Ok(())
         }
+        info!("Using link {} for {usage} from {old_usage}", existing.handle);
         if let Some(link) = state.links.values().find(|l| l.usage == Some(usage.to_string())) {
             // delete this link, no longer has a use
             let old_pseud = link.pseud.clone();
@@ -503,7 +506,11 @@ impl FTClient {
         let mut state = self.state.write().await;
         state.links.retain(|_, l| !l.is_expired()); // remove expiredg links
         if let Some(link) = state.links.values().find(|a| a.usage == Some(usage.to_string())) {
-            return Ok(link.get_link()?)
+            if self.identity.validate_pseudonym("com.apple.private.alloy.facetime.multi", handle, &link.pseud).await? {
+                return Ok(link.get_link()?)
+            } else {
+                warn!("Failed to validate pseudonym! {}", link.pseud);
+            }
         }
         
         let link_obj = self.new_link(handle, Some(usage.to_string())).await?;

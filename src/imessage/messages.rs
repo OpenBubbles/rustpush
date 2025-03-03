@@ -1404,6 +1404,13 @@ impl Message {
             _ => None,
         }
     }
+
+    pub fn should_schedule(&self) -> bool {
+        match &self {
+            Message::Message(NormalMessage { scheduled: Some(ScheduleMode { ms: _, schedule: false }), .. }) => false,
+            _ => true,
+        }
+    }
     
     pub fn get_nr(&self) -> Option<bool> {
         if self.is_sms() {
@@ -1419,6 +1426,8 @@ impl Message {
             Self::SmsConfirmSent(_) => Some(true),
             Self::MarkUnread => Some(true),
             Self::PeerCacheInvalidate => Some(true),
+            Self::MoveToRecycleBin(_) => Some(true),
+            Self::PermanentDelete(_) => Some(true),
             _ => None
         }
     }

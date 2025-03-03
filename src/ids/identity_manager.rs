@@ -499,6 +499,13 @@ impl IdentityResource {
         cache_lock.save();
     }
 
+    pub async fn validate_pseudonym(&self, service: &'static str, handle: &str, pseud: &str) -> Result<bool, PushError> {
+        let cache_lock = self.cache.lock().await;
+        let Some(service) = cache_lock.cache.get(service) else { panic!("No service {service}!") };
+        let Some(pseud) = service.get(pseud) else { return Ok(false) };
+        Ok(pseud.real_handle == Some(handle.to_string()))
+    }
+
     pub async fn create_pseudonym(&self, handle: &str, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, expiry_seconds: f64) -> Result<String, PushError> {
         let users = self.users.read().await;
         let user = IdentityResource::user_by_real_handle(&*users, handle)?;
@@ -953,11 +960,11 @@ impl InnerSendJob {
         debug!("send_uuid {}", encode_hex(&uuid));
         for (batch, group) in groups.into_iter().enumerate() {
             let complete = SendMessage {
-                batch: if is_relay_message { Some(batch as u8 + 1) } else { None },
+                batch: if !is_relay_message { Some(batch as u8 + 1) } else { None },
                 command: message.command,
                 encryption: if !matches!(message.raw, Raw::None) { Some("pair".to_string()) } else { None },
                 user_agent: self.user_agent.clone(),
-                v: if is_relay_message { Some(8) } else { None },
+                v: if !is_relay_message { Some(8) } else { None },
                 message_id: msg_id,
                 uuid: uuid.clone().into(),
                 payloads: group,
@@ -979,6 +986,8 @@ impl InnerSendJob {
 
             let mut value = plist::to_value(&complete)?;
             value.as_dictionary_mut().expect("Not a dictionary?").extend(message.extras.clone());
+
+            debug!("Sending value {value:?}");
 
             let binary = plist_to_bin(&value)?;
             self.conn.send_message(apns_topic, binary, Some(msg_id)).await?
