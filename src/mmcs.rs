@@ -5,13 +5,14 @@ use log::{debug, info, warn};
 use openssl::{hash::{Hasher, MessageDigest}, sha::{sha256, Sha1}, symm::{decrypt, encrypt, Cipher}};
 use plist::Data;
 use prost::Message;
-use reqwest::{Client, Response, Body};
+use reqwest::{header::{HeaderMap, HeaderName}, Body, Client, Response};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
 use rand::{Rng, RngCore};
 use std::io::{Read, Write};
+use std::str::FromStr;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,9 +30,14 @@ pub struct MMCSConfig {
     pub dataclass: &'static str,
     pub mini_ua: String,
     pub dsid: Option<String>,
+    pub cloudkit_headers: HashMap<&'static str, String>,
+    pub extra_1: Option<String>,
+    pub extra_2: Option<String>,
 }
 
 async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: &str, auth: &str, dsid: &str, body: &[u8]) -> Result<Response, PushError> {
+    let cloudkit_headers: HeaderMap = config.cloudkit_headers.iter().map(|(a, b)| (HeaderName::from_str(a).unwrap(), b.parse().unwrap())).collect();
+
     Ok(client.post(format!("{}/{}", url, method))
         .header("x-apple-mmcs-dataclass", config.dataclass)
         .header("x-apple-mmcs-auth", auth)
@@ -48,6 +54,7 @@ async fn send_mmcs_req(client: &Client, config: &MMCSConfig, url: &str, method: 
         .header("Proxy-Connection", "keep-alive")
         .header("Connection", "keep-alive")
         .header("x-apple-mmcs-plist-sha256", "fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=")
+        .headers(cloudkit_headers)
         .body(body.to_owned())
         .send().await?)
 }
@@ -241,9 +248,7 @@ impl WriteContainer for MMCSPutContainer {
                 confirm_data: self.finish_binary.clone()
             };
 
-            let mut buf: Vec<u8> = Vec::new();
-            buf.reserve(footer.encoded_len());
-            footer.encode(&mut buf).unwrap();
+            let mut buf: Vec<u8> = footer.encode_to_vec();
 
             let result = self.sender.take().unwrap().into_send_async(Ok([
                 self.buffer.take().unwrap(),
@@ -278,9 +283,7 @@ impl WriteContainer for MMCSPutContainer {
                 inner: vec![confirmed],
                 confirm_data: self.finish_binary.clone(),
             };
-            let mut buf: Vec<u8> = Vec::new();
-            buf.reserve(confirmation.encoded_len());
-            confirmation.encode(&mut buf).unwrap();
+            let buf: Vec<u8> = confirmation.encode_to_vec();
             let resp = send_mmcs_req(&REQWEST, config, &self.confirm_url, "putComplete", &format!("{} {} {}", self.target.cl_auth_p1, self.length, self.target.cl_auth_p2), &self.dsid, &buf).await?;
             if !resp.status().is_success() {
                 return Err(PushError::MMCSUploadFailed(resp.status().as_u16()));
@@ -344,41 +347,32 @@ impl<T: Write + Send + Sync> WriteContainer for FileContainer<T> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSUpload {
-    #[serde(rename = "mL")]
-    length: usize,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32,
-    #[serde(rename = "cV")]
-    cv: u32,
-    #[serde(rename = "cH")]
-    headers: String,
-    #[serde(rename = "cB")]
-    body: Data,
+pub async fn authorize_put(config: &MMCSConfig, inputs: &[(&PreparedPut, Option<String>, impl ReadContainer + Send + Sync)], url: &str) -> Result<AuthorizedOperation, PushError> {
+    let (_, buf) = put_authorize_body(config, inputs);
+    let request = send_mmcs_req(&REQWEST, config, url, "authorizePut", &format!("{} {} {}", encode_hex(&inputs[0].0.total_sig), inputs[0].0.total_len, inputs[0].1.clone().unwrap()), config.dsid.as_ref().unwrap(), &buf).await?;
+    let body = request.bytes().await?;
+    
+    Ok(AuthorizedOperation {
+        url: url.to_string(),
+        body: body.into(),
+        dsid: config.dsid.clone().unwrap(),
+    })
 }
 
-#[derive(Serialize, Deserialize)]
-struct MMCSUploadResponse {
-    #[serde(rename = "cB")]
-    response: Data,
-    #[serde(rename = "mR")]
-    domain: String,
-    #[serde(rename = "mU")]
-    object: String
+pub fn get_headers(mme_client_info: String) -> HashMap<&'static str, String> {
+    [
+        ("x-apple-mmcs-proto-version", "5.0".to_string()),
+        ("x-apple-mmcs-plist-sha256", "fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=".to_string()),
+        ("x-apple-mmcs-plist-version", "v1.0".to_string()),
+        ("x-mme-client-info", mme_client_info),
+    ].into_iter().collect()
 }
 
-// upload data to mmcs
-pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<String>, impl ReadContainer + Send + Sync)>, url: Option<&str>, apns: &APSConnectionResource, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(String, String, HashMap<Vec<u8>, String>), PushError> {
-    let mut inputs = inputs.into_iter().map(|(a, b, c)| (a, b, Some(c))).collect::<Vec<_>>();
+pub fn put_authorize_body(config: &MMCSConfig, inputs: &[(&PreparedPut, Option<String>, impl ReadContainer + Send + Sync)]) -> (HashMap<&'static str, String>, Vec<u8>) {
     let get = mmcsp::AuthorizePut {
         data: inputs.iter().map(|(prepared, object, _)| mmcsp::authorize_put::PutData {
             sig: prepared.total_sig.clone(),
-            token: object.clone().unwrap_or_default(),
+            token: Some(object.clone().unwrap_or_default()), // TODO changed; verify doesn't break other stuff
             chunks: prepared.chunk_sigs.iter().map(|chunk| mmcsp::authorize_put::put_data::Chunk {
                 sig: chunk.id.to_vec(),
                 size: chunk.size as u32,
@@ -387,64 +381,30 @@ pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<Str
             footer: Some(mmcsp::authorize_put::put_data::Footer {
                 chunk_count: prepared.chunk_sigs.len() as u32,
                 profile_type: "kCKProfileTypeFixed".to_string(),
-                f103: Some(0)
+                f103: Some(0),
+                f102: config.extra_1.clone(),
+                f104: config.extra_2.clone(),
             }),
         }).collect(),
         f3: 81
     };
-    let mut buf: Vec<u8> = Vec::new();
-    buf.reserve(get.encoded_len());
-    get.encode(&mut buf).unwrap();
+    let buf: Vec<u8> = get.encode_to_vec();
 
-    let (url, body, dsid): (String, Vec<u8>, String) = if config.dataclass == "com.apple.Dataclass.Messenger" {
-        let prepared = inputs[0].0;
-        let msg_id = rand::thread_rng().next_u32();
-        let header = format!("x-mme-client-info:{}", config.mme_client_info);
+    (get_headers(config.mme_client_info.to_string()), buf)
+}
 
-        let complete = RequestMMCSUpload {
-            c: 150,
-            ua: config.mini_ua.clone(),
-            v: 3,
-            i: msg_id,
-            length: prepared.total_len,
-            signature: prepared.total_sig.clone().into(),
-            cv: 2,
-            headers: [
-                "x-apple-mmcs-proto-version:5.0",
-                "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
-                "x-apple-mmcs-plist-version:v1.0",
-                &header,
-                ""
-            ].join("\n"),
-            body: buf.into()
-        };
-        let binary = plist_to_bin(&complete)?;
-        let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
+#[derive(Default)]
+pub struct AuthorizedOperation {
+    pub url: String,
+    pub body: Vec<u8>,
+    pub dsid: String,
+}
 
-        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return None
-            };
-            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-                return None
-            };
-            if c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
-                Some(loaded)
-            } else { None }
-        }, &["com.apple.madrid"])).await?;
-        let apns_response: MMCSUploadResponse = plist::from_value(&reader)?;
+// upload data to mmcs
+pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<String>, impl ReadContainer + Send + Sync)>, auth: AuthorizedOperation, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(String, Option<String>, HashMap<Vec<u8>, String>), PushError> {
+    let mut inputs = inputs.into_iter().map(|(a, b, c)| (a, b, Some(c))).collect::<Vec<_>>();
 
-        let confirm_url = format!("{}/{}", apns_response.domain, apns_response.object);
-
-        inputs[0].1 = Some(apns_response.object.clone());
-        (confirm_url, apns_response.response.into(), apns_response.object)
-    } else {
-        let request = send_mmcs_req(&REQWEST, config, url.unwrap(), "authorizePut", &format!("{} {} {}", encode_hex(&inputs[0].0.total_sig), inputs[0].0.total_len, inputs[0].1.clone().unwrap()), config.dsid.as_ref().unwrap(), &buf).await?;
-        let body = request.bytes().await?;
-        
-        (url.unwrap().to_string(), body.into(), config.dsid.clone().unwrap())
-    };
+    let AuthorizedOperation { url, body, dsid } = auth;
 
     let mut receipts: HashMap<Vec<u8>, String> = HashMap::new();
 
@@ -485,7 +445,7 @@ pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<Str
         g.finished.iter().map(|i| (i.signature.clone(), i.receipt.clone()))
     }));
 
-    Ok((url, inputs[0].1.clone().unwrap(), receipts))
+    Ok((url, inputs[0].1.clone(), receipts))
 }
 
 fn get_container_url(req: &HttpRequest) -> String {
@@ -802,94 +762,31 @@ impl ReadContainer for MMCSGetContainer {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct RequestMMCSDownload {
-    #[serde(rename = "mO")]
-    object: String,
-    #[serde(rename = "mS")]
-    signature: Data,
-    v: u64,
-    ua: String,
-    c: u64,
-    i: u32,
-    #[serde(rename = "cH")]
-    headers: String,
-    #[serde(rename = "mR")]
-    domain: String,
-    #[serde(rename = "cV")]
-    cv: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MMCSDownloadResponse {
-    #[serde(rename = "cB")]
-    response: Data,
-    #[serde(rename = "mU")]
-    object: String
-}
-
-pub async fn get_mmcs(config: &MMCSConfig, url: &str, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync)>, apns: &APSConnectionResource, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
-    let mut files = files.into_iter().map(|(a, b, c)| (a, b, Some(c))).collect::<Vec<_>>();
-    let (data, dsid): (Vec<u8>, String) = if config.dataclass == "com.apple.Dataclass.Messenger" {
-        let (sig, object, _) = &files[0];
-        let domain = url.replace(&format!("/{}", object), "");
-        let msg_id = rand::thread_rng().next_u32();
-        let header = format!("x-mme-client-info:{}", config.mme_client_info);
-        let request_download = RequestMMCSDownload {
+pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &str, impl WriteContainer + Send + Sync)]) -> Result<AuthorizedOperation, PushError> {
+    let confirmation = mmcsp::AuthorizeGet {
+        item: files.iter().map(|(sig, object, _)| mmcsp::authorize_get::Item {
+            signature: sig.to_vec(),
             object: object.to_string(),
-            c: 151,
-            ua: config.mini_ua.clone(),
-            headers: [
-                "x-apple-mmcs-proto-version:5.0",
-                "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
-                "x-apple-mmcs-plist-version:v1.0",
-                &header,
-                ""
-            ].join("\n"),
-            v: 8,
-            domain,
-            cv: 2,
-            i: msg_id,
-            signature: sig.to_vec().into()
-        };
-
-        info!("mmcs obj {} sig {}", object, encode_hex(sig));
-        
-        let binary = plist_to_bin(&request_download)?;
-        let recv = apns.subscribe().await;
-        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
-
-        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
-            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
-                return None
-            };
-            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
-                return None
-            };
-            if c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
-                Some(loaded)
-            } else { None }
-        }, &["com.apple.madrid"])).await?;
-        let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
-        (apns_response.response.clone().into(), apns_response.object)
-    } else {
-        let confirmation = mmcsp::AuthorizeGet {
-            item: files.iter().map(|(sig, object, _)| mmcsp::authorize_get::Item {
-                signature: sig.to_vec(),
-                object: object.to_string(),
-            }).collect()
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        buf.reserve(confirmation.encoded_len());
-        confirmation.encode(&mut buf).unwrap();
-        let (sig, object, _) = &files[0];
-        let request = send_mmcs_req(&REQWEST, config, &url, "authorizeGet", &format!("{} {}", encode_hex(&sig), object), config.dsid.as_ref().unwrap(), &buf).await?;
-        
-        (request.bytes().await?.into(), config.dsid.clone().unwrap())
+        }).collect()
     };
+    let buf: Vec<u8> = confirmation.encode_to_vec();
+    let (sig, object, _) = &files[0];
+    let request = send_mmcs_req(&REQWEST, config, &url, "authorizeGet", &format!("{} {}", encode_hex(&sig), object), config.dsid.as_ref().unwrap(), &buf).await?;
+    
+    Ok(AuthorizedOperation {
+        url: url.to_string(),
+        body: request.bytes().await?.into(),
+        dsid: config.dsid.clone().unwrap()
+    })
+}
 
-    debug!("get response hex {}", encode_hex(&data));
-    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(data)).unwrap();
+pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync)>, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+    let mut files = files.into_iter().map(|(a, b, c)| (a, b, Some(c))).collect::<Vec<_>>();
+
+    let AuthorizedOperation { url, body, dsid } = authorized;
+
+    debug!("get response hex {}", encode_hex(&body));
+    let response = mmcsp::AuthorizeGetResponse::decode(&mut Cursor::new(body)).unwrap();
 
     if response.f1.is_none() {
         let Some(authorize_get_response::Error { 
@@ -931,19 +828,20 @@ pub async fn get_mmcs(config: &MMCSConfig, url: &str, files: Vec<(Vec<u8>, &str,
     };
     matcher.transfer_chunks(config, progress).await?;
 
-    let confirmation = mmcsp::ConfirmResponse {
-        inner: matcher.get_confirm_reciepts().iter().map(|i| {
-            let MMCSReceipt::Get(g) = i else { panic!("Bad receipt type") };
-            g.clone()
-        }).collect(),
-        confirm_data: None,
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    buf.reserve(confirmation.encoded_len());
-    confirmation.encode(&mut buf).unwrap();
-    let resp = send_mmcs_req(&REQWEST, config, url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &dsid, &buf).await?;
-    if !resp.status().is_success() {
-        panic!("confirm failed {}", resp.status())
+    // cloudkit doesn't do getComplete
+    if url != "" {
+        let confirmation = mmcsp::ConfirmResponse {
+            inner: matcher.get_confirm_reciepts().iter().map(|i| {
+                let MMCSReceipt::Get(g) = i else { panic!("Bad receipt type") };
+                g.clone()
+            }).collect(),
+            confirm_data: None,
+        };
+        let buf: Vec<u8> = confirmation.encode_to_vec();
+        let resp = send_mmcs_req(&REQWEST, config, &url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &dsid, &buf).await?;
+        if !resp.status().is_success() {
+            panic!("confirm failed {}", resp.status())
+        }
     }
 
     Ok(())

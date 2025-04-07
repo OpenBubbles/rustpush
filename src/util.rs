@@ -263,7 +263,7 @@ pub fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
-pub fn base64_decode(data: String) -> Vec<u8> {
+pub fn base64_decode(data: &str) -> Vec<u8> {
     general_purpose::STANDARD.decode(data).unwrap()
 }
 
@@ -327,7 +327,31 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     s
 }
 
+pub fn decode_uleb128(cursor: &mut impl Read) -> Result<u64, std::io::Error> {
+    let mut result: u64 = 0;
+    let mut read_buf = [0u8; 1];
+    for i in 0.. {
+        cursor.read_exact(&mut read_buf)?;
+        result |= ((read_buf[0] & 0x7f) as u64) << (7 * i);
+        if read_buf[0] & 0x80 == 0 {
+            return Ok(result)
+        }
+    }
+    panic!()
+}
 
+pub fn encode_uleb128(mut val: u64) -> Vec<u8> {
+    let mut result = vec![];
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val == 0 {
+            result.push(byte);
+            return result
+        }
+        result.push(byte | 0x80)
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -489,8 +513,6 @@ impl Display for ResourceFailure {
     }
 }
 
-// 5 minutes timeout, in case of deadlock
-const RESOURCE_GENERATE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub enum ResourceState {
@@ -500,7 +522,7 @@ pub enum ResourceState {
 }
 
 impl<T: Resource + 'static> ResourceManager<T> {
-    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
+    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, generate_timeout: Duration, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
         let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), ResourceFailure>>>(99999);
         let (sig_send, mut sig_recv) = mpsc::channel(99999);
         let (retry_now_send, mut retry_now_recv) = mpsc::channel(99999);
@@ -546,7 +568,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
                 let mut backoff = backoff.build();
                 loop_manager.resource_state.send_replace(ResourceState::Generating);
                 debug!("Resource {}: generating", loop_manager.name);
-                let mut result = tokio::time::timeout(RESOURCE_GENERATE_TIMEOUT, 
+                let mut result = tokio::time::timeout(generate_timeout, 
                 loop_manager.resource.generate_unwind_safe()).await
                     .map_err(|e| PushError::ResourceGenTimeout(e)).and_then(|e| e);
                 debug!("Resource {}: finished_generate", loop_manager.name);
@@ -798,6 +820,7 @@ impl KeyedArchive {
             Value::Dictionary(dict) => {
                 for (key, item) in dict.iter_mut() {
                     if let ("$class", Value::Uid(uid)) = (key.as_str(), &item) {
+                        debug!("asdfa");
                         let class: KeyedArchiveClass = plist::from_value(&self.objects[uid.get() as usize])?;
                         my_class = Some(class.classname.clone());
                         *item = Value::String(class.classname);
@@ -825,6 +848,7 @@ impl KeyedArchive {
     }
 
     fn expand_key(&self, key: Uid) -> Result<Value, PushError> {
+        debug!("kaa");
         let mut obj = self.objects[key.get() as usize].clone();
 
         self.expand_obj(&mut obj)?;
@@ -957,13 +981,13 @@ impl<T> Deref for NSArray<T> {
 }
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum NSDictionaryClass {
     NSDictionary,
     NSMutableDictionary,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct NSDictionary<T> {
     #[serde(rename = "$class")]
     pub class: NSDictionaryClass,
@@ -991,12 +1015,12 @@ impl<T> Deref for NSDictionary<T> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum NSDataClass {
     NSMutableData,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct NSData {
     #[serde(rename = "NS.data")]
     pub data: Data,
@@ -1011,7 +1035,7 @@ impl Deref for NSData {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "$class")]
 pub struct NSUUID {
     #[serde(rename = "NS.uuidbytes")]
@@ -1039,7 +1063,7 @@ impl Deref for NSUUID {
 
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "$class")]
 pub struct NSURL {
     #[serde(rename = "NS.base")]

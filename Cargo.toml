@@ -45,6 +45,8 @@ aes = "0.8.4"
 sha2 = "0.10.8"
 hkdf = "0.12.4"
 aes-gcm = "0.10.3"
+cloudkit-proto = { path = "./cloudkit-proto" }
+cloudkit-derive = { path = "./cloudkit-derive" }
 
 [features]
 default = ["macOS"]

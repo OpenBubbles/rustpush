@@ -16,7 +16,7 @@ use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
 
-use crate::{aps::{get_message, APSConnection}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
 
@@ -323,6 +323,7 @@ pub struct IdentityResource {
     query_lock: Mutex<()>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
     services: &'static [&'static IDSService],
+    interest_token: APSInterestToken,
 }
 
 pub type IdentityManager = Arc<ResourceManager<IdentityResource>>;
@@ -385,6 +386,7 @@ impl IdentityResource {
             users: RwLock::new(users),
             config,
             identity,
+            interest_token: conn.request_topics(vec!["com.apple.private.ids"]).await.0,
             aps: conn,
             query_lock: Mutex::new(()),
             manager: Mutex::new(None),
@@ -406,6 +408,7 @@ impl IdentityResource {
                 .with_max_delay(Duration::from_secs(86400 /* one day */))
                 .with_max_times(usize::MAX)
                 .with_min_delay(Duration::from_secs(300 /* 5 mins */)),
+            Duration::from_secs(300),
             Some(cancel)
         );
 
@@ -632,6 +635,40 @@ impl IdentityResource {
        }
        debug!("Cached keys for {:?}", participants);
        Ok(())
+    }
+
+    pub async fn handle(&self, msg: APSMessage) -> Result<(), PushError> {
+        let APSMessage::Notification { id: _, topic, token: _, payload } = msg.clone() else { return Ok(()) };
+        if topic != sha1("com.apple.private.ids".as_bytes()) { return Ok(()) };
+
+        #[derive(Deserialize)]
+        struct IDSPrivateMessage {
+            c: u32
+        }
+
+        // just monitoring for now...
+        debug!("got IDS message {}", std::str::from_utf8(&payload).unwrap());
+
+        let decoded: IDSPrivateMessage = serde_json::from_slice(&payload)?;
+
+        match decoded.c {
+            32 => {
+                debug!("Got reregister command, reregistering!");
+                self.manager().await.refresh().await?;
+            },
+            66 => {
+                debug!("IDS said handles changed");
+                let my_handles: HashSet<String> = self.get_handles().await.into_iter().collect();
+                let real_handles = self.get_possible_handles().await?;
+                if real_handles != my_handles {
+                    info!("New handles; reregistering! {:?} {:?}", real_handles, my_handles);
+                    self.manager().await.refresh().await?;
+                }
+            }
+            _ => {}
+        } 
+
+        Ok(()) 
     }
 
     pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {

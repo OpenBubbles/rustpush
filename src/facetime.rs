@@ -821,7 +821,7 @@ impl FTClient {
 
         let alive_tokens: Vec<MessageTarget> = session.participants.values()
             .filter(|a| a.active.is_some())
-            .filter_map(|a| a.token.clone().map(|a| MessageTarget::Token(base64_decode(a)))).collect();
+            .filter_map(|a| a.token.as_ref().map(|a| MessageTarget::Token(base64_decode(a)))).collect();
         let relevant_people: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity.cache_keys(

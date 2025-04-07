@@ -170,6 +170,7 @@ impl IMClient {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<MessageInst>, PushError> {
+        self.identity.handle(msg.clone()).await?;
         if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
             let recieved = self.process_msg(received).await;
             if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
@@ -249,22 +250,6 @@ impl IMClient {
             return Ok(if sender == target {
                 self.identity.ensure_private_self(&mut cache_lock, &target, true).await?;
                 let private_self = &cache_lock.cache["com.apple.madrid"].get(target).unwrap().private_data;
-
-                let Some(new_device_token) = private_self.iter().find(|dev| &dev.token == sender_token) else {
-                    error!("New device not found!");
-                    return Ok(None)
-                };
-
-                let my_handles: HashSet<String> = self.identity.get_handles().await.into_iter().collect();
-                if new_device_token.identites.len() != my_handles.len() {
-                    info!("New handles; checking handles! {:?} {:?}", new_device_token.identites, my_handles);
-                    drop(cache_lock);
-                    let real_handles = self.identity.get_possible_handles().await?;
-                    if real_handles != my_handles {
-                        info!("New handles; reregistering! {:?} {:?}", real_handles, my_handles);
-                        self.identity.refresh().await?;
-                    }
-                }
 
                 payload.to_message(None, Message::PeerCacheInvalidate).ok()
             } else {

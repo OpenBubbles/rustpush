@@ -377,6 +377,7 @@ impl APSConnectionResource {
             ExponentialBuilder::default()
                 .with_max_delay(Duration::from_secs(30))
                 .with_max_times(usize::MAX),
+            Duration::from_secs(300),
             ok
         );
 

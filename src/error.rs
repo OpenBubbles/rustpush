@@ -10,6 +10,7 @@ use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Ela
 
 use crate::{aps::APSMessage, ids::user::SupportAlert, util::ResourceFailure};
 
+
 #[derive(Error, Debug)]
 pub enum PushError {
     #[error("Cryptography error: {0}")]
@@ -127,4 +128,8 @@ pub enum PushError {
     ResourceGenTimeout(Elapsed),
     #[error("Delegate {0} login failed status {1} error {2}")]
     DelegateLoginFailed(String, i64, String),
+    #[error("Cloudkit error {0:?}")]
+    CloudKitError(cloudkit_proto::response_operation::Result),
+    #[error("NickName Crypto Error: {0}")]
+    NickNameCryptoError(String),
 }

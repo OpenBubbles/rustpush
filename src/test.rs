@@ -1,13 +1,17 @@
 
-use std::{fs::File, io::Cursor, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
+use std::{fs::File, io::Cursor, num::ParseIntError, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
 
 use base64::engine::general_purpose;
+use cloudkit_derive::CloudKitRecord;
+use cloudkit_proto::{CloudKitRecord, CloudKitValue};
+use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
 use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, MADRID_SERVICE};
-use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command};
+use rustpush::{authenticate_apple, cloudkit::{record_identifier_from_string, CloudKitClient, CloudKitContainer, CloudKitOperation, CloudKitSession, CloudKitState}, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, ProfilesClient}, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, UpdateProfileMessage, MADRID_SERVICE};
+use sha2::Sha256;
+use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
@@ -42,6 +46,21 @@ async fn read_input() -> String {
     let mut username = String::new();
     reader.read_line(&mut username).await.unwrap();
     username
+}
+
+pub fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+    s
+}
+
+pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
+        .collect()
 }
 
 #[tokio::main(worker_threads = 1)]
@@ -177,6 +196,10 @@ async fn main() {
         let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
         std::fs::write(id_path, plist_to_string(&sharedstreams).unwrap()).unwrap();
 
+        let cloudkitstate = CloudKitState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
+        let id_path = PathBuf::from_str("cloudkit.plist").unwrap();
+        std::fs::write(id_path, plist_to_string(&cloudkitstate).unwrap()).unwrap();
+
         vec![user]
     };
     
@@ -211,6 +234,48 @@ async fn main() {
 
     let findmy_client = FindMyClient::new(connection.clone(), config.clone(), state, anisette_client.clone(), client.identity.clone()).await.unwrap();
 
+    let id_path = PathBuf::from_str("cloudkit.plist").unwrap();
+    let state: CloudKitState = plist::from_file(&id_path).unwrap();
+
+    let cloudkit = Arc::new(CloudKitClient {
+        state: RwLock::new(state),
+        anisette: anisette_client.clone(),
+        config: config.clone()
+    });
+
+    let id_path = PathBuf::from_str("profiles.plist").unwrap();
+    let mut state: Option<ShareProfileMessage> = plist::from_file(&id_path).unwrap_or_default();
+    let name_photo_client = ProfilesClient::new(cloudkit.clone());
+    // plist::to_file_xml(&id_path, &state).unwrap();
+
+    // let session: CloudKitSession = CloudKitSession::new();
+    // let (record, data) = name_photo_client.container.get_record::<_, TestRecord>(&session, &cloudkit, rustpush::cloudkit_proto::AssetsToDownload {
+    //     all_assets: Some(true),
+    //     asset_fields: None,
+    // }, "+1ZvgjukQfNbTOQ4KJfjvA==-wp").await.unwrap();
+
+            // let record = name_photo_client.get_record(&ShareProfileMessage {
+            //     cloud_kit_decryption_record_key: vec![252, 89, 106, 62, 98, 168, 206, 27, 85, 204, 233, 177, 226, 226, 250, 105],
+            //     cloud_kit_record_key: "+1ZvgjukQfNbTOQ4KJfjvA==".to_string(),
+            //     poster: Some(SharedPoster {
+            //         low_res_wallpaper_tag: vec![129, 56, 178, 150, 254, 45, 242, 22, 100, 117, 75, 159, 41, 71, 124, 179, 223, 216, 33, 32, 243, 16, 49, 208, 246, 222, 124, 232, 133, 190, 163, 168],
+            //         wallpaper_tag: vec![224, 248, 168, 14, 40, 131, 159, 194, 205, 43, 88, 103, 235, 249, 191, 107, 30, 51, 116, 242, 199, 186, 3, 155, 150, 128, 156, 108, 30, 80, 86, 110],
+            //         message_tag: vec![105, 108, 56, 149, 123, 86, 208, 11, 168, 187, 193, 190, 222, 121, 120, 69, 136, 245, 181, 223, 149, 195, 17, 38, 226, 187, 62, 200, 138, 143, 57, 239],
+            //     }),
+            // }).await.unwrap();
+
+    // name_photo_client.set_record(record, &mut state).await.unwrap();
+
+    // name_photo_client.set_record(IMessageNicknameRecord {
+    //     name: IMessageNameRecord {
+    //         name: "Testing Now".to_string(),
+    //         first: "Testing".to_string(),
+    //         last: "Now".to_string(),
+    //     },
+    //     image: fs::read("upload.png").await.unwrap()
+    // }, &mut state).await.unwrap();
+
+    // println!("name {:?}", record.n);
 
     let id_path = PathBuf::from_str("sharedstreams.plist").unwrap();
     let state: SharedStreamsState = plist::from_file(&id_path).unwrap();
@@ -222,7 +287,7 @@ async fn main() {
     // let album = shared_streams.state.read().await.albums[0].albumguid.clone();
     // shared_streams.get_album_summary(&album).await.unwrap();
 
-    let state: FTState = plist::from_file(&PathBuf::from_str("facetime.plist").unwrap()).expect("Bad format!");
+    let state: FTState = plist::from_file(&PathBuf::from_str("facetime.plist").unwrap()).unwrap_or_default();
     let facetime = FTClient::new(state, Box::new(|state| {
         plist::to_file_xml(&PathBuf::from_str("facetime.plist").unwrap(), state).expect("Failed to serialize plist!");
     }), connection.clone(), client.identity.clone(), config.clone()).await;
@@ -398,6 +463,16 @@ async fn main() {
                 if let Ok(Some(msg)) = msg {
                     if msg.has_payload() && !received_msgs.contains(&msg.id) {
                         received_msgs.push(msg.id.clone());
+                        if let Message::ShareProfile(message) = &msg.message {
+                            if let Err(e) = name_photo_client.get_record(&message).await {
+                                error!("{e}");
+                            }
+                        }
+                        if let Message::UpdateProfile(UpdateProfileMessage { profile: Some(profile), .. }) = &msg.message {
+                            if let Err(e) = name_photo_client.get_record(&profile).await {
+                                error!("{e}");
+                            }
+                        }
                         println!("{}", msg);
                         print!(">> ");
                         std::io::stdout().flush().unwrap();

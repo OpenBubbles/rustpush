@@ -6,7 +6,7 @@ use openssl::sha::sha1;
 use plist::{Date, Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, imessage::messages::AttachmentPreparedPut, mmcs::{get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, ResourceState};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, imessage::messages::AttachmentPreparedPut, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, ResourceState};
 use rand::Rng;
 use uuid::Uuid;
 use tokio::{process::Command, runtime::Handle, select, sync::{Mutex, RwLock}};
@@ -438,6 +438,9 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             dataclass: "com.apple.Dataclass.SharedStreams",
             mini_ua: self.config.get_version_ua(),
             dsid: Some(self.state.read().await.dsid.clone()),
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
         };
 
         let batch_date_created = SystemTime::now();
@@ -456,7 +459,9 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             }
         }
 
-        let (_, _, receipts) = put_mmcs(&mmcs_config, inputs, Some(&response.contenturl), &self.aps, progress).await?;
+        let auth = authorize_put(&mmcs_config, &inputs, &response.contenturl).await?;
+
+        let (_, _, receipts) = put_mmcs(&mmcs_config, inputs, auth, progress).await?;
 
         #[derive(Serialize)]
         struct FinishFile {
@@ -536,11 +541,17 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             dataclass: "com.apple.Dataclass.SharedStreams",
             mini_ua: self.config.get_version_ua(),
             dsid: Some(self.state.read().await.dsid.clone()),
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
         };
 
         let url = &files[0].0.url;
         let files_map = files.into_iter().map(|(a, b)| (decode_hex(&a.checksum).unwrap(), a.token.as_str(), FileContainer::new(b))).collect::<Vec<_>>();
-        get_mmcs(&mmcs_config, url, files_map, &self.aps, progress).await?;
+        
+        let authorized = authorize_get(&mmcs_config, url, &files_map).await?;
+        
+        get_mmcs(&mmcs_config, authorized, files_map, progress).await?;
         Ok(())
     }
 
@@ -697,6 +708,7 @@ impl<P, F> SyncController<P, F>
                 .with_max_delay(Duration::from_secs(86400 /* one day */))
                 .with_max_times(usize::MAX)
                 .with_min_delay(Duration::from_secs(300 /* 5 mins */)),
+            Duration::from_secs(60 * 60 * 12), // 12 hours, can take a long time to sync
             None,
         );
 

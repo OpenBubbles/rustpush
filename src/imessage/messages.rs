@@ -3,7 +3,7 @@
 use std::{collections::HashMap, fmt, io::{Cursor, Read, Write}, mem, str::FromStr, time::{Duration, SystemTime, UNIX_EPOCH}, vec};
 
 use log::{debug, error, info, warn};
-use openssl::{sha::sha256, symm::{Cipher, Crypter}};
+use openssl::{sha::{self, sha256}, symm::{Cipher, Crypter}};
 use plist::{Data, Dictionary, Value};
 use regex::Regex;
 use uuid::Uuid;
@@ -12,8 +12,9 @@ use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader, EventWriter};
 use async_trait::async_trait;
 use async_recursion::async_recursion;
 use std::io::Seek;
+use rand::RngCore;
 
-use crate::{ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, IDSRecvMessage}, mmcs::{MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -637,7 +638,7 @@ impl ExtensionApp {
         let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?)?;
         let mut balloon = None;
         if let Some(balloon_obj) = &self.balloon {
-            balloon = Some(balloon_obj.to_raw(self)?)
+            balloon = Some(balloon_obj.to_raw(self)?);
         }
 
         Ok((collapse, balloon))
@@ -645,7 +646,7 @@ impl ExtensionApp {
 }
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all_fields = "kebab-case", tag = "layoutClass", content = "userInfo")]
 pub enum BalloonLayout {
     #[serde(rename = "MSMessageTemplateLayout")]
@@ -746,6 +747,7 @@ pub struct NormalMessage {
     pub link_meta: Option<LinkMeta>,
     pub voice: bool,
     pub scheduled: Option<ScheduleMode>,
+    pub embedded_profile: Option<ShareProfileMessage>,
 }
 
 #[repr(C)]
@@ -772,6 +774,7 @@ impl NormalMessage {
             link_meta: None,
             voice: false,
             scheduled: None,
+            embedded_profile: None,
         }
     }
 }
@@ -1001,6 +1004,7 @@ pub struct ReactMessage {
     pub to_part: Option<u64>,
     pub reaction: ReactMessageType,
     pub to_text: String,
+    pub embedded_profile: Option<ShareProfileMessage>,
 }
 
 #[repr(C)]
@@ -1137,6 +1141,35 @@ pub struct AttachmentPreparedPut {
     key: [u8; 32],
 }
 
+
+#[derive(Serialize, Deserialize)]
+struct RequestMMCSUpload {
+    #[serde(rename = "mL")]
+    length: usize,
+    #[serde(rename = "mS")]
+    signature: Data,
+    v: u64,
+    ua: String,
+    c: u64,
+    i: u32,
+    #[serde(rename = "cV")]
+    cv: u32,
+    #[serde(rename = "cH")]
+    headers: String,
+    #[serde(rename = "cB")]
+    body: Data,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MMCSUploadResponse {
+    #[serde(rename = "cB")]
+    response: Data,
+    #[serde(rename = "mR")]
+    domain: String,
+    #[serde(rename = "mU")]
+    object: String
+}
+
 #[repr(C)]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MMCSFile {
@@ -1196,15 +1229,61 @@ impl MMCSFile {
             dataclass: "com.apple.Dataclass.Messenger",
             mini_ua: apns.os_config.get_version_ua(),
             dsid: None,
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
         };
 
         let send_container = IMessageContainer::new(&prepared.key, reader, false);
-        let result = put_mmcs(&mmcs_config, vec![(&prepared.mmcs, None, send_container)], None, apns, progress).await?;
+
+        let mut inputs = vec![(&prepared.mmcs, None, send_container)];
+        let (headers, body) = put_authorize_body(&mmcs_config, &inputs);
+
+        let msg_id = rand::thread_rng().next_u32();
+        let complete = RequestMMCSUpload {
+            c: 150,
+            ua: mmcs_config.mini_ua.clone(),
+            v: 3,
+            i: msg_id,
+            length: prepared.mmcs.total_len,
+            signature: prepared.mmcs.total_sig.clone().into(),
+            cv: 2,
+            headers: format!("{}\n", headers.into_iter().map(|(k, v)| format!("{}:{}", k, v)).collect::<Vec<_>>().join("\n")),
+            body: body.into()
+        };
+        let binary = plist_to_bin(&complete)?;
+        let recv = apns.subscribe().await;
+        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
+
+        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
+            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                return None
+            };
+            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+                return None
+            };
+            if c.as_unsigned_integer().unwrap() == 150 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+                Some(loaded)
+            } else { None }
+        }, &["com.apple.madrid"])).await?;
+        let apns_response: MMCSUploadResponse = plist::from_value(&reader)?;
+
+        let confirm_url = format!("{}/{}", apns_response.domain, apns_response.object);
+
+        inputs[0].1 = Some(apns_response.object.clone());
+
+        let authorization = AuthorizedOperation {
+            url: confirm_url,
+            body: apns_response.response.into(),
+            dsid: apns_response.object,
+        };
+
+        let result = put_mmcs(&mmcs_config, inputs, authorization, progress).await?;
 
 
         Ok(MMCSFile {
             signature: prepared.mmcs.total_sig.to_vec(),
-            object: result.1,
+            object: result.1.expect("No unique ID??"),
             url: result.0,
             key: prepared.key.to_vec(),
             size: prepared.mmcs.total_len
@@ -1213,16 +1292,91 @@ impl MMCSFile {
 
     // request to get and download attachment from MMCS
     pub async fn get_attachment(&self, apns: &APSConnectionResource, writer: impl Write + Send + Sync, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
+        #[derive(Serialize, Deserialize)]
+        struct RequestMMCSDownload {
+            #[serde(rename = "mO")]
+            object: String,
+            #[serde(rename = "mS")]
+            signature: Data,
+            v: u64,
+            ua: String,
+            c: u64,
+            i: u32,
+            #[serde(rename = "cH")]
+            headers: String,
+            #[serde(rename = "mR")]
+            domain: String,
+            #[serde(rename = "cV")]
+            cv: u32,
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct MMCSDownloadResponse {
+            #[serde(rename = "cB")]
+            response: Data,
+            #[serde(rename = "mU")]
+            object: String
+        }
         let mmcs_config = MMCSConfig {
             mme_client_info: apns.os_config.get_mme_clientinfo("com.apple.icloud.content/1950.19 (com.apple.Messenger/1.0)"),
             user_agent: apns.os_config.get_normal_ua("IMTransferAgent/1000"),
             dataclass: "com.apple.Dataclass.Messenger",
             mini_ua: apns.os_config.get_version_ua(),
             dsid: None,
+            cloudkit_headers: HashMap::new(),
+            extra_1: None,
+            extra_2: None,
         };
 
         let recieve_container = IMessageContainer::new(&self.key, writer, true);
-        get_mmcs(&mmcs_config, &self.url, vec![(self.signature.clone(), &self.object, recieve_container)], apns, progress).await?;
+
+        let domain = self.url.replace(&format!("/{}", &self.object), "");
+        let msg_id = rand::thread_rng().next_u32();
+        let header = format!("x-mme-client-info:{}", mmcs_config.mme_client_info);
+        let request_download = RequestMMCSDownload {
+            object: self.object.to_string(),
+            c: 151,
+            ua: mmcs_config.mini_ua.clone(),
+            headers: [
+                "x-apple-mmcs-proto-version:5.0",
+                "x-apple-mmcs-plist-sha256:fvj0Y/Ybu1pq0r4NxXw3eP51exujUkEAd7LllbkTdK8=",
+                "x-apple-mmcs-plist-version:v1.0",
+                &header,
+                ""
+            ].join("\n"),
+            v: 8,
+            domain,
+            cv: 2,
+            i: msg_id,
+            signature: self.signature.to_vec().into()
+        };
+
+        info!("mmcs obj {} sig {}", self.object, encode_hex(&self.signature));
+        
+        let binary = plist_to_bin(&request_download)?;
+        let recv = apns.subscribe().await;
+        apns.send_message("com.apple.madrid", binary, Some(msg_id)).await?;
+
+        let reader = apns.wait_for_timeout(recv, get_message(|loaded| {
+            let Some(c) = loaded.as_dictionary().unwrap().get("c") else {
+                return None
+            };
+            let Some(i) = loaded.as_dictionary().unwrap().get("i") else {
+                return None
+            };
+            if c.as_unsigned_integer().unwrap() == 151 && i.as_unsigned_integer().unwrap() as u32 == msg_id {
+                Some(loaded)
+            } else { None }
+        }, &["com.apple.madrid"])).await?;
+        let apns_response: MMCSDownloadResponse = plist::from_value(&reader)?;
+
+        let authorized = AuthorizedOperation {
+            body: apns_response.response.clone().into(),
+            url: self.url.clone(),
+            dsid: apns_response.object,
+        };
+
+        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container)], progress).await?;
 
         Ok(())
     }
@@ -1314,6 +1468,40 @@ pub struct PermanentDeleteMessage {
 }
 
 
+#[derive(Clone)]
+pub struct UpdateProfileMessage {
+    pub profile: Option<ShareProfileMessage>,
+    pub share_contacts: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SharedPoster {
+    #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
+    pub low_res_wallpaper_tag: Vec<u8>,
+    #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
+    pub wallpaper_tag: Vec<u8>,
+    #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
+    pub message_tag: Vec<u8>, 
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ShareProfileMessage {
+    #[serde(deserialize_with = "bin_deserialize", serialize_with = "bin_serialize")]
+    pub cloud_kit_decryption_record_key: Vec<u8>,
+    pub cloud_kit_record_key: String,
+    pub poster: Option<SharedPoster>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UpdateProfileSharingMessage {
+    #[serde(rename = "nBL")]
+    pub shared_dismissed: Vec<String>,
+    #[serde(rename = "nWL")]
+    pub shared_all: Vec<String>,
+    #[serde(rename = "nBWV")]
+    pub version: u64,
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub enum Message {
@@ -1339,6 +1527,9 @@ pub enum Message {
     RecoverChat(OperatedChat),
     PermanentDelete(PermanentDeleteMessage),
     Unschedule,
+    UpdateProfile(UpdateProfileMessage),
+    UpdateProfileSharing(UpdateProfileSharingMessage),
+    ShareProfile(ShareProfileMessage)
 }
 
 
@@ -1379,6 +1570,9 @@ impl Message {
             Self::PermanentDelete(_) => 181,
             Self::RecoverChat(_) => 182,
             Self::Unschedule => 103,
+            Self::UpdateProfile(_) => 180,
+            Self::UpdateProfileSharing(_) => 180,
+            Self::ShareProfile(_) => 131,
         }
     }
 
@@ -1386,6 +1580,7 @@ impl Message {
         match &self {
             Message::Message(message) => matches!(message.service, MessageType::IMessage) && !conversation.is_group(),
             Message::React(_) => conversation.is_group(),
+            Message::UpdateProfile(_) => true,
             _ => false
         }
     }
@@ -1411,6 +1606,22 @@ impl Message {
             _ => true,
         }
     }
+
+    pub fn extras(&self) -> Dictionary {
+        match &self {
+            Message::UpdateProfile(_) => Dictionary::from_iter([
+                ("pID", Value::Dictionary(Dictionary::new())),
+                ("Dc", Value::Dictionary(Dictionary::from_iter([
+                    ("c", Value::Integer(70000.into()))
+                ]))),
+            ]),
+            Message::UpdateProfileSharing(_) => Dictionary::from_iter([
+                ("gC", Value::Integer(70000.into())),
+                ("pID", Value::Dictionary(Dictionary::new())),
+            ]),
+            _ => Default::default(),
+        }
+    }
     
     pub fn get_nr(&self) -> Option<bool> {
         if self.is_sms() {
@@ -1428,6 +1639,9 @@ impl Message {
             Self::PeerCacheInvalidate => Some(true),
             Self::MoveToRecycleBin(_) => Some(true),
             Self::PermanentDelete(_) => Some(true),
+            Self::UpdateProfile(_) => Some(true),
+            Self::ShareProfile(_) => Some(true),
+            Self::UpdateProfileSharing(_) => Some(true),
             _ => None
         }
     }
@@ -1501,6 +1715,15 @@ impl fmt::Display for Message {
             },
             Message::Unschedule => {
                 write!(f, "Unscheduled a message")
+            },
+            Message::UpdateProfile(i) => {
+                write!(f, "{}", if i.profile.is_some() { "Updated their profile" } else { "Deleted their profile" })
+            },
+            Message::ShareProfile(_) => {
+                write!(f, "Shared their profile")
+            },
+            Message::UpdateProfileSharing(_) => {
+                write!(f, "Shared to someone else")
             }
         }
     }
@@ -1689,6 +1912,8 @@ impl MessageInst {
             extras.insert("eX".to_string(), Value::Integer(ex.into()));
         }
 
+        extras.extend(self.message.extras());
+
         Ok(IDSSendMessage {
             sender: self.sender.as_ref().unwrap().to_string(),
             raw: if self.has_payload() { Raw::Body(self.to_raw(&my_handles, apns, schedule).await?) } else { Raw::None },
@@ -1756,6 +1981,41 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::UpdateProfile(update) => {
+                let raw = RawProfileUpdateMessage {
+                    profile: RawProfileUpdate {
+                        share_automatically: if update.share_contacts { 1 } else { 2 },
+                        key: update.profile.as_ref().map(|a| a.cloud_kit_decryption_record_key.clone().into()),
+                        enabled: update.profile.is_some(),
+                        record_id: update.profile.as_ref().map(|a| a.cloud_kit_record_key.clone()),
+                        unk2: true,
+                        unk3: Some(true),
+                        wallpaper_data_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.wallpaper_tag.clone().into())),
+                        low_res_wallpaper_data_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.low_res_wallpaper_tag.clone().into())),
+                        wallpaper_meta_key: update.profile.as_ref().and_then(|a| a.poster.as_ref().map(|a| a.message_tag.clone().into())),
+                    },
+                    unk1: 70000,
+                };
+                plist_to_bin(&raw).unwrap()
+            },
+            Message::UpdateProfileSharing(update) => {
+                let raw = RawProfileSharingUpdateMessage {
+                    profile: update.clone(),
+                    unk1: 70000,
+                };
+                plist_to_bin(&raw).unwrap()
+            }
+            Message::ShareProfile(share) => {
+                plist_to_bin(&RawShareProfileMessage {
+                    cloud_kit_decryption_record_key: share.cloud_kit_decryption_record_key.clone().into(),
+                    cloud_kit_record_key: share.cloud_kit_record_key.clone(),
+                    wallpaper_message_tag: share.poster.as_ref().map(|p| p.message_tag.clone().into()),
+                    wallpaper_tag: share.poster.as_ref().map(|p| p.wallpaper_tag.clone().into()),
+                    low_res_wallpaper_tag: share.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into()),
+                    wallpaper_update_key: if share.poster.is_some() { Some("YES".to_string()) } else { None },
+                    update_info_included: if share.poster.is_some() { Some(15) } else { None },
+                }).unwrap()
+            }
             Message::MarkUnread => {
                 let raw = RawMarkUnread {
                     msg_id: self.id.clone()
@@ -1764,29 +2024,13 @@ impl MessageInst {
             },
             Message::StopTyping => {
                 let raw = RawIMessage {
-                    text: None,
-                    xml: None,
                     participants: conversation.participants.clone(),
-                    after_guid: None,
                     sender_guid: conversation.sender_guid.clone(),
                     pv: 0,
                     gv: "8".to_string(),
                     v: "1".to_string(),
-                    effect: None,
                     cv_name: conversation.cv_name.clone(),
-                    reply: None,
-                    inline0: None,
-                    inline1: None,
-                    live_xml: None,
-                    subject: None,
-                    balloon_id: None,
-                    balloon_part: None,
-                    balloon_part_mmcs: None,
-                    app_info: None,
-                    voice_audio: None,
-                    voice_e: None,
-                    schedule_date: None,
-                    schedule_type: None,
+                    ..Default::default()
                 };
         
                 plist_to_bin(&raw).unwrap()
@@ -1849,6 +2093,13 @@ impl MessageInst {
                     balloon_part_mmcs,
                     are: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
                     arc: if react.reaction.is_balloon() { Some("".to_string()) } else { None },
+                    cloud_kit_decryption_record_key: react.embedded_profile.as_ref().map(|p| p.cloud_kit_decryption_record_key.clone().into()),
+                    cloud_kit_record_key: react.embedded_profile.as_ref().map(|p| p.cloud_kit_record_key.clone()),
+                    wallpaper_message_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
+                    wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.wallpaper_tag.clone().into())),
+                    low_res_wallpaper_tag: react.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into())),
+                    wallpaper_update_key: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
+                    update_info_included: react.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
                 };
                 plist_to_bin(&raw).unwrap()
             },
@@ -1903,6 +2154,13 @@ impl MessageInst {
                             voice_e: if normal.voice { Some(true) } else { None },
                             schedule_date: if !scheduled { normal.scheduled.clone().map(|i| (SystemTime::UNIX_EPOCH + Duration::from_millis(i.ms)).into()) } else { None },
                             schedule_type: if normal.scheduled.is_some() && !scheduled { Some(2) } else { None },
+                            cloud_kit_decryption_record_key: normal.embedded_profile.as_ref().map(|p| p.cloud_kit_decryption_record_key.clone().into()),
+                            cloud_kit_record_key: normal.embedded_profile.as_ref().map(|p| p.cloud_kit_record_key.clone()),
+                            wallpaper_message_tag: normal.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.message_tag.clone().into())),
+                            wallpaper_tag: normal.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.wallpaper_tag.clone().into())),
+                            low_res_wallpaper_tag: normal.embedded_profile.as_ref().and_then(|p| p.poster.as_ref().map(|p| p.low_res_wallpaper_tag.clone().into())),
+                            wallpaper_update_key: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
+                            update_info_included: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
                         };
         
                         if normal.parts.is_multipart() {
@@ -2151,6 +2409,26 @@ impl MessageInst {
                 return wrapper.to_message(None, Message::MarkUnread);
             }
         }
+        let shared_profile = if let Ok(loaded) = plist::from_value::<RawShareProfileMessage>(&value) {
+            let shared_profile = ShareProfileMessage {
+                cloud_kit_decryption_record_key: loaded.cloud_kit_decryption_record_key.clone().into(),
+                cloud_kit_record_key: loaded.cloud_kit_record_key.clone(),
+                poster: if let (Some(w), Some(lrw), Some(m)) = (loaded.wallpaper_tag, loaded.low_res_wallpaper_tag, loaded.wallpaper_message_tag) {
+                    Some(SharedPoster {
+                        low_res_wallpaper_tag: lrw.into(),
+                        wallpaper_tag: w.into(),
+                        message_tag: m.into(),
+                    })
+                } else { None }
+            };
+            if wrapper.command == 131 {
+                return wrapper.to_message(None, Message::ShareProfile(shared_profile))
+            }
+            if wrapper.command != 100 {
+                warn!("New profile embed??");
+            }
+            Some(shared_profile)
+        } else { None };
         if let Ok(loaded) = plist::from_value::<RawMoveToTrash>(&value) {
             return match loaded {
                 RawMoveToTrash { chat, message, recoverable_delete_date: Some(recoverable_delete_date), is_permanent_delete: false, .. } => {
@@ -2209,6 +2487,27 @@ impl MessageInst {
                 file: loaded.new_icon.map(|icon| icon.local_user_info.into()),
                 group_version: loaded.group_version
             }))
+        }
+        if let Ok(loaded) = plist::from_value::<RawProfileUpdateMessage>(&value) {
+            return wrapper.to_message(None, Message::UpdateProfile(UpdateProfileMessage {
+                profile: if let (Some(key), Some(record)) = (loaded.profile.key, loaded.profile.record_id) {
+                    Some(ShareProfileMessage { 
+                        cloud_kit_decryption_record_key: key.into(), 
+                        cloud_kit_record_key: record, 
+                        poster: if let (Some(wallpaper), Some(low_res_wallpaper), Some(meta)) = (loaded.profile.wallpaper_data_key, loaded.profile.low_res_wallpaper_data_key, loaded.profile.wallpaper_meta_key) {
+                            Some(SharedPoster {
+                                low_res_wallpaper_tag: low_res_wallpaper.into(),
+                                wallpaper_tag: wallpaper.into(),
+                                message_tag: meta.into(),
+                            })
+                        } else { None }
+                    })
+                } else { None },
+                share_contacts: loaded.profile.share_automatically == 1
+            }))
+        }
+        if let Ok(loaded) = plist::from_value::<RawProfileSharingUpdateMessage>(&value) {
+            return wrapper.to_message(None, Message::UpdateProfileSharing(loaded.profile))
         }
         if let Ok(loaded) = plist::from_value::<RawRenameMessage>(&value) {
             return wrapper.to_message(Some(ConversationData {
@@ -2280,6 +2579,7 @@ impl MessageInst {
                 to_part,
                 to_text: "".to_string(),
                 reaction: msg,
+                embedded_profile: shared_profile,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawMmsIncomingMessage>(&value) {
@@ -2329,6 +2629,7 @@ impl MessageInst {
                     link_meta: None,
                     voice: false,
                     scheduled: None,
+                    embedded_profile: None,
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -2359,6 +2660,7 @@ impl MessageInst {
                 link_meta: None,
                 voice: false,
                 scheduled: None,
+                embedded_profile: None,
             }))
         }
         if let Ok(loaded) = plist::from_value::<RawIMessage>(&value) {
@@ -2444,6 +2746,7 @@ impl MessageInst {
                     // we have no way of knowing if it is actually scheduled or not
                     ScheduleMode { ms: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64, schedule: true }
                 }),
+                embedded_profile: shared_profile,
             }))
         }
         Err(PushError::BadMsg)

@@ -10,6 +10,7 @@ mod ids;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
+pub mod cloudkit;
 
 #[cfg(feature = "macOS")]
 mod macos;
@@ -29,7 +30,7 @@ use async_trait::async_trait;
 pub use mmcs::{FileContainer, prepare_put};
 pub use omnisette::AnisetteProvider;
 use icloud_auth::LoginClientInfo;
-pub use imessage::messages::{MessageInst, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
+pub use imessage::messages::{UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use openssl::conf;
 use util::encode_hex;
@@ -42,6 +43,9 @@ pub use error::PushError;
 pub use macos::MacOSConfig;
 #[cfg(feature = "macOS")]
 pub use open_absinthe::nac::HardwareConfig;
+pub use cloudkit_proto;
+pub use cloudkit_derive;
+pub use imessage::name_photo_sharing;
 
 use plist::Dictionary;
 pub use relay::RelayConfig;
@@ -78,6 +82,7 @@ pub trait OSConfig: Sync + Send {
     fn get_serial_number(&self) -> String;
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String>;
     fn get_aoskit_version(&self) -> String;
+    fn get_udid(&self) -> String { "55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string() }
 
     fn get_adi_mme_info(&self, for_item: &str) -> String {
         self.get_mme_clientinfo(for_item)

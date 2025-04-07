@@ -1,4 +1,6 @@
 /target
+/cloudkit-derive/target
+/cloudkit-proto/target
 /config.json
 /config.plist
 /out

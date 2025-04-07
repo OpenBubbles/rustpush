@@ -14,9 +14,11 @@ message AuthorizePut {
             uint32 chunk_count = 1;
             string profile_type = 101;
             optional uint32 f103 = 103;
+            optional string f102 = 102;
+            optional string f104 = 104;
         }
         bytes sig = 1;
-        string token = 2;
+        optional string token = 2;
         repeated Chunk chunks = 3;
         Footer footer = 8;
     }

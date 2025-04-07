@@ -117,6 +117,35 @@ struct RawReactMessage {
     balloon_id: Option<String>,
     are: Option<String>,
     arc: Option<String>,
+    #[serde(rename = "CloudKitDecryptionRecordKey")]
+    cloud_kit_decryption_record_key: Option<Data>,
+    #[serde(rename = "CloudKitRecordKey")]
+    cloud_kit_record_key: Option<String>,
+    #[serde(rename = "WallpaperUpdateKey")]
+    wallpaper_update_key: Option<String>,
+    #[serde(rename = "UpdateInfoIncluded")]
+    update_info_included: Option<u32>,
+    #[serde(rename = "nWDK")]
+    wallpaper_tag: Option<Data>,
+    #[serde(rename = "nLRWDK")]
+    low_res_wallpaper_tag: Option<Data>,
+    #[serde(rename = "nWMK")]
+    wallpaper_message_tag: Option<Data>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RawShareProfileMessage {
+    cloud_kit_decryption_record_key: Data,
+    cloud_kit_record_key: String,
+    wallpaper_update_key: Option<String>,
+    update_info_included: Option<u32>,
+    #[serde(rename = "nWDK")]
+    wallpaper_tag: Option<Data>,
+    #[serde(rename = "nLRWDK")]
+    low_res_wallpaper_tag: Option<Data>,
+    #[serde(rename = "nWMK")]
+    wallpaper_message_tag: Option<Data>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -140,6 +169,44 @@ struct RawUpdateExtensionMessage {
     target_id: String,
     #[serde(rename = "srpi")]
     new_info: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawProfileUpdate {
+    #[serde(rename = "mcAK")]
+    share_automatically: u64, // 1 contacts, 2 always ask
+    #[serde(rename = "nDK")]
+    key: Option<Data>,
+    #[serde(rename = "mcEK")]
+    enabled: bool,
+    #[serde(rename = "nRID")]
+    record_id: Option<String>,
+    #[serde(rename = "mcIFK")]
+    unk2: bool,
+    #[serde(rename = "mcNFK")]
+    unk3: Option<bool>,
+    #[serde(rename = "nLRWDK")]
+    low_res_wallpaper_data_key: Option<Data>,
+    #[serde(rename = "nWDK")]
+    wallpaper_data_key: Option<Data>,
+    #[serde(rename = "nWMK")]
+    wallpaper_meta_key: Option<Data>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawProfileUpdateMessage {
+    #[serde(rename = "pID")]
+    profile: RawProfileUpdate,
+    #[serde(rename = "gC")]
+    unk1: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawProfileSharingUpdateMessage {
+    #[serde(rename = "pID")]
+    profile: UpdateProfileSharingMessage,
+    #[serde(rename = "gC")]
+    unk1: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -289,7 +356,7 @@ struct RawMMCSBalloon {
     size: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: Option<String>,
@@ -334,10 +401,24 @@ struct RawIMessage {
     schedule_date: Option<Date>,
     #[serde(rename = "st")]
     schedule_type: Option<u32>,
+    #[serde(rename = "CloudKitDecryptionRecordKey")]
+    cloud_kit_decryption_record_key: Option<Data>,
+    #[serde(rename = "CloudKitRecordKey")]
+    cloud_kit_record_key: Option<String>,
+    #[serde(rename = "WallpaperUpdateKey")]
+    wallpaper_update_key: Option<String>,
+    #[serde(rename = "UpdateInfoIncluded")]
+    update_info_included: Option<u32>,
+    #[serde(rename = "nWDK")]
+    wallpaper_tag: Option<Data>,
+    #[serde(rename = "nLRWDK")]
+    low_res_wallpaper_tag: Option<Data>,
+    #[serde(rename = "nWMK")]
+    wallpaper_message_tag: Option<Data>,
 }
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct RawBalloonData {
     ldtext: Option<String>,
@@ -368,7 +449,7 @@ impl Serialize for RawBalloonData {
         ].into_iter());
 
         if let Some(appid) = &self.appid {
-            dict["appid"] = appid.into();
+            dict.insert("appid".to_string(), appid.into());
         }
 
         if let Some(ldtext) = &self.ldtext {

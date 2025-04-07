@@ -146,7 +146,7 @@ impl OSConfig for RelayConfig {
 
         let result: DataResp = result.json().await?;
 
-        Ok(base64_decode(result.data))
+        Ok(base64_decode(&result.data))
     }
 
     fn get_register_meta(&self) -> RegisterMeta {
