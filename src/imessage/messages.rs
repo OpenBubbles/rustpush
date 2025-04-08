@@ -1861,14 +1861,6 @@ impl MessageInst {
                 !my_handles.contains(p)
             });
         }
-        if let Message::PeerCacheInvalidate = self.message {
-            if target_participants.len() > 1 {
-                // if we're sending to a chat, don't send to us again.
-                target_participants.retain(|p| {
-                    !my_handles.contains(p)
-                });
-            }
-        }
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }

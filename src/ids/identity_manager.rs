@@ -637,9 +637,9 @@ impl IdentityResource {
        Ok(())
     }
 
-    pub async fn handle(&self, msg: APSMessage) -> Result<(), PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload } = msg.clone() else { return Ok(()) };
-        if topic != sha1("com.apple.private.ids".as_bytes()) { return Ok(()) };
+    pub async fn handle(&self, msg: APSMessage) -> Result<bool, PushError> {
+        let APSMessage::Notification { id: _, topic, token: _, payload } = msg.clone() else { return Ok(false) };
+        if topic != sha1("com.apple.private.ids".as_bytes()) { return Ok(false) };
 
         #[derive(Deserialize)]
         struct IDSPrivateMessage {
@@ -664,11 +664,15 @@ impl IdentityResource {
                     info!("New handles; reregistering! {:?} {:?}", real_handles, my_handles);
                     self.manager().await.refresh().await?;
                 }
+            },
+            34 => {
+                debug!("IDS said devices changed");
+                return Ok(true)
             }
             _ => {}
         } 
 
-        Ok(()) 
+        Ok(false) 
     }
 
     pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {

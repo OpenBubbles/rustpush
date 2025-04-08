@@ -170,7 +170,18 @@ impl IMClient {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<MessageInst>, PushError> {
-        self.identity.handle(msg.clone()).await?;
+        if self.identity.handle(msg.clone()).await? {
+            return Ok(Some(MessageInst {
+                id: Uuid::new_v4().to_string(),
+                sender: None,
+                conversation: None,
+                message: Message::PeerCacheInvalidate,
+                sent_timestamp: 0,
+                target: None,
+                send_delivered: false,
+                verification_failed: false,
+            }))
+        }
         if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
             let recieved = self.process_msg(received).await;
             if let Ok(Some(recieved)) = &recieved { info!("recieved {recieved}"); }
@@ -247,14 +258,7 @@ impl IMClient {
         } = &payload {
             let mut cache_lock = self.identity.cache.lock().await;
             cache_lock.invalidate(&target, &sender);
-            return Ok(if sender == target {
-                self.identity.ensure_private_self(&mut cache_lock, &target, true).await?;
-                let private_self = &cache_lock.cache["com.apple.madrid"].get(target).unwrap().private_data;
-
-                payload.to_message(None, Message::PeerCacheInvalidate).ok()
-            } else {
-                None
-            })
+            return Ok(None)
         }
 
         if let IDSRecvMessage {

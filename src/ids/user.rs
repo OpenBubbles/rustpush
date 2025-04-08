@@ -990,7 +990,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
             if status != 0 {
-                if status == 6009 {
+                if status == 6009 || status == 6001 {
                     if let Some(alert) = user_dict.get("alert") {
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
                     }
