@@ -667,6 +667,14 @@ impl IdentityResource {
             },
             34 => {
                 debug!("IDS said devices changed");
+                // invalidate my handle cache
+                let handles = self.get_handles().await;
+                let mut cache = self.cache.lock().await;
+                for handle in &handles {
+                    for handle2 in &handles {
+                        cache.invalidate(handle, &handle2);
+                    }
+                }
                 return Ok(true)
             }
             _ => {}
