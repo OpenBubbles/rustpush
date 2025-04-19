@@ -1529,7 +1529,8 @@ pub enum Message {
     Unschedule,
     UpdateProfile(UpdateProfileMessage),
     UpdateProfileSharing(UpdateProfileSharingMessage),
-    ShareProfile(ShareProfileMessage)
+    ShareProfile(ShareProfileMessage),
+    NotifyAnyways,
 }
 
 
@@ -1573,6 +1574,7 @@ impl Message {
             Self::UpdateProfile(_) => 180,
             Self::UpdateProfileSharing(_) => 180,
             Self::ShareProfile(_) => 131,
+            Self::NotifyAnyways => 113,
         }
     }
 
@@ -1642,6 +1644,7 @@ impl Message {
             Self::UpdateProfile(_) => Some(true),
             Self::ShareProfile(_) => Some(true),
             Self::UpdateProfileSharing(_) => Some(true),
+            Self::NotifyAnyways => Some(true),
             _ => None
         }
     }
@@ -1724,6 +1727,9 @@ impl fmt::Display for Message {
             },
             Message::UpdateProfileSharing(_) => {
                 write!(f, "Shared to someone else")
+            },
+            Message::NotifyAnyways => {
+                write!(f, "Notify anyways")
             }
         }
     }
@@ -1827,6 +1833,7 @@ impl MessageInst {
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
             Message::Unschedule => false,
+            Message::NotifyAnyways => false,
             _ => true
         }
     }
@@ -2256,6 +2263,7 @@ impl MessageInst {
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),
+            Message::NotifyAnyways => { panic!("No Message body!") }
             Message::Unschedule => panic!("no enc body!"),
             Message::Unsend(msg) => {
                 let raw = RawUnsendMessage {

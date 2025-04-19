@@ -145,7 +145,7 @@ impl CompactECKey<Private> {
         }
     }
 
-    fn sign_raw(&self, digest: MessageDigest, data: &[u8]) -> Result<[u8; 64], PushError> {
+    pub fn sign_raw(&self, digest: MessageDigest, data: &[u8]) -> Result<[u8; 64], PushError> {
         let mut my_signer = Signer::new(digest, self.get_pkey().as_ref())?;
         let data = my_signer.sign_oneshot_to_vec(&data)?;
         let parsed: ECSignature = rasn::der::decode(&data).expect("RASN couldn't decode??");
@@ -171,7 +171,7 @@ impl<T: HasPublic> CompactECKey<T> {
         x.to_vec_padded(32).unwrap().try_into().expect("Bad compressed key size!")
     }
 
-    fn verify(&self, digest: MessageDigest, data: &[u8], signature: [u8; 64]) -> Result<(), PushError> {
+    pub fn verify(&self, digest: MessageDigest, data: &[u8], signature: [u8; 64]) -> Result<(), PushError> {
         let encoded = rasn::der::encode(&ECSignature {
             r: BigInt::from_bytes_be(Sign::Plus, &signature[..32]),
             s: BigInt::from_bytes_be(Sign::Plus, &signature[32..]),

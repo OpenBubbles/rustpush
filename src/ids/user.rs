@@ -875,6 +875,7 @@ impl IDSService {
     pub fn hash_data(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         plist_to_bin(&self.client_data).unwrap().hash(&mut hasher);
+        self.sub_services.hash(&mut hasher);
         hasher.finish()
     }
 }

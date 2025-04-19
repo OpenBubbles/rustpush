@@ -11,6 +11,7 @@ pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
 pub mod cloudkit;
+pub mod statuskit;
 
 #[cfg(feature = "macOS")]
 mod macos;

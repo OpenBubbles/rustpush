@@ -132,4 +132,14 @@ pub enum PushError {
     CloudKitError(cloudkit_proto::response_operation::Result),
     #[error("NickName Crypto Error: {0}")]
     NickNameCryptoError(String),
+    #[error("APS Channel subscribe Error: {0}")]
+    ChannelSubscribeError(u8),
+    #[error("APS Channel publish Error: {0}")]
+    ChannelPublishError(u32),
+    #[error("Ensure Channel Error: {0}")]
+    StatusKitEnsureChannelError(u32),
+    #[error("Ratchet key missing, wanted {0}")]
+    RatchetKeyMissing(u64),
+    #[error("StatusKit Auth Missing")]
+    StatusKitAuthMissing,
 }

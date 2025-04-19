@@ -556,7 +556,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<Vec<String>>, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload } = msg else { return Ok(None) };
+        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(None) };
         if topic != sha1("com.apple.sharedstreams".as_bytes()) { return Ok(None) };
 
         #[derive(Deserialize)]

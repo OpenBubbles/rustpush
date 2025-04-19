@@ -1,11 +1,12 @@
 
-use std::{borrow::BorrowMut, cmp::min, collections::HashMap, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
+use std::{borrow::BorrowMut, cmp::min, collections::HashMap, fmt::Debug, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, net::ToSocketAddrs, sync::{atomic::{AtomicU32, AtomicU64, Ordering}, Arc, Weak}, time::{Duration, SystemTime}};
 
 use backon::ExponentialBuilder;
 use deku::prelude::*;
 use log::{debug, error, info};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer};
 use plist::Value;
+use prost::Message;
 use rand::{Rng, RngCore};
 use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
 use serde::{Deserialize, Serialize};
@@ -13,9 +14,9 @@ use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, util::{bin_deserialize_opt, bin_serialize_opt, get_bag, KeyPair, Resource, ResourceManager, APNS_BAG}, OSConfig, PushError};
+use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{base64_encode, bin_deserialize_opt, bin_serialize, bin_deserialize, bin_serialize_opt, get_bag, KeyPair, Resource, ResourceManager, APNS_BAG}, OSConfig, PushError};
 
-#[derive(DekuRead, DekuWrite, Clone)]
+#[derive(DekuRead, DekuWrite, Clone, Debug)]
 #[deku(endian = "big")]
 struct APSRawField {
     id: u8,
@@ -25,7 +26,7 @@ struct APSRawField {
     value: Vec<u8>,
 }
 
-#[derive(DekuRead, DekuWrite, Clone)]
+#[derive(DekuRead, DekuWrite, Clone, Debug)]
 struct APSRawMessage {
     command: u8,
     #[deku(update = "self.body.iter().fold(0, |acc, i| acc + 3 + i.value.len())")]
@@ -44,7 +45,7 @@ impl APSRawMessage {
 pub fn get_message<'t, F, T>(mut pred: F, topics: &'t [&str]) -> impl FnMut(APSMessage) -> Option<T> + 't
     where F: FnMut(Value) -> Option<T> + 't {
     move |msg| {
-        if let APSMessage::Notification { id: _, topic, token: _, payload } = msg {
+        if let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg {
             if !topics.iter().any(|t| sha1(t.as_bytes()) == topic) {
                 return None
             }
@@ -54,6 +55,26 @@ pub fn get_message<'t, F, T>(mut pred: F, topics: &'t [&str]) -> impl FnMut(APSM
         }
         None
     }
+}
+
+#[derive(Serialize, Deserialize, Hash, Clone, PartialEq, Eq)]
+pub struct APSChannelIdentifier {
+    pub topic: String,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub id: Vec<u8>,
+}
+
+impl Debug for APSChannelIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Channel {} on topic {}", base64_encode(&self.id), self.topic)
+    }
+}
+
+#[derive(Hash, Clone, Debug)]
+pub struct APSChannel {
+    pub identifier: APSChannelIdentifier,
+    pub last_msg_ns: u64,
+    pub subscribe: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +87,7 @@ pub enum APSMessage {
         topic: [u8; 20],
         token: Option<[u8; 32]>,
         payload: Vec<u8>,
+        channel: Option<Channel>,
     },
     Ping,
     Ack {
@@ -91,6 +113,17 @@ pub enum APSMessage {
         token: Option<[u8; 32]>,
         status: u8,
     },
+    SubscribeToChannels {
+        index: u32,
+        channels: Vec<APSChannel>,
+        is_initial: bool,
+        token: [u8; 32],
+    },
+    SubscribeConfirm {
+        index: u32,
+        token: [u8; 32],
+        status: u8,
+    },
     NoStorage,
     Pong,
 }
@@ -108,7 +141,7 @@ impl APSMessage {
                     ]
                 }
             },
-            Self::Notification { id, topic, token, payload } => {
+            Self::Notification { id, topic, token, payload, channel: _ } => {
                 APSRawMessage {
                     command: 0xa,
                     length: 0,
@@ -167,9 +200,43 @@ impl APSMessage {
                     ].concat()
                 }
             },
+            Self::SubscribeToChannels { channels, is_initial, index, token } => {
+                let values = channels.iter().fold(HashMap::<String, SubscribedTopic>::new(), |mut acc, v| {
+                    let entry = acc.entry(v.identifier.topic.clone()).or_insert_with(|| SubscribedTopic { topic: v.identifier.topic.clone(), ..Default::default() });
+                    if v.subscribe {
+                        entry.channels.push(Channel {
+                            id: v.identifier.id.clone(),
+                            last_msg_ns: v.last_msg_ns,
+                        });
+                    } else {
+                        entry.unsub_channels.push(Channel {
+                            id: v.identifier.id.clone(),
+                            last_msg_ns: 0,
+                        });
+                    }
+                    acc
+                });
+
+                let msg = SubscribeToChannel {
+                    unk1: 1,
+                    topics: values.into_values().collect(),
+                    replace: Some(*is_initial)
+                };
+
+                APSRawMessage {
+                    command: 0x1d,
+                    length: 0,
+                    body: vec![
+                        APSRawField { id: 1, value: index.to_be_bytes().to_vec(), length: 0 },
+                        APSRawField { id: 2, value: msg.encode_to_vec(), length: 0 },
+                        APSRawField { id: 3, value: token.to_vec(), length: 0 },
+                    ],
+                }
+            }
             Self::ConnectResponse { token: _, status: _ } => panic!("can't encode ConnectResponse!"),
             Self::NoStorage => panic!("can't encode NoStorage!"),
-            Self::Pong => panic!("I only ping!")
+            Self::Pong => panic!("I only ping!"),
+            Self::SubscribeConfirm { .. } => panic!("I can't confirm!"), 
         }
     }
 
@@ -183,6 +250,7 @@ impl APSMessage {
                 topic: raw.get_field(2).unwrap().try_into().unwrap(),
                 token: raw.get_field(1).map(|i| i.try_into().unwrap()),
                 payload: raw.get_field(3).unwrap().try_into().unwrap(),
+                channel: raw.get_field(0x1d).map(|f| Channel::decode(Cursor::new(f)).expect("Invalid channel?"))
             }),
             0xc => Some(Self::Ping),
             0xb => Some(Self::Ack {
@@ -203,6 +271,11 @@ impl APSMessage {
             }),
             0xe => Some(Self::NoStorage),
             0xd => Some(Self::Pong),
+            0x1d => Some(Self::SubscribeConfirm {
+                index: u32::from_be_bytes(raw.get_field(1).unwrap().try_into().unwrap()),
+                token: raw.get_field(3).unwrap().try_into().unwrap(),
+                status: raw.get_field(4).unwrap().remove(0),
+            }),
             _ => None,
         }
     }
@@ -266,6 +339,7 @@ pub struct APSConnectionResource {
     reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
     topics: Mutex<HashMap<&'static str, u64>>,
+    sub_counter: AtomicU32,
 }
 
 const APNS_PORT: u16 = 5223;
@@ -362,6 +436,7 @@ impl APSConnectionResource {
             reader: Mutex::new(None),
             manager: Mutex::new(None),
             topics: Mutex::new(HashMap::new()),
+            sub_counter: AtomicU32::new(1),
         });
         
         let result = connection.generate().await;
@@ -389,7 +464,7 @@ impl APSConnectionResource {
         tokio::spawn(async move {
             loop {
                 match ack_receiver.recv().await {
-                    Ok(APSMessage::Notification { id, topic: _, token: _, payload: _ }) => {
+                    Ok(APSMessage::Notification { id, topic: _, token: _, payload: _, channel: _ }) => {
                         let _ = ack_ref.send(APSMessage::Ack { token: Some(ack_ref.get_token().await), for_id: id, status: 0 }).await;
                     }
                     Err(RecvError::Closed) => break,
@@ -489,7 +564,8 @@ impl APSConnectionResource {
             id: my_id,
             topic: sha1(topic.as_bytes()),
             token: Some(self.get_token().await),
-            payload: data
+            payload: data,
+            channel: None,
         }).await?;
         let status = self.wait_for_timeout(self.subscribe().await, |msg| {
             let APSMessage::Ack { token: _token, for_id: _, status } = msg else { return None };
@@ -552,6 +628,29 @@ impl APSConnectionResource {
         Ok(())
     }
 
+    pub async fn subscribe_channels(&self, channels: &[APSChannel], replace: bool) -> Result<(), PushError> {
+        debug!("Subscribing to APS channels {:?}", channels);
+        let receiver = self.subscribe().await;
+        let token = self.get_token().await;
+        let my_index = self.sub_counter.fetch_add(1, Ordering::Relaxed);
+        self.send(APSMessage::SubscribeToChannels {
+            token,
+            index: my_index,
+            channels: channels.to_vec(),
+            is_initial: replace
+        }).await?;
+        self.wait_for_timeout(receiver, |msg| {
+            let APSMessage::SubscribeConfirm { index, token: recv_token, status } = msg else { return None };
+            if token != recv_token || index != my_index {
+                return None
+            }
+            if status != 0 {
+                error!("Subscribe confirmed failed!");
+                return Some(Err(PushError::ChannelSubscribeError(status)))
+            }
+            Some(Ok(()))
+        }).await?
+    }
 
     async fn filter(&self, enabled: &[&str], ignored: &[&str], opportunistic: &[&str], paused: &[&str]) -> Result<(), PushError> {
         debug!("Filtering to {enabled:?} {ignored:?} {opportunistic:?} {paused:?}");

@@ -1,5 +1,5 @@
 
-use std::{fs::File, io::Cursor, num::ParseIntError, path::PathBuf, sync::Arc, time::{Duration, SystemTime}};
+use std::{fs::File, io::Cursor, num::ParseIntError, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
 
 use base64::engine::general_purpose;
 use cloudkit_derive::CloudKitRecord;
@@ -9,7 +9,7 @@ use icloud_auth::AppleAccount;
 use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, cloudkit::{record_identifier_from_string, CloudKitClient, CloudKitContainer, CloudKitOperation, CloudKitSession, CloudKitState}, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, ProfilesClient}, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, UpdateProfileMessage, MADRID_SERVICE};
+use rustpush::{authenticate_apple, cloudkit::{record_identifier_from_string, CloudKitClient, CloudKitContainer, CloudKitOperation, CloudKitSession, CloudKitState}, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, ProfilesClient}, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, UpdateProfileMessage, MADRID_SERVICE};
 use sha2::Sha256;
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
@@ -135,6 +135,7 @@ async fn main() {
 	
     let saved_state: Option<SavedState> = plist::from_reader_xml(Cursor::new(&data)).ok();
 
+    let state: Arc<Mutex<Option<SavedState>>> = Arc::new(Mutex::new(None));
     let (connection, error) = 
         APSConnectionResource::new(
             config.clone(),
@@ -182,6 +183,12 @@ async fn main() {
         let pet = account.get_pet().unwrap();
         let spd = account.spd.as_ref().unwrap();
 
+        let statuskitstate = StatusKitState {
+            auth_token: account.tokens["com.apple.gs.sharedchannels.auth"].clone(),
+            ..Default::default()
+        };
+        std::fs::write("statuskit.plist", plist_to_string(&statuskitstate).unwrap()).unwrap();
+
         let delegates = login_apple_delegates(&user_trimmed, &pet, spd["adsid"].as_string().unwrap(), None, &mut *anisette_client.lock().await, config.as_ref(), &[LoginDelegate::IDS, LoginDelegate::MobileMe]).await.unwrap();
         let user = authenticate_apple(delegates.ids.unwrap(), config.as_ref()).await.unwrap();
 
@@ -212,18 +219,19 @@ async fn main() {
         register(config.as_ref(), &*connection.state.read().await, services, &mut users, &identity).await.unwrap();
     }
 
-    let mut state = SavedState {
+    *state.lock().unwrap() = Some(SavedState {
         push: connection.state.read().await.clone(),
         identity: identity.clone(),
         users: users.clone()
-    };
-    fs::write("config.plist", plist_to_string(&state).unwrap()).await.unwrap();
+    });
+    fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).await.unwrap();
     
     let client = IMClient::new(connection.clone(), users, identity, services, "id_cache.plist".into(), config.clone(), Box::new(move |updated_keys| {
-        state.users = updated_keys;
-        std::fs::write("config.plist", plist_to_string(&state).unwrap()).unwrap();
+        state.lock().unwrap().as_mut().unwrap().users = updated_keys;
+        std::fs::write("config.plist", plist_to_string(state.lock().unwrap().as_ref().unwrap()).unwrap()).unwrap();
     })).await;
     let handle = client.identity.get_handles().await[0].clone();
+    // client.identity.ensure_private_self(&mut *client.identity.cache.lock().await, &handle, true).await;
 
     // client.identity.refresh_now().await.unwrap();
     println!("handle {}", handle);
@@ -247,6 +255,14 @@ async fn main() {
     let mut state: Option<ShareProfileMessage> = plist::from_file(&id_path).unwrap_or_default();
     let name_photo_client = ProfilesClient::new(cloudkit.clone());
     // plist::to_file_xml(&id_path, &state).unwrap();
+
+    let state: StatusKitState = plist::from_file("statuskit.plist").unwrap_or_default();
+    let statuskit_client = StatusKitClient::new(state, Box::new(|state| {
+        plist::to_file_xml("statuskit.plist", state).unwrap();
+    }), connection.clone(), config.clone(), client.identity.clone()).await;
+
+    // statuskit_client.invite_to_channel("mailto:sandboxalt@gmail.com", &["mailto:jerrylandgreen@copper.jjtech.dev".to_string()]).await.unwrap();
+    // statuskit_client.share_status(&StatusKitStatus::new_active()).await.unwrap();
 
     // let session: CloudKitSession = CloudKitSession::new();
     // let (record, data) = name_photo_client.container.get_record::<_, TestRecord>(&session, &cloudkit, rustpush::cloudkit_proto::AssetsToDownload {
@@ -423,6 +439,10 @@ async fn main() {
                 let msg = msg.unwrap();
                 let _ = findmy_client.handle(msg.clone()).await;
                 let _ = manager.handle(msg.clone()).await;
+                if let Err(e) = statuskit_client.handle(msg.clone()).await {
+                    error!("Statuskit error {e}");
+                    continue;
+                }
                 match facetime.handle(msg.clone()).await {
                     Err(e) => {
                         error!("Failed to receive {}", e);

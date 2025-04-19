@@ -638,7 +638,7 @@ impl IdentityResource {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<bool, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload } = msg.clone() else { return Ok(false) };
+        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(false) };
         if topic != sha1("com.apple.private.ids".as_bytes()) { return Ok(false) };
 
         #[derive(Deserialize)]
@@ -676,7 +676,7 @@ impl IdentityResource {
     }
 
     pub async fn receive_message(&self, msg: APSMessage, topics: &[&'static str]) -> Result<Option<IDSRecvMessage>, PushError> {
-        let APSMessage::Notification { id: _, topic, token: _, payload } = msg else { return Ok(None) };
+        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = msg else { return Ok(None) };
         let Some(topic) = topics.iter().find(|t| sha1(t.as_bytes()) == topic) else { return Ok(None) };
         debug!("ID got message {topic} {:?}", plist::from_bytes::<Value>(&payload)?);
 
@@ -802,7 +802,7 @@ impl IdentityResource {
             return Err(PushError::BadMsg);
         }
 
-        info!("ID send message {:?}", ids_message);
+        info!("ID send message {:?} to {} targets", ids_message, message_targets.len());
 
         if ids_message.queue_id.is_none() {
             // do not send to self

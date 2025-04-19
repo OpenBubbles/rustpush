@@ -135,6 +135,23 @@ where
     EcKey::private_key_from_der(s.as_ref()).map_err(Error::custom).and_then(|a| a.try_into().map_err(Error::custom))
 }
 
+pub fn ec_serialize<S>(x: &EcKey<Public>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    use serde::ser::Error;
+    s.serialize_bytes(&x.public_key_to_der().map_err(Error::custom)?)
+}
+
+pub fn ec_deserialize_compact<'de, D>(d: D) -> Result<CompactECKey<Public>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let s: Data = Deserialize::deserialize(d)?;
+    EcKey::public_key_from_der(s.as_ref()).map_err(Error::custom).and_then(|a| a.try_into().map_err(Error::custom))
+}
+
 pub fn rsa_serialize_priv<S>(x: &Rsa<Private>, s: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -179,6 +196,7 @@ where
     x.as_ref().map(|a| Data::new(a.encode_to_vec())).serialize(s)
 }
 
+
 pub fn proto_deserialize_opt<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -191,6 +209,28 @@ where
     } else {
         None
     })
+}
+
+
+pub fn proto_serialize_vec<S, T>(x: &Vec<T>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    T: Message,
+{
+    x.iter().map(|a| Data::new(a.encode_to_vec())).collect::<Vec<_>>().serialize(s)
+}
+
+
+pub fn proto_deserialize_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Message + Default,
+{
+    use serde::de::Error;
+    let s: Vec<Data> = Deserialize::deserialize(d)?;
+    s.into_iter().map(|s| {
+        T::decode(&mut Cursor::new(s.as_ref())).map_err(Error::custom)
+    }).collect()
 }
 
 pub fn bin_serialize<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error>

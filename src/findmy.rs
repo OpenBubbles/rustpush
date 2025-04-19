@@ -18,6 +18,8 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     sub_services: &[
         "com.apple.private.alloy.fmf",
         "com.apple.private.alloy.fmd",
+        "com.apple.private.alloy.status.keysharing",
+        "com.apple.private.alloy.status.personal",
     ],
     client_data: &[
         ("supports-fmd-v2", Value::Boolean(true)),

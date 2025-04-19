@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package statuskitp;
+
+message Channel {
+    bytes id = 1;
+    uint64 lastMsgNs = 2;
+}
+
+message SubscribedTopic {
+    string topic = 1;
+    repeated Channel channels = 2;
+    repeated Channel unsubChannels = 3;
+}
+
+message SubscribeToChannel {
+    uint32 unk1 = 1; // always 1
+    repeated SubscribedTopic topics = 2;
+    optional bool replace = 3;
+}
+
+
+message SharedKey {
+    bytes key = 1;
+    uint64 ratchet = 2;
+}
+
+message SharedKeys {
+    repeated SharedKey keys = 1;
+}
+
+message SharedMessage {
+    SharedKeys keys = 1;
+    bytes sigKey = 3;
+}
+
+message PublishedStatus {
+    bytes message = 1;
+    bytes padding = 2;
+}
+
+message ChannelAuth {
+    string token = 1;
+}
+
+message ChannelAllocateRequest {
+    string topic = 1;
+    ChannelAuth auth = 2;
+    optional uint32 unk3 = 3;
+}
+
+message AllocatedChannel {
+    string topic = 1;
+    bytes channelId = 2;
+    bytes channelToken = 3;
+    optional uint32 status = 4;
+}
+
+message ChannelAllocateResponse {
+    uint32 status = 1;
+    AllocatedChannel channel = 2;
+    uint64 time = 4;
+}
+
+message ChannelPublishResponse {
+    uint32 status = 1;
+}
+
+message ChannelPublishMessage {
+    uint64 time_published = 1;
+    AllocatedChannel channel = 2;
+    bytes message = 3;
+    uint64 valid_for = 4;
+    optional bool unk5 = 5;
+    optional bool unk6 = 6;
+    optional bool unk7 = 7;
+    optional bool unk8 = 8;
+}
+
+message ChannelPublishRequest {
+    ChannelAuth auth = 1;
+    ChannelPublishMessage message = 2;
+}
+
