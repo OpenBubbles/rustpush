@@ -3,7 +3,9 @@ use std::{collections::{HashMap, HashSet}, io::Cursor, sync::Arc, time::{Duratio
 use aes_gcm::{aead::AeadMutInPlace, AeadCore, Aes256Gcm, Nonce};
 use aes_gcm::aead::Aead;
 use hkdf::Hkdf;
+use icloud_auth::AppleAccount;
 use log::{debug, error, warn};
+use omnisette::AnisetteProvider;
 use openssl::{hash::MessageDigest, pkey::{Private, Public}, sha::{sha1, sha256}, sign::Verifier};
 use plist::{Data, Dictionary, Value};
 use prost::Message;
@@ -109,7 +111,6 @@ pub struct StatusKitState {
     pub recent_channels: Vec<SKChannel>,
     pub keys: HashMap<String, StatusKitSharedDevice>, // channel ID to key
     pub my_key: Option<StatusKitMyKey>,
-    pub auth_token: String,
 }
 
 impl StatusKitState {
@@ -172,12 +173,12 @@ impl StatusKitStatus {
     }
 }
 
-pub struct ChannelInterestToken {
+pub struct ChannelInterestToken<T: AnisetteProvider + Send + Sync + 'static> {
     topics: Vec<APSChannelIdentifier>,
-    client: Arc<StatusKitClient>,
+    client: Arc<StatusKitClient<T>>,
 }
 
-impl Drop for ChannelInterestToken {
+impl<T: AnisetteProvider + Send + Sync + 'static> Drop for ChannelInterestToken<T> {
     fn drop(&mut self) {
         // we don't care if it succeeds or not; we want to decrement no matter what
         let status_kit_ref = self.client.clone();
@@ -324,7 +325,7 @@ pub enum StatusKitMessage {
     }
 }
 
-pub struct StatusKitClient {
+pub struct StatusKitClient<T: AnisetteProvider> {
     pub conn: APSConnection,
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
@@ -333,11 +334,12 @@ pub struct StatusKitClient {
     update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>,
     active_channels: Mutex<HashMap<APSChannelIdentifier, u64>>, // *wanted* channels (with interest token)
     published_channels: RwLock<HashSet<APSChannelIdentifier>>, // currently subscribed channels, from the POV of APNs
+    account: Arc<Mutex<AppleAccount<T>>>,
 }
 
-impl StatusKitClient {
-    pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<StatusKitClient> {
-        let skclient = Arc::new(StatusKitClient {
+impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
+    pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, account: Arc<Mutex<AppleAccount<T>>>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<Self> {
+        let skclient = Arc::new(Self {
             _interest_token: conn.request_topics(vec!["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await.0,
             conn: conn.clone(),
             identity,
@@ -346,6 +348,7 @@ impl StatusKitClient {
             update_state,
             active_channels: Mutex::new(HashMap::new()),
             published_channels: RwLock::new(HashSet::new()),
+            account
         });
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -389,6 +392,7 @@ impl StatusKitClient {
     }
 
     pub async fn send_manage_request<ReqMsg: Message, ResMsg: Message + Default>(&self, request: ReqMsg, command: u8) -> Result<ResMsg, PushError> {
+        debug!("Sending channel manage request {command}, {request:?}");
         let msg_id = rand::thread_rng().next_u32();
         let req = ManageRequest {
             request: request.encode_to_vec().into(),
@@ -404,7 +408,7 @@ impl StatusKitClient {
         self.conn.send_message("com.apple.icloud.presence.channel.management", plist_to_bin(&req)?, Some(msg_id)).await?;
 
         Ok(ResMsg::decode(Cursor::new(self.conn.wait_for_timeout(recv, get_message(|loaded| {
-            println!("Got message {:?}", loaded);
+            debug!("Got message {:?}", loaded);
             #[derive(Deserialize)]
             struct Res {
                 c: u8,
@@ -450,19 +454,19 @@ impl StatusKitClient {
         if state.my_key.is_some() {
             return Ok(())
         }
+        drop(state);
 
-        if state.auth_token.len() == 0 {
+        let Some(token) = self.account.lock().await.get_token("com.apple.gs.sharedchannels.auth").await else {
             return Err(PushError::StatusKitAuthMissing)
-        }
+        };
 
         let allocate_request = ChannelAllocateRequest {
             topic: "com.apple.icloud.presence.mode.status".to_string(),
             auth: Some(ChannelAuth {
-                token: state.auth_token.clone()
+                token: token
             }),
             unk3: Some(0),
         };
-        drop(state);
 
         let response: ChannelAllocateResponse = self.send_manage_request(allocate_request, 224).await?;
         if response.status != 0 {
@@ -602,6 +606,10 @@ impl StatusKitClient {
     pub async fn share_status(&self, status: &StatusKitStatus) -> Result<(), PushError> {
         self.ensure_channel().await?;
 
+        let Some(token) = self.account.lock().await.get_token("com.apple.gs.sharedchannels.auth").await else {
+            return Err(PushError::StatusKitAuthMissing)
+        };
+
         let created = SystemTime::now();
 
         let state = self.state.read().await;
@@ -645,7 +653,7 @@ impl StatusKitClient {
 
         let publish_request = ChannelPublishRequest {
             auth: Some(ChannelAuth {
-                token: state.auth_token.clone()
+                token
             }),
             message: Some(ChannelPublishMessage {
                 time_published: publish_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
@@ -667,7 +675,7 @@ impl StatusKitClient {
         Ok(())
     }
 
-    pub async fn request_handles(self: &Arc<Self>, handles: &[String]) -> (ChannelInterestToken, Option<PushError>) {
+    pub async fn request_handles(self: &Arc<Self>, handles: &[String]) -> (ChannelInterestToken<T>, Option<PushError>) {
         let state_lock = self.state.read().await;
         let topics = state_lock.keys.iter().filter(|(c, d)| handles.contains(&d.from)).map(|(c, _)| APSChannelIdentifier {
             topic: "com.apple.icloud.presence.mode.status".to_string(),
@@ -678,7 +686,7 @@ impl StatusKitClient {
         self.request_channels(topics).await
     }
 
-    pub async fn request_channels(self: &Arc<Self>, topics: Vec<APSChannelIdentifier>) -> (ChannelInterestToken, Option<PushError>) {
+    pub async fn request_channels(self: &Arc<Self>, topics: Vec<APSChannelIdentifier>) -> (ChannelInterestToken<T>, Option<PushError>) {
         let mut channel_lock = self.active_channels.lock().await;
         for topic in &topics {
             *channel_lock.entry(topic.clone()).or_default() += 1;
