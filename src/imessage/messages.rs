@@ -2375,7 +2375,8 @@ impl MessageInst {
 
     async fn put_balloon(balloon: Vec<u8>, apns: &APSConnectionResource) -> Result<(Option<Data>, Option<RawMMCSBalloon>), PushError> {
         debug!("balloon size {:?}", balloon.len());
-        if balloon.len() > 7168 {
+        // larger balloon sizes can cause issues (see: messages not sending)
+        if balloon.len() > 1024 {
             let mut cursor = Cursor::new(&balloon);
             let prepared = MMCSFile::prepare_put(&mut cursor).await?;
             cursor.rewind()?;

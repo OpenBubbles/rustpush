@@ -972,7 +972,7 @@ impl InnerSendJob {
         let mut groups = vec![];
         let mut group = vec![];
         let mut group_size = 0;
-        const GROUP_MAX_SIZE: usize = 10000;
+        const GROUP_MAX_SIZE: usize = 5000;
 
         for target in &targets {
             let encrypted = match &message.raw {
