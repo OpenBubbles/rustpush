@@ -142,4 +142,6 @@ pub enum PushError {
     RatchetKeyMissing(u64),
     #[error("StatusKit Auth Missing")]
     StatusKitAuthMissing,
+    #[error("Unknown poster type {0}")]
+    UnknownPoster(String),
 }

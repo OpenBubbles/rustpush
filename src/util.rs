@@ -711,6 +711,8 @@ struct KeyedArchiveClass {
     classname: String,
     #[serde(rename = "$classes", default)]
     classes: Vec<String>,
+    #[serde(rename = "$classhints", default, skip_serializing_if = "Vec::is_empty")]
+    class_hints: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -805,6 +807,85 @@ const CLASS_SPECS: &[ClassData] = &[
         name: "NSArray",
         classes: &["NSArray", "NSObject"],
         uid_fields: &["NS.objects"],
+    },
+    ClassData {
+        name: "PRPosterTitleStyleConfiguration",
+        classes: &["PRPosterTitleStyleConfiguration", "NSObject"],
+        uid_fields: &[
+            "preferredTitleLayout",
+            "preferredTitleAlignment",
+            "titleColor",
+            "contentsLuminence",
+            "groupName",
+            "timeFontConfiguration",
+            "timeNumberingSystem",
+            "titleContentStyle",
+        ]
+    },
+    ClassData {
+        name: "PRPosterColor",
+        classes: &["PRPosterColor", "NSObject"],
+        uid_fields: &["preferredStyle", "identifier", "color"],
+    },
+    ClassData {
+        name: "UIColor",
+        classes: &["UIColor", "NSObject"],
+        uid_fields: &[],
+    },
+    ClassData {
+        name: "PRPosterContentDiscreteColorsStyle",
+        classes: &["PRPosterContentDiscreteColorsStyle", "NSObject"],
+        uid_fields: &["colors"],
+    },
+    ClassData {
+        name: "PRPosterContentVibrantMaterialStyle",
+        classes: &["PRPosterContentVibrantMaterialStyle", "NSObject"],
+        uid_fields: &[]
+    },
+    ClassData {
+        name: "PRPosterSystemTimeFontConfiguration",
+        classes: &["PRPosterSystemTimeFontConfiguration", "PRPosterTimeFontConfiguration", "NSObject"],
+        uid_fields: &["timeFontIdentifier", "weight"],
+    },
+    ClassData {
+        name: "PFPosterMedia",
+        classes: &["PFPosterMedia", "NSObject"],
+        uid_fields: &["assetUUID", "editConfiguration", "subpath"],
+    },
+    ClassData {
+        name: "PFPosterEditConfiguration",
+        classes: &["PFPosterEditConfiguration", "NSObject"],
+        uid_fields: &["style", "visibleFrame", "landscapeVisibleFrame"],
+    },
+    ClassData {
+        name: "PFParallaxLayerStyle",
+        classes: &["PFParallaxLayerStyle", "NSObject"],
+        uid_fields: &["kind", "colorSuggestions", "parameters"],
+    },
+    ClassData {
+        name: "PFParallaxColor",
+        classes: &["PFParallaxColor", "NSObject"],
+        uid_fields: &["rgbValues"],
+    },
+    ClassData {
+        name: "PFWallpaperCompoundDeviceConfiguration",
+        classes: &["PFWallpaperCompoundDeviceConfiguration", "NSObject"],
+        uid_fields: &["portrait", "landscape"],
+    },
+    ClassData {
+        name: "PFParallaxLayoutConfiguration",
+        classes: &["PFParallaxLayoutConfiguration", "NSObject"],
+        uid_fields: &["inactiveTimeRect", "timeRect", "screenSize", "parallaxPadding"],
+    },
+    ClassData {
+        name: "PFPosterConfiguration",
+        classes: &["PFPosterConfiguration", "NSObject"],
+        uid_fields: &["media", "layoutConfiguration", "editConfiguration", "identifier", "userInfo"],
+    },
+    ClassData {
+        name: "PRPosterContentGradientStyle",
+        classes: &["PRPosterContentGradientStyle", "NSObject"],
+        uid_fields: &["colors", "startPoint", "locations", "endPoint"],
     }
 ];
 
@@ -944,6 +1025,7 @@ impl KeyedArchive {
         let class = KeyedArchiveClass {
             classes: spec.classes.iter().map(|i| i.to_string()).collect(),
             classname: spec.name.to_string(),
+            class_hints: if spec.name == "UIColor" { vec!["NSColor".to_string()] } else { vec![] },
         };
         let key = self.archive_key(plist::to_value(&class)?, false)?;
         self.class_uids.insert(class_name.to_string(), (key, spec));
@@ -998,14 +1080,14 @@ impl KeyedArchive {
 
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum NSArrayClass {
     NSArray,
     NSMutableArray,
 }
 
 #[repr(C)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct NSArray<T> {
     #[serde(rename = "NS.objects")]
     pub objects: Vec<T>,

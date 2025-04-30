@@ -66,6 +66,7 @@ pub struct IMessageNameRecord {
     pub last: String,
 }
 
+#[derive(Clone)]
 pub struct IMessagePosterRecord {
     pub low_res_poster: Vec<u8>,
     pub package: Vec<u8>,

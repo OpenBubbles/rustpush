@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>$class</key>
+    <string>PFWallpaperCompoundDeviceConfiguration</string>
+    <key>landscape</key>
+    <string>$null</string>
+    <key>portrait</key>
+    <dict>
+        <key>$class</key>
+        <string>PFParallaxLayoutConfiguration</string>
+        <key>inactiveTimeRect</key>
+        <string>{{0.11282051282051284, 0.75276461295418651}, {0.77435897435897438, 0.10781990521327015}}</string>
+        <key>parallaxPadding</key>
+        <string>{0, 0}</string>
+        <key>screenScale</key>
+        <real>3</real>
+        <key>screenSize</key>
+        <string>{1170, 2532}</string>
+        <key>timeRect</key>
+        <string>{{0.11282051282051284, 0.75276461295418651}, {0.77435897435897438, 0.10781990521327015}}</string>
+        <key>version</key>
+        <integer>2</integer>
+    </dict>
+</dict>
+</plist>

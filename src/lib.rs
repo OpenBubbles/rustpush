@@ -12,6 +12,8 @@ pub mod findmy;
 pub mod facetime;
 pub mod cloudkit;
 pub mod statuskit;
+pub use imessage::posterkit;
+pub use util::KeyedArchive;
 
 #[cfg(feature = "macOS")]
 mod macos;
