@@ -144,4 +144,6 @@ pub enum PushError {
     StatusKitAuthMissing,
     #[error("Unknown poster type {0}")]
     UnknownPoster(String),
+    #[error("Report spam error {0}")]
+    ReportSpamError(u32),
 }

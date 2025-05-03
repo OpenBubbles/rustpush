@@ -18,7 +18,7 @@ use std::fmt::Debug;
 
 use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
-use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions}, IDSRecvMessage};
+use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
 
 const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
 
@@ -164,6 +164,7 @@ impl DeliveryHandle {
             encryption: payload.as_ref().and_then(|i| if i.1 == "pair" { None } else { Some(i.1.to_string()) }),
             payload: payload.map(|i| i.0.into()),
             token: self.delivery_data.push_token.clone().into(),
+            certified_delivery_version: if send_delivered && self.delivery_data.client_data.supports_certified_delivery_v1 { Some(1) } else { None },
         }
     }
 }
@@ -476,6 +477,7 @@ impl IdentityResource {
         // return indicates reregister
     }
 
+    // not a pseudonym
     pub fn user_by_real_handle<'t>(users: &'t Vec<IDSUser>, handle: &str) -> Result<&'t IDSUser, PushError> {
         users.iter().find(|user| user.registration["com.apple.madrid"].handles.contains(&handle.to_string())).ok_or(PushError::HandleNotFound(handle.to_string()))
     }
@@ -568,6 +570,12 @@ impl IdentityResource {
         cache_lock.cache.get_mut("com.apple.madrid").unwrap().get_mut(handle).unwrap().private_data = regs;
         cache_lock.save();
         Ok(())
+    }
+
+    pub async fn report_spam(&self, handle: &str, messages: &[ReportMessage]) -> Result<(), PushError> {
+        let user_lock = self.users.read().await;
+        let my_user = Self::user_by_real_handle(&user_lock, handle)?;
+        my_user.report_spam(self.config.as_ref(), &self.aps, handle, messages).await
     }
 
     pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
@@ -800,6 +808,33 @@ impl IdentityResource {
         Ok(key_cache.get_participants_targets(&topic, handle, &targets).into_iter().filter(|target| search_tokens.contains(&target.delivery_data.push_token)).collect())
     }
 
+    pub async fn certify_delivery(&self, topic: &'static str, delivery: &CertifiedContext, notify: bool) -> Result<(), PushError> {
+        debug!("Certifying delivery for message {} notify {notify}", Uuid::from_bytes(delivery.uuid.clone().try_into().expect("Bad message uuid size!")).to_string());
+        let msg_id = rand::thread_rng().next_u32();
+        let mut dict = Dictionary::from_iter([
+            // sends APN ack
+            ("cdr", Value::Data(delivery.receipt.clone())),
+            ("i", Value::Integer(msg_id.into())),
+            ("c", Value::Integer(109.into())),
+            ("U", Value::Data(delivery.uuid.clone())),
+            ("t", Value::Data(delivery.token.clone())),
+            ("cdv", Value::Integer(delivery.version.into())),
+            ("ua", Value::String(self.config.get_version_ua())),
+            ("v", Value::Integer(8.into())),
+            ("nr", Value::Integer(1.into())),
+        ]);
+        if notify {
+            dict.extend([
+                ("tP".to_string(), Value::String(delivery.sender.clone())),
+                ("sP".to_string(), Value::String(delivery.target.clone())),
+                ("gd".to_string(), Value::Boolean(true)),
+            ]);
+        }
+        self.aps.send_message(topic, plist_to_bin(&dict)?, Some(msg_id)).await?;
+
+        Ok(())
+    }
+
     pub async fn invalidate_id_cache(&self) {
         self.cache.lock().await.invalidate_all();
     }
@@ -890,6 +925,8 @@ pub struct BundledPayload {
     pub token: Data,
     #[serde(rename = "E")]
     pub encryption: Option<String>,
+    #[serde(rename = "cdv")]
+    pub certified_delivery_version: Option<u32>,
 }
 
 

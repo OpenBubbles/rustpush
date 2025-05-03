@@ -18,7 +18,7 @@ use super::identity_manager::KeyCache;
 use rand::{Rng, RngCore};
 use tokio::sync::Mutex;
 
-use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError};
 
 use super::CompactECKey;
 
@@ -628,6 +628,8 @@ pub struct ParsedClientData {
     pub public_message_ngm_device_prekey_data_key: Option<IDSNGMPrekeyIdentity>,
     #[serde(default, deserialize_with = "deserialize_kt_data", serialize_with = "serialize_kt_data")]
     pub ngm_public_identity: Option<CompactECKey<Public>>,
+    #[serde(default)]
+    pub supports_certified_delivery_v1: bool,
 }
 
 pub fn deserialize_kt_data<'de, D>(d: D) -> Result<Option<CompactECKey<Public>>, D::Error>
@@ -692,6 +694,14 @@ impl QueryOptions {
         }
         request
     }
+}
+
+pub struct ReportMessage {
+    pub guid: String,
+    pub sender: String,
+    pub conversation_size: u32,
+    pub parts: MessageParts,
+    pub time_of_message: f64,
 }
 
 
@@ -819,6 +829,95 @@ impl IDSUser {
                 sub_services: dict.get("sub-services").unwrap().as_array().unwrap().iter().map(|id| id.as_string().unwrap().to_string()).collect(),
             })
         }).collect())
+    }
+
+    pub async fn report_spam(&self, config: &dyn OSConfig, aps: &APSConnectionResource, handle: &str, messages: &[ReportMessage]) -> Result<(), PushError> {
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct IDSReportedAttachment {
+            #[serde(rename = "mmcs-UTI-type")]
+            mmcs_uti_type: String,
+            mmcs_owner_id: Option<String>,
+            mmcs_signature_hex: Option<String>,
+            mmcs_symmetric_key: Option<String>,
+            mmcs_url: Option<String>,
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct IDSReportedMessage {
+            conversation_group_size: u32,
+            is_informal: bool,
+            is_payment: bool,
+            is_self: bool,
+            message_attachment_info: Vec<IDSReportedAttachment>,
+            message_format_version: u32,
+            message_has_image: bool, // actually has-attachment
+            message_id: String,
+            message_length: u32,
+            message_service: String,
+            message_spam_model_detected_spam: bool,
+            message_text: Data,
+            sender_uri: String,
+            time_of_message: f64,
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct IDSReport {
+            spam_messages: Vec<IDSReportedMessage>,
+        }
+        
+
+        let request = SignedRequest::new("id-report-spam", Method::POST)
+            .header("x-protocol-version", &self.protocol_version.to_string())
+            .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
+            .header("x-id-self-uri", handle)
+            .header("x-push-token", &base64_encode(&aps.get_token().await))
+            .header("content-encoding", "gzip")
+            .body(gzip(&plist_to_buf(&IDSReport {
+                spam_messages: messages.iter().map(|report| IDSReportedMessage {
+                    conversation_group_size: report.conversation_size,
+                    is_informal: false,
+                    is_payment: false,
+                    is_self: false,
+                    message_attachment_info: report.parts.0.iter().filter_map(|part| {
+                        let MessagePart::Attachment(a) = &part.part else { return None };
+                        let m = if let AttachmentType::MMCS(m) = &a.a_type { Some(m) } else { None };
+                        Some(IDSReportedAttachment {
+                            mmcs_uti_type: a.uti_type.clone(),
+                            mmcs_owner_id: m.map(|a| a.object.clone()),
+                            mmcs_signature_hex: m.map(|a| encode_hex(&a.signature)),
+                            mmcs_symmetric_key: m.map(|a| encode_hex(&a.key)),
+                            mmcs_url: m.map(|a| a.url.clone()),
+                        })
+                    }).collect(),
+                    message_format_version: 2,
+                    message_has_image: report.parts.has_attachments(),
+                    message_id: report.guid.clone(),
+                    message_length: 5,
+                    message_service: "iMessage".to_string(),
+                    message_spam_model_detected_spam: false,
+                    message_text: report.parts.raw_text().into_bytes().into(),
+                    sender_uri: report.sender.clone(),
+                    time_of_message: report.time_of_message,
+                }).collect()
+            })?)?)
+            .sign(&self.registration["com.apple.madrid"].id_keypair, KeyType::Id, &*aps.state.read().await, None)?
+            .send(&REQWEST).await?;
+
+        #[derive(Deserialize)]
+        struct ReportSpamResp {
+            status: u32,
+        }
+
+        let loaded: ReportSpamResp = plist::from_bytes(&request.bytes().await?)?;
+        if loaded.status != 0 {
+            return Err(PushError::ReportSpamError(loaded.status))
+        }
+
+        Ok(())
     }
 
     #[async_recursion]

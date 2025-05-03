@@ -78,10 +78,25 @@ pub struct IDSRecvMessage {
     #[serde(rename = "fM")]
     pub error_for_str: Option<String>,
 
+    #[serde(rename = "cdv")]
+    pub certified_delivery_version: Option<u32>,
+    #[serde(default, rename = "cdr", deserialize_with = "bin_deserialize_opt_vec")]
+    pub certified_delivery_receipt: Option<Vec<u8>>,
+
     #[serde(skip)]
     pub verification_failed: bool,
     #[serde(skip)]
     pub topic: &'static str,
+}
+
+#[derive(Clone)]
+pub struct CertifiedContext {
+    pub version: u32,
+    pub receipt: Vec<u8>,
+    pub sender: String,
+    pub target: String,
+    pub uuid: Vec<u8>,
+    pub token: Vec<u8>,
 }
 
 #[derive(AsnType, Encode, Decode)]

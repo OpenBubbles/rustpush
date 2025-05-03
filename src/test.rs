@@ -496,12 +496,9 @@ async fn main() {
                         println!("{}", msg);
                         print!(">> ");
                         std::io::stdout().flush().unwrap();
-                        if msg.send_delivered {
-                            println!("sending delivered");
-                            let mut msg2 = MessageInst::new(msg.conversation.unwrap(), &handle, Message::Delivered);
-                            msg2.id = msg.id;
-                            msg2.target = msg.target;
-                            let _ = client.send(&mut msg2).await;
+                        if let Some(context) = msg.certified_context {
+                            println!("sending delivered {}", msg.send_delivered);
+                            client.identity.certify_delivery("com.apple.madrid", &context, false).await.unwrap();
                         }
                     }
                 }

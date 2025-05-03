@@ -189,13 +189,18 @@ impl APSMessage {
                     command: 0x7,
                     length: 0,
                     body: [
+                        // apsd [copyConnectMessageWithToken]
                         token.as_ref().map(|token| vec![APSRawField { id: 1, value: token.to_vec(), length: 0 }]).unwrap_or(vec![]),
                         vec![
+                            // state
                             APSRawField { id: 2, value: 1u8.to_be_bytes().to_vec(), length: 0 },
-                            APSRawField { id: 5, value: flags.to_be_bytes().to_vec(), length: 0 },
+                            // prescence flags
+                            APSRawField { id: 5, value: flags.to_be_bytes().to_vec(), length: 0 }, 
                             APSRawField { id: 0xc, value: certificate.clone(), length: 0 },
                             APSRawField { id: 0xd, value: nonce.clone(), length: 0 },
                             APSRawField { id: 0xe, value: signature.clone(), length: 0 },
+                            // some sort of version identifier? Hardcoded into binary; stops apple from sending delivereds on my ack
+                            APSRawField { id: 0x10, value: 9u16.to_be_bytes().to_vec(), length: 0 },
                         ],
                     ].concat()
                 }

@@ -38,8 +38,9 @@ pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
 use openssl::conf;
 use util::encode_hex;
 pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure};
-pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction};
+pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager};
+pub use ids::CertifiedContext;
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate};
 pub use error::PushError;
 #[cfg(feature = "macOS")]

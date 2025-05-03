@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
+use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
 
 use crate::ids::{identity_manager::{DeliveryHandle, IdentityManager, IdentityResource}, user::{IDSUserIdentity, QueryOptions}};
 use std::str::FromStr;
@@ -66,6 +66,7 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-stick-moji-backs", Value::Boolean(true)),
         ("supports-emoji-tapbacks", Value::Boolean(true)),
         ("supports-send-later-messages", Value::Boolean(true)),
+        ("supports-certified-delivery-v1", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -92,7 +93,20 @@ impl IDSRecvMessage {
             target: token.clone().map(|token| vec![MessageTarget::Token(token)]),
             send_delivered: send_delivered.unwrap_or(false),
             verification_failed: self.verification_failed,
+            certified_context: self.certified_context(),
         })
+    }
+
+    pub fn certified_context(&self) -> Option<CertifiedContext> {
+        let Self {
+            certified_delivery_receipt: Some(receipt), 
+            certified_delivery_version: Some(version), 
+            sender: Some(sender), 
+            target: Some(target), 
+            token: Some(token), 
+            uuid: Some(uuid), ..
+        } = self else { return None };
+        Some(CertifiedContext { version: *version, receipt: receipt.clone(), sender: sender.clone(), target: target.clone(), uuid: uuid.clone(), token: token.clone() })
     }
 }
 
@@ -180,6 +194,7 @@ impl IMClient {
                 target: None,
                 send_delivered: false,
                 verification_failed: false,
+                certified_context: None,
             }))
         }
         if let Some(received) = self.identity.receive_message(msg, &["com.apple.madrid", "com.apple.private.alloy.sms"]).await? {
@@ -277,11 +292,21 @@ impl IMClient {
         }
 
         if payload.message_unenc.is_none() {
+            if let Some(context) = payload.certified_context() {
+                // we weren't delivered, but we got this
+                self.identity.certify_delivery("com.apple.madrid", &context, false).await?;
+            }
             return Ok(None);
         }
 
         match MessageInst::from_raw(payload.message_unenc.take().unwrap().plist()?, &payload, &self.conn).await {
-            Err(PushError::BadMsg) => Ok(None),
+            Err(PushError::BadMsg) => {
+                if let Some(context) = payload.certified_context() {
+                    // we weren't delivered, but we got this
+                    self.identity.certify_delivery("com.apple.madrid", &context, false).await?;
+                }
+                Ok(None)
+            },
             Err(err) => Err(err),
             Ok(msg) => Ok(Some(msg))
         }

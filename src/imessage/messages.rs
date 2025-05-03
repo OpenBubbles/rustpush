@@ -14,7 +14,7 @@ use async_recursion::async_recursion;
 use std::io::Seek;
 use rand::RngCore;
 
-use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, CertifiedContext, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -179,7 +179,7 @@ pub struct IndexedMessagePart {
 pub struct MessageParts(pub Vec<IndexedMessagePart>);
 
 impl MessageParts {
-    fn has_attachments(&self) -> bool {
+    pub fn has_attachments(&self) -> bool {
         self.0.iter().any(|p| matches!(p.part, MessagePart::Attachment(_)))
     }
 
@@ -583,7 +583,7 @@ impl MessageParts {
     pub fn raw_text(&self) -> String {
         self.0.iter().filter_map(|m| match &m.part {
             MessagePart::Text(text, _) => Some(text.clone()),
-            MessagePart::Attachment(_) => None,
+            MessagePart::Attachment(_) => Some("\u{fffc}".to_string()),
             MessagePart::Mention(_uri, text) => Some(format!("@{}", text)),
             MessagePart::Object(_) => Some("\u{fffd}\u{fffc}".to_string()) // two object replacements
         }).collect::<Vec<String>>().join("")
@@ -1808,6 +1808,7 @@ pub struct MessageInst {
     pub target: Option<Vec<MessageTarget>>,
     pub send_delivered: bool,
     pub verification_failed: bool,
+    pub certified_context: Option<CertifiedContext>,
 }
 
 impl MessageInst {
@@ -1822,6 +1823,7 @@ impl MessageInst {
             message,
             target: None,
             verification_failed: false,
+            certified_context: None,
         }
     }
 
@@ -1901,6 +1903,7 @@ impl MessageInst {
                     }),
                     target: None,
                     verification_failed: false,
+                    certified_context: None,
                 };
                 return message.get_ids(my_handles, apns, schedule).await;
             }
