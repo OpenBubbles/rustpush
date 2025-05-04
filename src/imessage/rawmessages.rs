@@ -227,6 +227,14 @@ struct RawSmsActivateMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawSmsStatusMessage {
+    #[serde(rename = "g")]
+    guid: String,
+    #[serde(rename = "e")]
+    date_read: Date,
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawSmsDeactivateMessage {
     ue: bool,
 }
@@ -244,7 +252,7 @@ struct RawSmsParticipant {
 #[derive(Serialize, Deserialize)]
 struct RawSmsOutgoingInnerMessage {
     handle: Option<String>, // only for single SMS
-    service: String, // always SMS, even for MMS chats
+    service: String, // always SMS, even for MMS chats (RCS for rcs)
     #[serde(rename = "sV")]
     version: String, // always 1
     guid: String, // same as outside encryption
@@ -259,7 +267,7 @@ struct RawSmsOutgoingInnerMessage {
 struct RawSmsOutgoingMessage {
     #[serde(rename = "re")]
     participants: Vec<RawSmsParticipant>,
-    ic: u32, // always seems to be 1
+    ic: u32, // always seems to be 1, 2 for rcs
     #[serde(rename = "fR")]
     already_sent: Option<bool>,
     #[serde(rename = "chat-style")]

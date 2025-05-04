@@ -307,8 +307,8 @@ impl MessageParts {
         msg
     }
 
-    fn to_sms(&self, using_number: &str, mms: bool) -> (String, Vec<RawSmsIncomingMessageData>) {
-        let mut parts = vec![format!("s:{}", using_number)];
+    fn to_sms(&self, from_handle: &str, mms: bool) -> (String, Vec<RawSmsIncomingMessageData>) {
+        let mut parts = vec![format!("s:{}", from_handle)];
         let mut out = vec![];
         if !mms {
             parts.push("(null)(0)".to_string());
@@ -360,13 +360,7 @@ impl MessageParts {
     }
 
     fn parse_sms(raw: &RawSmsIncomingMessage) -> MessageParts {
-        MessageParts(raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
-            let corresponding = if part.starts_with("(null)") {
-                raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
-            } else {
-                let filename = part.split("(").next().unwrap();
-                raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
-            };
+        fn parse_data(idx: usize, corresponding: &RawSmsIncomingMessageData) -> IndexedMessagePart {
             let typ = if corresponding.mime_type == "text/plain" {
                 MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap(), Default::default())
             } else {
@@ -384,7 +378,21 @@ impl MessageParts {
                 idx: None,
                 ext: None
             }
-        }).collect())
+        }
+
+        if raw.format.starts_with("s:") {
+            MessageParts(raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
+                let corresponding = if part.starts_with("(null)") {
+                    raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
+                } else {
+                    let filename = part.split("(").next().unwrap();
+                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
+                };
+                parse_data(idx, corresponding)
+            }).collect())
+        } else {
+            MessageParts(raw.content.iter().enumerate().map(|(idx, part)| parse_data(idx, part)).collect())
+        }
     }
 
     // parse XML parts
@@ -1539,13 +1547,23 @@ impl Message {
     pub fn get_c(&self) -> u8 {
         match self {
             Self::Message(msg) => {
-                match msg.service {
+                match &msg.service {
                     MessageType::IMessage => 100,
-                    MessageType::SMS { is_phone: _, using_number: _, from_handle: _ } => {
-                        if msg.parts.has_attachments() {
-                            144
+                    MessageType::SMS { is_phone: _, using_number: _, from_handle } => {
+                        if let Some(_) = from_handle {
+                            // forwarded message
+                            if msg.parts.has_attachments() {
+                                141
+                            } else {
+                                140
+                            }
                         } else {
-                            143
+                            // non-forwarded message
+                            if msg.parts.has_attachments() {
+                                144
+                            } else {
+                                143
+                            }
                         }
                     }
                 }
@@ -1620,6 +1638,9 @@ impl Message {
             Message::UpdateProfileSharing(_) => Dictionary::from_iter([
                 ("gC", Value::Integer(70000.into())),
                 ("pID", Value::Dictionary(Dictionary::new())),
+            ]),
+            Message::Message(NormalMessage { service: MessageType::SMS { .. }, .. }) => Dictionary::from_iter([
+                ("htu", Value::Boolean(true)),
             ]),
             _ => Default::default(),
         }
@@ -2179,7 +2200,7 @@ impl MessageInst {
                                 .filter(|p| *p != self.sender.as_ref().unwrap() && *p != from_handle)
                                 .map(|p| p.replace("tel:", "")).collect();
                             let is_mms = my_participants.len() > 1 || normal.parts.has_attachments();
-                            let (format, content) = normal.parts.to_sms(&using_number, is_mms);
+                            let (format, content) = normal.parts.to_sms(&from_handle, is_mms);
                             let raw = RawSmsIncomingMessage {
                                 participants: if is_mms { my_participants } else { vec![] },
                                 sender: from_handle.replace("tel:", ""),
@@ -2610,7 +2631,12 @@ impl MessageInst {
             let mut msg = wrapper.to_message(
                 Some(ConversationData {
                     participants: if loaded.participants.len() > 0 {
-                        loaded.participants.iter().chain(std::iter::once(&loaded.sender)).map(|p| format!("tel:{p}")).collect()
+                        let mut participants = loaded.participants.clone();
+                        // duplicates cause chat matching in dart to fail (it is duplicate for RCS)
+                        if !participants.contains(&loaded.sender) {
+                            participants.push(loaded.sender.clone());
+                        }
+                        participants.iter().map(|p| format!("tel:{p}")).collect()
                     } else {
                         vec![format!("tel:{}", loaded.sender), format!("tel:{}", loaded.recieved_number)]
                     },
@@ -2637,6 +2663,7 @@ impl MessageInst {
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            return Ok(msg);
         }
         if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {
             let parts = loaded.message.xhtml.as_ref().map_or_else(|| {

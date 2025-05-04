@@ -18,7 +18,7 @@ use std::fmt::Debug;
 
 use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
 
-use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
+use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, IDSUserType, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
 
 const EMPTY_REFRESH: Duration = Duration::from_secs(3600); // one hour
 
@@ -255,6 +255,10 @@ impl KeyCache {
         let target_tokens = keys_for.iter().map(|i| Ok(match i {
             MessageTarget::Token(token) => token,
             MessageTarget::Uuid(uuid) => {
+                // the handle cache is madrid-only, TODO maybe fix if we ever need to
+                let Some(handle_cache) = self.cache.get("com.apple.madrid").and_then(|a| a.get(handle)) else {
+                    return Err(PushError::KeyNotFound(handle.to_string()))
+                };
                 let Some(saved) = handle_cache.private_data.iter().find(|p| p.uuid.as_ref() == Some(uuid)) else {
                     return Err(PushError::KeyNotFound(uuid.to_string()))
                 };
@@ -583,6 +587,12 @@ impl IdentityResource {
         self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
         let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
         Ok(private_self.clone())
+    }
+
+    // gets phone handles *REGISTERED BY THIS DEVICE*
+    pub async fn get_my_phone_handles(&self) -> Vec<String> {
+        let user_lock = self.users.read().await;
+        user_lock.iter().filter(|user| user.user_type == IDSUserType::Phone).flat_map(|user| user.registration["com.apple.madrid"].handles.clone()).collect()
     }
 
     pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
@@ -940,7 +950,7 @@ pub struct SendMessage {
     pub encryption: Option<String>,
     #[serde(rename = "ua")]
     pub user_agent: String,
-    pub v: Option<u8>,
+    pub v: Option<u32>,
     #[serde(rename = "i")]
     pub message_id: u32,
     #[serde(rename = "U")]
@@ -1050,7 +1060,7 @@ impl InnerSendJob {
                 command: message.command,
                 encryption: if !matches!(message.raw, Raw::None) { Some("pair".to_string()) } else { None },
                 user_agent: self.user_agent.clone(),
-                v: if !is_relay_message { Some(8) } else { None },
+                v: if !is_relay_message { Some(if self.topic == "com.apple.private.alloy.sms" { 1850 } else { 8 }) } else { None },
                 message_id: msg_id,
                 uuid: uuid.clone().into(),
                 payloads: group,

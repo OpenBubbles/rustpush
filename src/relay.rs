@@ -168,22 +168,37 @@ impl OSConfig for RelayConfig {
     fn get_private_data(&self) -> Dictionary {
         let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
         Dictionary::from_iter([
-            ("ap", Value::String("0".to_string())), // 1 for ios
+            // apple pay
+            ("ap", Value::String("0".to_string())),
 
             ("d", Value::String(format!("{:.6}", apple_epoch.elapsed().unwrap().as_secs_f64()))),
+            // device type
             ("dt", Value::Integer(1.into())),
+            // green tea - ??
             ("gt", Value::String("0".to_string())),
+            // supports handoff
             ("h", Value::String("1".to_string())),
-            ("m", Value::String("0".to_string())),
+            // supports phone calls
             ("p", Value::String("0".to_string())),
 
             ("pb", Value::String(self.version.software_build_id.clone())),
             ("pn", Value::String(if self.version.software_name == "MacOS" { "macOS".to_string() } else { self.version.software_name.clone() })),
             ("pv", Value::String(self.version.software_version.clone())),
+            
+            // mms router support
+            ("m", Value::String("1".to_string())),
+            // sms router support
+            ("s", Value::String("1".to_string())),
 
-            ("s", Value::String("0".to_string())),
+            // tethering support
+            // ec = enclosure color
+            // c = data color
+            // ss = service signatures
+            // ktf = key transparency flags
+            // ktv = key transparency version
             ("t", Value::String("0".to_string())),
             ("u", Value::String(self.dev_uuid.clone().to_uppercase())),
+            // version
             ("v", Value::String("1".to_string())),
         ])
     }
