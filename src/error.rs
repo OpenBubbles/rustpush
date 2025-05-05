@@ -2,7 +2,7 @@ use std::{any::Any, io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
 use omnisette::AnisetteError;
-#[cfg(feature = "macOS")]
+#[cfg(feature = "macos-validation-data")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use thiserror::Error;
@@ -43,7 +43,7 @@ pub enum PushError {
     StatusError(reqwest::StatusCode /* code */),
     #[error("Failed to parse Albert Cert")]
     AlbertCertParseError,
-    #[cfg(feature = "macOS")]
+    #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
     #[error("{0}")]

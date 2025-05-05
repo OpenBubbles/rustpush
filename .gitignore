@@ -1,6 +1,8 @@
+.idea
 /target
 /cloudkit-derive/target
 /cloudkit-proto/target
+/open-absinthe/target
 /config.json
 /config.plist
 /out

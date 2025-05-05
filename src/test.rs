@@ -9,9 +9,10 @@ use icloud_auth::AppleAccount;
 use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders};
 use open_absinthe::nac::HardwareConfig;
-use rustpush::{authenticate_apple, cloudkit::{record_identifier_from_string, CloudKitClient, CloudKitContainer, CloudKitOperation, CloudKitSession, CloudKitState}, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, ProfilesClient}, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, MacOSConfig, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, UpdateProfileMessage, MADRID_SERVICE};
-use sha2::Sha256;
-use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
+use rustpush::{authenticate_apple, facetime::{FTClient, FTMember, FTMessage, FTState, FACETIME_SERVICE, VIDEO_SERVICE}, findmy::{FindMyClient, FindMyState, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, login_apple_delegates, prepare_put, register, sharedstreams::{round_seconds, AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState}, APSConnectionResource, APSState, Attachment, ConversationData, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IndexedMessagePart, LoginDelegate, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, UpdateProfileMessage, MADRID_SERVICE};
+#[cfg(feature = "macos-validation-data")]
+use rustpush::macos::MacOSConfig;
+use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
@@ -21,6 +22,9 @@ use std::str::FromStr;
 use std::io::Seek;
 use rustpush::OSConfig;
 use std::fmt::{Display, Write as FmtWrite};
+use tokio::sync::RwLock;
+use rustpush::cloudkit::{CloudKitClient, CloudKitState};
+use rustpush::name_photo_sharing::ProfilesClient;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct SavedState {
