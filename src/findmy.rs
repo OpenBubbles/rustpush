@@ -40,15 +40,15 @@ pub struct FindMyState {
 }
 
 impl FindMyState {
-    pub fn new(dsid: String, user: String, delegate: &MobileMeDelegateResponse) -> FindMyState {
+    pub fn new(dsid: String, user: String, delegate: &MobileMeDelegateResponse) -> Option<FindMyState> {
         let udid: [u8; 20] = rand::thread_rng().gen();
-        FindMyState {
+        Some(FindMyState {
             dsid,
-            fmf_token: delegate.tokens["mmeFMFAppToken"].clone(),
-            fmip_token: delegate.tokens["mmeFMIPAppToken"].clone(),
+            fmf_token: delegate.tokens.get("mmeFMFAppToken")?.clone(),
+            fmip_token: delegate.tokens.get("mmeFMIPAppToken")?.clone(),
             udid: encode_hex(&udid),
             user
-        }
+        })
     }
 }
 

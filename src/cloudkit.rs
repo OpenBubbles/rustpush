@@ -278,12 +278,12 @@ pub struct CloudKitState {
 }
 
 impl CloudKitState {
-    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Self {
-        Self {
+    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Option<Self> {
+        Some(Self {
             dsid,
-            token: delegate.tokens["cloudKitToken"].clone(),
-            mme_token: delegate.tokens["mmeAuthToken"].clone(),
-        }
+            token: delegate.tokens.get("cloudKitToken")?.clone(),
+            mme_token: delegate.tokens.get("mmeAuthToken")?.clone(),
+        })
     }
 }
 

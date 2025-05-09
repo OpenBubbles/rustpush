@@ -26,13 +26,13 @@ pub struct SharedStreamsState {
 }
 
 impl SharedStreamsState {
-    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> SharedStreamsState {
-        SharedStreamsState {
+    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Option<SharedStreamsState> {
+        Some(SharedStreamsState {
             dsid,
-            mme_authtoken: delegate.tokens["mmeAuthToken"].clone(),
-            host: delegate.config["com.apple.Dataclass.SharedStreams"].as_dictionary().unwrap()["url"].as_string().unwrap().to_string(),
+            mme_authtoken: delegate.tokens.get("mmeAuthToken")?.clone(),
+            host: delegate.config.get("com.apple.Dataclass.SharedStreams")?.as_dictionary().unwrap().get("url")?.as_string().unwrap().to_string(),
             albums: vec![],
-        }
+        })
     }
 }
 
