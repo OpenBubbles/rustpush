@@ -525,7 +525,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
         }
     }
 
-    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<(), PushError> {
+    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<bool, PushError> {
         if let Some(ec) = &request.ec {
             return Err(PushError::IdmsCircleError(*ec))
         }
@@ -571,6 +571,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                         ptkn: encode_hex(&self.push_token).to_uppercase(),
                         ec: Some(-9003),
                     }).await?;
+                    return Ok(false);
                 }
                 let receipt = verifier.proof();
 
@@ -615,7 +616,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                 warn!("Ignoring unknown circle step {_circlestep}");
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
