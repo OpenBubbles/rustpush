@@ -1,12 +1,13 @@
 
 use backon::ExponentialBuilder;
+use icloud_auth::AppleAccount;
 use log::{debug, error, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider, ArcAnisetteClient};
 use openssl::sha::sha1;
 use plist::{Date, Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, imessage::messages::AttachmentPreparedPut, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, ResourceState};
+use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState};
 use rand::Rng;
 use uuid::Uuid;
 use tokio::{process::Command, runtime::Handle, select, sync::{Mutex, RwLock}};
@@ -218,6 +219,7 @@ pub struct SharedStreamClient<P: AnisetteProvider> {
     config: Arc<dyn OSConfig>,
     aps: APSConnection,
     root_tag: Mutex<Option<String>>,
+    account: Arc<Mutex<AppleAccount<P>>>,
 }
 
 impl<P: AnisetteProvider> SharedStreamClient<P> {
@@ -244,6 +246,24 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         Ok(map)
     }
 
+    pub async fn reauth(&self) -> Result<(), PushError> {
+        let mut account = self.account.lock().await;
+        let pet = account.get_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
+        
+        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, 
+        account.spd.as_ref().unwrap().get("adsid").expect("no adsid").as_string().unwrap(), None, 
+        &mut *self.anisette.lock().await, &*self.config, &[LoginDelegate::MobileMe]).await?;
+
+        drop(account);
+        
+        let mut locked = self.state.write().await;
+        locked.mme_authtoken = delegates.mobileme.unwrap().tokens["mmeAuthToken"].clone();
+
+        (self.update_state)(&*locked);
+
+        Ok(())
+    }
+
     pub async fn get_album<T: DeserializeOwned>(&self, album: &str, url: &str, enter: impl Serialize) -> Result<T, PushError> {
         let state = self.state.read().await;
         let location = state.albums.iter().find(|a| a.albumguid == album).unwrap().albumlocation.clone().expect("Not a confirmed location?");
@@ -254,6 +274,10 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             .header("Content-Type", "text/plist")
             .body(plist_to_string(&enter)?)
             .send().await?;
+        
+        if resp.status().as_u16() == 401 {
+            self.reauth().await?;
+        }
         
         let resp = resp.bytes().await?;
 
@@ -274,6 +298,10 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         if let Some(host) = resp.headers().get("X-Apple-MME-Host") {
             state_lock.host = host.to_str().unwrap().to_string();
             (self.update_state)(&*state_lock);
+        }
+
+        if resp.status().as_u16() == 401 {
+            self.reauth().await?;
         }
 
         let resp = resp.error_for_status()?.bytes().await?;
@@ -574,7 +602,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         Ok(Some(self.get_changes().await?))
     }
 
-    pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
+    pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, account: Arc<Mutex<AppleAccount<P>>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
         SharedStreamClient {
             _interest_token: aps.request_topics(vec!["com.apple.sharedstreams"]).await.0,
             state: RwLock::new(state),
@@ -583,6 +611,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             root_tag: Mutex::new(None),
             aps,
             config,
+            account,
         }
     }
 

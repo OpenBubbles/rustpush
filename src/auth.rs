@@ -1,15 +1,23 @@
-use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
-use log::debug;
+use aes::{cipher::consts::U16, Aes128};
+use hkdf::Hkdf;
+use icloud_auth::{AppleAccount, CircleSendMessage};
+use log::{debug, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
 use plist::{Data, Dictionary, Value};
+use rasn::{AsnType, Decode, Encode};
 use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client, Method, Request, RequestBuilder, Response, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::Sha256;
+use srp::{client::SrpClient, groups::G_3072, server::SrpServer};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use rand::Rng;
+use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
 
-use crate::{aps::get_message, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_encode, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG, REQWEST}, APSConnectionResource, APSState, OSConfig, PushError};
+use crate::{aps::{get_message, APSInterestToken}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, util::{base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -369,4 +377,273 @@ impl<S: RequestState> SignedRequest<S> {
     }
 }
 
+#[derive(Clone, Deserialize, Debug)]
+pub struct ApsAlert {
+    pub title: String,
+    pub body: String,
+    pub sbdy: String,
+    pub defbtn: String,
+    pub albtn: String,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct ApsData {
+    pub alert: ApsAlert,
+}
+
+#[derive(Clone, Copy, Deserialize, Debug)]
+pub struct AkData {
+    pub lat: f32,
+    pub lng: f32,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct IdmsRequestedSignIn {
+    pub aps: ApsData,
+    pub txnid: String,
+    pub akdata: AkData,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct IdmsCircleMessage {
+    pub step: u32,
+    pub atxnid: String,
+    pub pake: Option<String>,
+    pub ec: Option<i32>,
+    pub idmsdata: String,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+pub struct TeardownSignIn {
+    pub prevtxnid: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum IdmsMessage {
+    RequestedSignIn(IdmsRequestedSignIn),
+    TeardownSignIn(TeardownSignIn),
+    CircleRequest(IdmsCircleMessage, Option<IdmsRequestedSignIn>),
+}
+
+pub struct IdmsAuthListener {
+    _interest_token: APSInterestToken,
+}
+
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleStep0 {
+    circle_step: rasn::types::Integer,
+    public_ephermeral: rasn::types::OctetString,
+    unk3: rasn::types::Integer, // set to 1
+    req_uuid: rasn::types::OctetString,
+    tag: rasn::types::OctetString, // ASCII 'o'
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleStep1Body {
+    salt: rasn::types::OctetString,
+    public_ephermeral: rasn::types::OctetString,
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleStep1 {
+    circle_step: rasn::types::Integer,
+    body: rasn::types::OctetString,
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleError {
+    extra_code: rasn::types::Integer,
+    meta: rasn::types::OctetString,
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleStep2 {
+    circle_step: rasn::types::Integer,
+    proof: rasn::types::OctetString,
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleEncryptedPayload {
+    iv: rasn::types::OctetString,
+    ciphertext: rasn::types::OctetString,
+    tag: rasn::types::OctetString,
+}
+
+type Aes128Gcm16ByteNonce = aes_gcm::AesGcm<Aes128, U16>;
+
+impl CircleEncryptedPayload {
+    fn new(data: &[u8], key: [u8; 16]) -> Self {
+        let nonce: [u8; 16] = rand::random();
+        let cipher = Aes128Gcm16ByteNonce::new(&key.into());
+        let mut encrypted = cipher.encrypt(Nonce::from_slice(&nonce), data).expect("AES GCM failed?");
+
+        let tag = encrypted.split_off(encrypted.len() - 16);
+
+        Self {
+            iv: nonce.to_vec().into(),
+            ciphertext: encrypted.into(),
+            tag: tag.into(),
+        }
+    }
+}
+
+#[derive(AsnType, Encode, Decode)]
+struct CircleStep3 {
+    circle_step: rasn::types::Integer,
+    proof: rasn::types::OctetString,
+    payload: rasn::types::OctetString,
+}
+
+pub struct CircleServerSession<P: AnisetteProvider> {
+    salt: [u8; 16],
+    dsid: u64,
+    verifier: Vec<u8>,
+    server: SrpServer<'static, Sha256>,
+    account: Arc<Mutex<AppleAccount<P>>>,
+    b: [u8; 32],
+    client_public: Option<Vec<u8>>,
+    push_token: [u8; 32],
+}
+
+impl<P: AnisetteProvider> CircleServerSession<P> {
+    pub fn new(dsid: u64, otp: u32, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Self {
+        let salt: [u8; 16] = rand::random();
+        let client = SrpClient::<Sha256>::new(&G_3072);
+        // check password, was guess
+        let verifier = client.compute_verifier(format!("{dsid}").as_bytes(), format!("{:0>6}", otp).as_bytes(), &salt);
+
+        Self {
+            salt,
+            dsid,
+            verifier,
+            server: SrpServer::<Sha256>::new(&G_3072),
+            account,
+            b: rand::random(),
+            client_public: None,
+            push_token,
+        }
+    }
+
+    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<(), PushError> {
+        if let Some(ec) = &request.ec {
+            return Err(PushError::IdmsCircleError(*ec))
+        }
+        let Some(pake) = &request.pake else { return Err(PushError::IdmsCircleError(50)) };
+        match request.step {
+            1 => {
+                let step0: CircleStep0 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
+                self.client_public = Some(step0.public_ephermeral.into());
+                let b_pub = self.server.compute_public_ephemeral(&self.b, &self.verifier);
+
+                let step1 = rasn::der::encode(&CircleStep1 {
+                    circle_step: 1.into(),
+                    body: rasn::der::encode(&CircleStep1Body {
+                        salt: self.salt.to_vec().into(),
+                        public_ephermeral: b_pub.into()
+                    }).unwrap().into(),
+                }).unwrap();
+
+                println!("Body {}", encode_hex(&step1));
+
+                self.account.lock().await.circle(&CircleSendMessage {
+                    atxid: request.atxnid.clone(),
+                    circlestep: 1,
+                    idmsdata: request.idmsdata.clone(),
+                    pakedata: base64_encode(&step1),
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: None,
+                }).await?;
+            },
+            3 => {
+                let step2: CircleStep2 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
+                let verifier = self.server.process_reply(&self.b, &self.verifier, self.client_public.as_ref().unwrap(), format!("{}", self.dsid).as_bytes(), &self.salt).expect("Srp failure");
+                if let Err(e) = verifier.verify_client(&step2.proof) {
+                    warn!("SRP auth error {e}");
+                    self.account.lock().await.circle(&CircleSendMessage {
+                        atxid: request.atxnid.clone(),
+                        circlestep: 3,
+                        idmsdata: request.idmsdata.clone(),
+                        pakedata: base64_encode(&rasn::der::encode(&CircleError {
+                            extra_code: 0.into(),
+                            meta: vec![].into()
+                        }).unwrap()),
+                        ptkn: encode_hex(&self.push_token).to_uppercase(),
+                        ec: Some(-9003),
+                    }).await?;
+                }
+                let receipt = verifier.proof();
+
+                let hk = Hkdf::<Sha256>::new(None, verifier.key());
+                let mut key = [0u8; 16];
+                hk.expand("recv->send".as_bytes(), &mut key).expect("Failed to expand key!");
+
+                let twofa_code = self.account.lock().await.anisette.lock().await.provider.get_2fa_code().await?;
+                let twofa_str = format!("{:0>6}", twofa_code);
+                
+                let message = rasn::der::encode(&CircleStep3 {
+                    circle_step: 3.into(),
+                    proof: receipt.to_vec().into(),
+                    payload: rasn::der::encode(&CircleEncryptedPayload::new(&rasn::der::encode(&twofa_str).expect("Failed to encode der?"), key)).expect("Encoding failed").into(),
+                }).expect("outer encoding failed");
+
+                self.account.lock().await.circle(&CircleSendMessage {
+                    atxid: request.atxnid.clone(),
+                    circlestep: 3,
+                    idmsdata: request.idmsdata.clone(),
+                    pakedata: base64_encode(&message),
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: None,
+                }).await?;
+            },
+            5 => {
+                // this is where we could exchange iCloud keychain keys.
+                // However, let's just say "I don't have them", because, well, I don't
+                self.account.lock().await.circle(&CircleSendMessage {
+                    atxid: request.atxnid.clone(),
+                    circlestep: 5,
+                    idmsdata: request.idmsdata.clone(),
+                    pakedata: base64_encode(&rasn::der::encode(&CircleError {
+                        extra_code: 5.into(),
+                        meta: vec![].into(),
+                    }).expect("outer encoding failed")),
+                    ptkn: encode_hex(&self.push_token).to_uppercase(),
+                    ec: None,
+                }).await?;
+            },
+            _circlestep => {
+                warn!("Ignoring unknown circle step {_circlestep}");
+            }
+        }
+        Ok(())
+    }
+}
+
+
+impl IdmsAuthListener {
+    pub async fn new(conn: APSConnection) -> Self {
+        Self {
+            _interest_token: conn.request_topics(vec!["com.apple.idmsauth"]).await.0,
+        }
+    }
+
+    pub fn handle(&self, message: APSMessage) -> Result<Option<IdmsMessage>, PushError> {
+        let APSMessage::Notification { topic, payload, .. } = message else { return Ok(None) };
+        if &topic != &sha1("com.apple.idmsauth".as_bytes()) { return Ok(None) }
+
+        let data: serde_json::value::Map<String, serde_json::Value> = serde_json::from_slice(&payload)?;
+
+        debug!("Got idms message {data:?}");
+
+        Ok(match data["cmd"].as_u64().unwrap() {
+            100 => Some(IdmsMessage::RequestedSignIn(serde_json::from_slice(&payload)?)),
+            400 => Some(IdmsMessage::TeardownSignIn(serde_json::from_slice(&payload)?)),
+            700 => Some(IdmsMessage::CircleRequest(serde_json::from_slice(&payload)?, serde_json::from_slice(&payload).ok())),
+            _cmd => {
+                debug!("Ignoring unknown IDMS message");
+                None
+            }
+        })
+    }
+}
 

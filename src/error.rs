@@ -146,4 +146,10 @@ pub enum PushError {
     UnknownPoster(String),
     #[error("Report spam error {0}")]
     ReportSpamError(u32),
+    #[error("Token missing")]
+    TokenMissing,
+    #[error("Circle http error {0}")]
+    CircleHTTPError(#[from] icloud_auth::Error),
+    #[error("Circle error {0}")]
+    IdmsCircleError(i32),
 }

@@ -51,6 +51,8 @@ pub use cloudkit_proto;
 pub use cloudkit_derive;
 pub use imessage::name_photo_sharing;
 
+pub use auth::{IdmsAuthListener, IdmsMessage, IdmsRequestedSignIn, ApsData, ApsAlert, AkData, TeardownSignIn, CircleServerSession};
+
 use plist::Dictionary;
 pub use relay::RelayConfig;
 pub use util::get_gateways_for_mccmnc;
