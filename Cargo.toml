@@ -31,6 +31,7 @@ async-trait = "0.1.73"
 flume = "0.11.0"
 open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, features = ["serde"] }
 icloud_auth = { path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth" }
+srp = { version = "0.6.0", path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth/rustcrypto-srp" }
 omnisette = { path = "/home/tae/Documents/GitHub/apple-private-apis/omnisette", features = ["remote-clearadi"] }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
