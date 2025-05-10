@@ -402,6 +402,7 @@ pub struct IdmsRequestedSignIn {
     pub aps: ApsData,
     pub txnid: String,
     pub akdata: AkData,
+    pub adsid: String,
 }
 
 #[derive(Clone, Deserialize, Debug)]
