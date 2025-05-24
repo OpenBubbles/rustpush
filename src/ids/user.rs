@@ -1000,6 +1000,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     let services = id_services.iter().map(|service| {
         let mut user_list = vec![];
+        let mut sim_count = 0;
         for user in users.iter() {
             let handles = &possible_handles[&user.user_id];
             let mut user_data = Dictionary::from_iter([
@@ -1020,7 +1021,8 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 ("user-id", Value::String(user.user_id.to_string()))
             ].into_iter());
             if let IDSUserType::Phone = user.user_type {
-                user_data.insert("tag".to_string(), Value::String("SIM".to_string()));
+                sim_count += 1;
+                user_data.insert("tag".to_string(), Value::String(format!("SIM{}", if sim_count == 1 { "".to_string() } else { sim_count.to_string() })));
             }
             user_list.push(Value::Dictionary(user_data));
         }
