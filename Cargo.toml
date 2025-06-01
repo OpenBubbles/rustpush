@@ -2,9 +2,11 @@
 name = "rustpush"
 version = "0.1.0"
 edition = "2021"
-default-run = "rustpush-test"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
+remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
+macos-validation-data = ["dep:open-absinthe"]
 
 [dependencies]
 plist = "1.7.0"
@@ -29,10 +31,10 @@ log = "0.4.20"
 pretty_env_logger = "0.5.0"
 async-trait = "0.1.73"
 flume = "0.11.0"
-open-absinthe = { path = "/home/tae/Documents/open-absinthe", optional = true, features = ["serde"] }
-icloud_auth = { path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth" }
-srp = { version = "0.6.0", path = "/home/tae/Documents/GitHub/apple-private-apis/icloud-auth/rustcrypto-srp" }
-omnisette = { path = "/home/tae/Documents/GitHub/apple-private-apis/omnisette", features = ["remote-clearadi"] }
+icloud_auth = { path = "./apple-private-apis/icloud-auth" }
+srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
+omnisette = { path = "./apple-private-apis/omnisette" }
+open-absinthe = { path = "./open-absinthe", optional = true }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
@@ -49,16 +51,12 @@ aes-gcm = "0.10.3"
 cloudkit-proto = { path = "./cloudkit-proto" }
 cloudkit-derive = { path = "./cloudkit-derive" }
 
-[features]
-default = ["macOS"]
-macOS = ["dep:open-absinthe"]
-
-
 [build-dependencies]
 prost-build = { version = "0.12.0" }
 
 [[bin]]
 name = "rustpush-test"
+required-features = ["macos-validation-data"]
 path = "src/test.rs"
 
 [lib]

@@ -15,8 +15,8 @@ pub mod statuskit;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
 
-#[cfg(feature = "macOS")]
-mod macos;
+#[cfg(feature = "macos-validation-data")]
+pub mod macos;
 
 mod relay;
 
@@ -35,7 +35,6 @@ pub use omnisette::AnisetteProvider;
 use icloud_auth::LoginClientInfo;
 pub use imessage::messages::{UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
 pub use imessage::aps_client::{IMClient, MADRID_SERVICE};
-use openssl::conf;
 use util::encode_hex;
 pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray, ResourceFailure};
 pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
@@ -43,10 +42,6 @@ pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager};
 pub use ids::CertifiedContext;
 pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate};
 pub use error::PushError;
-#[cfg(feature = "macOS")]
-pub use macos::MacOSConfig;
-#[cfg(feature = "macOS")]
-pub use open_absinthe::nac::HardwareConfig;
 pub use cloudkit_proto;
 pub use cloudkit_derive;
 pub use imessage::name_photo_sharing;

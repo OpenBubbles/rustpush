@@ -1,0 +1,55 @@
+on: [ push, pull_request ]
+name: Build
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+        features:
+          - macos-validation-data,remote-clearadi
+          - macos-validation-data,remote-anisette-v3
+      fail-fast: false
+    name: ${{ matrix.os }} with ${{ matrix.features }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Protobuf compiler
+        run: |
+          if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+              sudo apt-get install -y protobuf-compiler
+          elif [[ "$OSTYPE" == "darwin"* ]]; then
+              brew install protobuf
+          fi
+
+      - name: Set up fake Fairplay keys
+        run: |
+          mkdir -p certs/fairplay
+
+          cert_names=(
+            "4056631661436364584235346952193"
+            "4056631661436364584235346952194"
+            "4056631661436364584235346952195"
+            "4056631661436364584235346952196"
+            "4056631661436364584235346952197"
+            "4056631661436364584235346952198"
+            "4056631661436364584235346952199"
+            "4056631661436364584235346952200"
+            "4056631661436364584235346952201"
+            "4056631661436364584235346952208"
+          )
+
+          for name in "${cert_names[@]}"; do
+              touch certs/fairplay/$name.pem
+              touch certs/fairplay/$name.crt
+          done
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+      - uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --features '${{ matrix.features }}' --package rustpush --lib
