@@ -67,6 +67,7 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-emoji-tapbacks", Value::Boolean(true)),
         ("supports-send-later-messages", Value::Boolean(true)),
         ("supports-certified-delivery-v1", Value::Boolean(true)),
+        ("supports-transcript-backgrounds", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"

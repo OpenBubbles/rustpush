@@ -1,13 +1,13 @@
 
 use std::{collections::HashMap, io::{Cursor, Read, Seek, Write}};
 
-use log::debug;
+use log::{debug, warn};
 use plist::{Data, Dictionary, Value};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
-use crate::{util::{bin_deserialize, bin_serialize, plist_to_bin, plist_to_string, KeyedArchive, NSDictionary}, NSArray, PushError};
+use crate::{util::{base64_decode, bin_deserialize, bin_serialize, plist_to_bin, plist_to_string, KeyedArchive, NSDictionary}, NSArray, PushError};
 
 use super::name_photo_sharing::IMessagePosterRecord;
 
@@ -60,7 +60,7 @@ struct PFPosterConfiguration {
     identifier: String,
     layout_configuration: Value,
     media: NSArray<PFPosterMedia>,
-    user_info: NSDictionary<PFPosterConfigurationUserInfo>,
+    user_info: Option<NSDictionary<PFPosterConfigurationUserInfo>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -175,7 +175,7 @@ pub struct PRPosterTitleStyleConfiguration {
     #[serde(serialize_with = "vec_serialize", deserialize_with = "vec_deserialize")]
     pub time_numbering_system: Option<Vec<u8>>,
     pub title_color: PRPosterColor,
-    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    #[serde(default, serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub title_content_style: Vec<u8>,
     pub user_configured: bool,
     #[serde(default)]
@@ -184,6 +184,10 @@ pub struct PRPosterTitleStyleConfiguration {
 
 impl PRPosterTitleStyleConfiguration {
     fn unpack(&mut self) -> Result<(), PushError> {
+        if self.title_content_style.is_empty() {
+            self.title_style = Some(PRPosterContentMaterialStyle::PRPosterContentVibrantMaterialStyle);
+            return Ok(())
+        }
         self.title_style = Some(plist::from_value(&KeyedArchive::expand(self.title_content_style.as_ref())?)?);
         self.title_content_style.clear();
         Ok(())
@@ -205,7 +209,7 @@ struct PosterManifest {
     extension_identifier: String,
     latest_configuration_supplement: u32,
     latest_configuration_version: u32,
-    role: String,
+    role: PosterRole,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -229,14 +233,14 @@ pub struct WallpaperMetadata {
 }
 
 impl PosterManifest {
-    fn new(extension: String) -> Self {
+    fn new(extension: String, role: PosterRole) -> Self {
         Self {
             archive_version: 1,
             configuration_uuid: Uuid::new_v4().to_string().to_uppercase(),
             extension_identifier: extension,
             latest_configuration_supplement: 0,
             latest_configuration_version: 0,
-            role: "PRPosterRoleIncomingCall".to_string()
+            role
         }
     }
 }
@@ -329,6 +333,35 @@ pub struct PosterAsset {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TranscriptDynamicUserData {
+    pub identifier: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TranscriptGradientUserData {
+    custom: String,
+}
+
+impl TranscriptGradientUserData {
+    fn to_colors(&self) -> Vec<PosterColor> {
+        self.custom.split("//").map(|a| {
+            let mut parts = a.split("/");
+            PosterColor {
+                red: parts.next().expect("No red").parse().unwrap(),
+                green: parts.next().expect("No green").parse().unwrap(),
+                blue: parts.next().expect("No blue").parse().unwrap(),
+                alpha: parts.next().expect("No alpha").parse().unwrap(),
+            }
+        }).collect()
+    }
+    fn from_colors(colors: &[PosterColor]) -> Self {
+        Self {
+            custom: colors.iter().map(|c| format!("{}/{}/{}/{}", c.red, c.green, c.blue, c.alpha)).collect::<Vec<_>>().join("//")
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum PosterType {
     // com.apple.PhotosUIPrivate.PhotosPosterProvider
     Photo {
@@ -342,6 +375,12 @@ pub enum PosterType {
         data: MemojiData,
         background: PosterColor,
     },
+    TranscriptDynamic {
+        data: TranscriptDynamicUserData,
+    },
+    TranscriptGradient {
+        colors: Vec<PosterColor>,
+    },
 }
 
 impl PosterType {
@@ -350,6 +389,8 @@ impl PosterType {
             Self::Photo { .. } => "com.apple.PhotosUIPrivate.PhotosPosterProvider",
             Self::Monogram { .. } => "com.apple.ContactsUI.MonogramPosterExtension",
             Self::Memoji { .. } => "com.apple.AvatarUI.AvatarPosterExtension",
+            Self::TranscriptDynamic { .. } => "com.apple.transcriptBackgroundPoster.DynamicExtension",
+            Self::TranscriptGradient { .. } => "com.apple.transcriptBackgroundPoster.GradientExtension",
         }
     }
 }
@@ -372,17 +413,16 @@ struct UserDataWrapper {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct SimplifiedPoster {
+pub struct SimplifiedIncomingCallPoster {
+    pub poster: SimplifiedPoster,
     pub text_metadata: WallpaperMetadata,
-    pub title_configuration: PRPosterTitleStyleConfiguration,
-    pub r#type: PosterType,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub low_res: Vec<u8>,
 }
 
-impl SimplifiedPoster {
+impl SimplifiedIncomingCallPoster {
     pub fn to_poster(&mut self) -> Result<IMessagePosterRecord, PushError> {
-        self.text_metadata.type_key = self.r#type.get_identifier().to_string();
+        self.text_metadata.type_key = self.poster.r#type.get_identifier().to_string();
         let meta = plist_to_bin(&WallpaperMetadataWrapper {
             wallpaper_file_name_key: "Wallpaper".to_string(),
             wallpaper_low_res_file_name_key: "Wallpaper".to_string(),
@@ -390,11 +430,103 @@ impl SimplifiedPoster {
             wallpaper_metadata_key: self.text_metadata.clone(),
         })?;
 
+        Ok(IMessagePosterRecord {
+            low_res_poster: self.low_res.clone(),
+            package: self.poster.to_archive()?,
+            meta
+        })
+    }
+    
+    pub fn from_poster(poster: &IMessagePosterRecord) -> Result<Self, PushError> {
+        let meta: WallpaperMetadataWrapper = plist::from_bytes(&poster.meta)?;
+        
+        Ok(Self {
+            poster: SimplifiedPoster::from_archive(Cursor::new(&poster.package))?,
+            text_metadata: meta.wallpaper_metadata_key,
+            low_res: poster.low_res_poster.clone(),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchBackground {
+    pub is_high_key: bool,
+    pub luminance: f64,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub background_image_data: Vec<u8>,
+    pub extension_identifier: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SimplifiedTranscriptPoster {
+    pub watch: WatchBackground,
+    pub poster: SimplifiedPoster,
+}
+
+impl SimplifiedTranscriptPoster {
+    pub fn parse_payload(payload: &[u8]) -> Result<Self, PushError> {
+        let mut archive = ZipArchive::new(Cursor::new(&payload))?;
+        let watch: WatchBackground = read_file(&mut archive, "transcriptBackground/watchBackground")?;
+
+        let mut poster = vec![];
+        archive.by_name("transcriptBackground/poster")?.read_to_end(&mut poster)?;
+        Ok(Self {
+            watch,
+            poster: SimplifiedPoster::from_archive(Cursor::new(&poster))?,
+        })
+    }
+
+    pub fn to_payload(&mut self) -> Result<Vec<u8>, PushError> {
+        let mut new_zip = vec![];
+
+        let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        let mut writer = ZipWriter::new(Cursor::new(&mut new_zip));
+        writer.add_directory("transcriptBackground/", stored.clone())?;
+
+        
+        writer.start_file("transcriptBackground/watchBackground", SimpleFileOptions::default())?;
+        plist::to_writer_binary(&mut writer, &self.watch)?;
+
+        writer.start_file("transcriptBackground/poster", SimpleFileOptions::default())?;
+        let result = self.poster.to_archive()?;
+        writer.write_all(&result)?;
+
+        writer.finish()?;
+
+        Ok(new_zip)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Copy)]
+pub enum PosterRole {
+    PRPosterRoleBackdrop,
+    PRPosterRoleIncomingCall,
+}
+
+// default for serde
+impl Default for PosterRole {
+    fn default() -> Self {
+        Self::PRPosterRoleIncomingCall
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SimplifiedPoster {
+    pub title_configuration: PRPosterTitleStyleConfiguration,
+    pub r#type: PosterType,
+    #[serde(default)]
+    pub role: PosterRole,
+}
+
+impl SimplifiedPoster {
+    pub fn to_archive(&mut self) -> Result<Vec<u8>, PushError> {
         let mut new_zip = vec![];
 
         let mut writer = ZipWriter::new(Cursor::new(&mut new_zip));
         writer.start_file("manifest.plist", SimpleFileOptions::default())?;
-        plist::to_writer_binary(&mut writer, &PosterManifest::new(self.r#type.get_identifier().to_string()))?;
+        plist::to_writer_binary(&mut writer, &PosterManifest::new(self.r#type.get_identifier().to_string(), self.role))?;
 
         let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
@@ -435,10 +567,10 @@ impl SimplifiedPoster {
                         subpath: a.uuid.clone(),
                         version: 0,
                     }).collect(), class: crate::NSArrayClass::NSArray },
-                    user_info: NSDictionary { class: crate::NSDictionaryClass::NSDictionary, item: PFPosterConfigurationUserInfo {
+                    user_info: Some(NSDictionary { class: crate::NSDictionaryClass::NSDictionary, item: PFPosterConfigurationUserInfo {
                         asset_uuid: assets.first().unwrap().uuid.clone(),
                         represents_device_owner: false,
-                    } }
+                    } })
                 };
 
                 writer.start_file("configuration/versions/0/contents/ConfigurationModel.plist", SimpleFileOptions::default())?;
@@ -485,29 +617,53 @@ impl SimplifiedPoster {
                 };
                 writer.start_file("configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo", SimpleFileOptions::default())?;
                 plist::to_writer_binary(&mut writer, &data)?;
+            },
+            PosterType::TranscriptDynamic { data } => {
+                writer.start_file("configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo", SimpleFileOptions::default())?;
+                plist::to_writer_binary(&mut writer, &data)?;
+            },
+            PosterType::TranscriptGradient { colors } => {
+                writer.start_file("configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo", SimpleFileOptions::default())?;
+                plist::to_writer_binary(&mut writer, &TranscriptGradientUserData::from_colors(&colors))?;
             }
         }
 
         writer.finish()?;
 
-        Ok(IMessagePosterRecord {
-            low_res_poster: self.low_res.clone(),
-            package: new_zip,
-            meta
-        })
+        Ok(new_zip)
     }
 
-    pub fn from_poster(poster: &IMessagePosterRecord) -> Result<Self, PushError> {
-        let meta: WallpaperMetadataWrapper = plist::from_bytes(&poster.meta)?;
-        let mut archive = ZipArchive::new(Cursor::new(&poster.package))?;
+    pub fn from_archive(archive: impl Read + Seek) -> Result<Self, PushError> {
+        let mut archive = ZipArchive::new(archive)?;
 
         let manifest: PosterManifest = read_file(&mut archive, "manifest.plist")?;
-        let mut configuration: PRPosterTitleStyleConfiguration = read_archive(&mut archive, "configuration/versions/0/com.apple.posterkit.provider.instance.titleStyleConfiguration.plist")?;
+        let mut configuration: PRPosterTitleStyleConfiguration = read_archive(&mut archive, "configuration/versions/0/com.apple.posterkit.provider.instance.titleStyleConfiguration.plist")
+            .unwrap_or(PRPosterTitleStyleConfiguration { 
+                alternate_date_enabled: false, 
+                contents_luminence: 0.0, 
+                group_name: "PREditingLook".to_string(), 
+                preferred_title_alignment: 0, 
+                preferred_title_layout: 0, 
+                time_font_configuration: PRPosterSystemTimeFontConfiguration { 
+                    is_system_item: true, 
+                    time_font_identifier: "PRTimeFontIdentifierSFPro".to_string(), 
+                    weight: 400.0,
+                }, 
+                time_numbering_system: None, 
+                title_color: PRPosterColor { 
+                    preferred_style: 2, 
+                    identifier: "vibrantMaterialColor".to_string(), 
+                    suggested: false, 
+                    color: UIColor::GrayscaleAlphaColorSpace { color_components: 2, white: 1.0, alpha: 0.5, bin: base64_decode("MSAwLjU="), color_space: 4, class: "PRPosterColor".to_string() }
+                }, 
+                title_content_style: vec![], 
+                user_configured: false, 
+                title_style: Some(PRPosterContentMaterialStyle::PRPosterContentVibrantMaterialStyle)
+            });
 
         configuration.unpack()?;
 
         Ok(Self {
-            text_metadata: meta.wallpaper_metadata_key,
             title_configuration: configuration,
             r#type: match manifest.extension_identifier.as_str() {
                 "com.apple.PhotosUIPrivate.PhotosPosterProvider" => {
@@ -550,12 +706,24 @@ impl SimplifiedPoster {
                         data: plist::from_bytes(file.data_representation.as_ref())?,
                         background: plist::from_bytes(file.background_color_description.as_ref())?
                     }
+                },
+                "com.apple.transcriptBackgroundPoster.DynamicExtension" => {
+                    let file: TranscriptDynamicUserData = read_file(&mut archive, "configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo")?;
+                    PosterType::TranscriptDynamic {
+                        data: file,
+                    }
+                },
+                "com.apple.transcriptBackgroundPoster.GradientExtension" => {
+                    let file: TranscriptGradientUserData = read_file(&mut archive, "configuration/versions/0/contents/com.apple.posterkit.provider.contents.userInfo")?;
+                    PosterType::TranscriptGradient {
+                        colors: file.to_colors(),
+                    }
                 }
                 _provider => {
                     return Err(PushError::UnknownPoster(_provider.to_string()))
                 }
             },
-            low_res: poster.low_res_poster.clone(),
+            role: manifest.role,
         })
     }
 }
@@ -563,12 +731,18 @@ impl SimplifiedPoster {
 
 fn read_file<T: Read + Seek, R: DeserializeOwned>(archive: &mut ZipArchive<T>, path: &str) -> Result<R, PushError> {
     let mut manifest = vec![];
+    if let Err(_) = archive.by_name(path) {
+        warn!("Error reading file {path}");
+    }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_bytes(&manifest)?)
 }
 
 fn read_archive<T: Read + Seek, R: DeserializeOwned>(archive: &mut ZipArchive<T>, path: &str) -> Result<R, PushError> {
     let mut manifest = vec![];
+    if let Err(_) = archive.by_name(path) {
+        warn!("Error reading file {path}");
+    }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
     Ok(plist::from_value(&KeyedArchive::expand(&manifest)?)?)
 }

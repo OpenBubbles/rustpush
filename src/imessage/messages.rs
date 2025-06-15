@@ -14,7 +14,7 @@ use async_recursion::async_recursion;
 use std::io::Seek;
 use rand::RngCore;
 
-use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, CertifiedContext, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
+use crate::{aps::get_message, ids::{identity_manager::{IDSSendMessage, MessageTarget, Raw}, CertifiedContext, IDSRecvMessage}, mmcs::{self, put_authorize_body, AuthorizedOperation, MMCSReceipt, ReadContainer, WriteContainer}, util::{base64_decode, base64_encode, bin_deserialize, bin_serialize, duration_since_epoch, plist_to_string, KeyedArchive, NSArray, NSArrayClass, NSDataClass, NSDictionary, NSDictionaryClass}, OSConfig};
 
 use crate::{aps::APSConnectionResource, error::PushError, mmcs::{get_mmcs, prepare_put, put_mmcs, MMCSConfig, Container, DataCacher, PreparedPut}, mmcsp, util::{decode_hex, encode_hex, gzip, plist_to_bin, ungzip}};
 
@@ -1510,6 +1510,83 @@ pub struct UpdateProfileSharingMessage {
     pub version: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum SetTranscriptBackgroundMessage {
+    Remove {
+        #[serde(rename = "traba")]
+        aid: u32,
+        #[serde(rename = "tbid")]
+        bid: u32, // sequence number
+        #[serde(rename = "cid")]
+        chat_id: Option<String>,
+
+        #[serde(rename = "trababr")]
+        remove: bool,
+    },
+    Set {
+        #[serde(rename = "traba")]
+        aid: u32,
+        #[serde(rename = "tbid")]
+        bid: u32, // sequence number
+        #[serde(rename = "cid")]
+        chat_id: Option<String>,
+        
+        #[serde(rename = "traboid")]
+        object_id: String,
+        #[serde(rename = "trabapv")]
+        payload_version: u32,
+        #[serde(rename = "trabaid")]
+        background_id: String,
+        #[serde(rename = "trabar")]
+        url: String,
+        #[serde(rename = "trabas")]
+        signature: String,
+        #[serde(rename = "trabak")]
+        key: String,
+        #[serde(rename = "trabafs")]
+        file_size: usize,
+    }
+}
+
+impl SetTranscriptBackgroundMessage {
+    pub fn to_mmcs(&self) -> Option<MMCSFile> {
+        match self {
+            Self::Remove { .. } => None,
+            Self::Set { object_id, url, signature, key, file_size, .. } => Some(MMCSFile { 
+                signature: base64_decode(&signature), 
+                object: object_id.to_string(), 
+                url: url.to_string(), 
+                key: base64_decode(&key)[1..].to_vec(), 
+                size: *file_size, // not used?? better hope not
+            })
+        }
+    }
+
+    pub fn from_mmcs(file: Option<MMCSFile>, version: u32, chat_id: Option<String>) -> Self {
+        match file {
+            None => Self::Remove {
+                aid: 1, 
+                bid: version, 
+                chat_id, 
+                remove: true,
+            },
+            Some(file) => Self::Set { 
+                aid: 1, 
+                bid: version, 
+                chat_id, 
+                object_id: file.object, 
+                payload_version: 1, 
+                background_id: Uuid::new_v4().to_string().to_uppercase(), 
+                url: file.url, 
+                signature: base64_encode(&file.signature), 
+                key: base64_encode(&[vec![0x00], file.key].concat()), 
+                file_size: file.size,
+            }
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub enum Message {
@@ -1539,6 +1616,7 @@ pub enum Message {
     UpdateProfileSharing(UpdateProfileSharingMessage),
     ShareProfile(ShareProfileMessage),
     NotifyAnyways,
+    SetTranscriptBackground(SetTranscriptBackgroundMessage),
 }
 
 
@@ -1593,6 +1671,7 @@ impl Message {
             Self::UpdateProfileSharing(_) => 180,
             Self::ShareProfile(_) => 131,
             Self::NotifyAnyways => 113,
+            Self::SetTranscriptBackground(_) => 138,
         }
     }
 
@@ -1666,6 +1745,7 @@ impl Message {
             Self::ShareProfile(_) => Some(true),
             Self::UpdateProfileSharing(_) => Some(true),
             Self::NotifyAnyways => Some(true),
+            Self::SetTranscriptBackground(_) => Some(true),
             _ => None
         }
     }
@@ -1751,6 +1831,9 @@ impl fmt::Display for Message {
             },
             Message::NotifyAnyways => {
                 write!(f, "Notify anyways")
+            },
+            Message::SetTranscriptBackground(_) => {
+                write!(f, "Changed the transcript background")
             }
         }
     }
@@ -1976,6 +2059,9 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::SetTranscriptBackground(back) => {
+                plist_to_bin(&back).unwrap()
+            }
             Message::UpdateExtension(ext) => {
                 let raw = RawUpdateExtensionMessage {
                     version: "1".to_string(),
@@ -2478,6 +2564,9 @@ impl MessageInst {
                 }
             }
         }
+        if let Ok(loaded) = plist::from_value::<SetTranscriptBackgroundMessage>(&value) {
+            return wrapper.to_message(None, Message::SetTranscriptBackground(loaded))
+        }
         if let Ok(loaded) = plist::from_value::<RecoverChatMetadataArray>(&value) {
             return wrapper.to_message(None, Message::RecoverChat(loaded.recover_chat_metadata_array.into_iter().next().unwrap()))
         }
@@ -2720,7 +2809,8 @@ impl MessageInst {
                         None
                     }
                 };
-            } else if let Some(balloon) = &balloon_part {
+            }
+            if let (Some(balloon), None) = (&balloon_part, &app) {
                 app = match Balloon::decode_raw(&balloon) {
                     Ok(i) => Some(ExtensionApp {
                         app_id: None,
@@ -2733,7 +2823,7 @@ impl MessageInst {
                         None
                     }
                 };
-            }
+            } 
             let mut link_meta = None;
             if let (Some("com.apple.messages.URLBalloonProvider"), Some(balloon_part)) = (loaded.balloon_id.as_deref(), balloon_part) {
                 match (|| {
