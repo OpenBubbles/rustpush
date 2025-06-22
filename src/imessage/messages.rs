@@ -1596,11 +1596,10 @@ pub enum Message {
     React(ReactMessage),
     Delivered,
     Read,
-    Typing,
+    Typing(bool),
     Unsend(UnsendMessage),
     Edit(EditMessage),
     IconChange(IconChangeMessage),
-    StopTyping,
     EnableSmsActivation(bool),
     MessageReadOnDevice,
     SmsConfirmSent(bool /* status */),
@@ -1651,11 +1650,10 @@ impl Message {
             Self::ChangeParticipants(_) => 190,
             Self::Delivered => 101,
             Self::Read => 102,
-            Self::Typing => 100,
+            Self::Typing(_) => 100,
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
             Self::IconChange(_) => 190,
-            Self::StopTyping => 100,
             Self::EnableSmsActivation(_) => 145,
             Self::MessageReadOnDevice => 147,
             Self::SmsConfirmSent(status) => if *status { 146 } else { 149 },
@@ -1730,7 +1728,7 @@ impl Message {
             return Some(true)
         }
         match self {
-            Self::Typing => Some(true),
+            Self::Typing(_) => Some(true),
             Self::Delivered => Some(true),
             Self::Edit(_) => Some(true),
             Self::Unsend(_) => Some(true),
@@ -1772,8 +1770,8 @@ impl fmt::Display for Message {
             Message::Delivered => {
                 write!(f, "delivered")
             },
-            Message::Typing => {
-                write!(f, "typing")
+            Message::Typing(typing) => {
+                write!(f, "{}", if *typing { "typing" } else { "stopped typing" })
             },
             Message::Edit(e) => {
                 write!(f, "Edited {}", e.new_parts.raw_text())
@@ -1783,9 +1781,6 @@ impl fmt::Display for Message {
             },
             Message::IconChange(_e) => {
                 write!(f, "changed the group icon")
-            },
-            Message::StopTyping => {
-                write!(f, "stopped typing")
             },
             Message::EnableSmsActivation(enabled) => {
                 write!(f, "{} sms activation", if *enabled { "enabled" } else { "disabled" })
@@ -1935,7 +1930,7 @@ impl MessageInst {
         match &self.message {
             Message::Read => false,
             Message::Delivered => false,
-            Message::Typing => false,
+            Message::Typing(typing) => self.conversation.as_ref().is_some_and(|a| a.participants.len() > 2) || !*typing,
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
             Message::Unschedule => false,
@@ -1946,8 +1941,7 @@ impl MessageInst {
 
     pub fn get_ex(&self) -> Option<u32> {
         match &self.message {
-            Message::Typing => Some(0),
-            Message::StopTyping => Some(0),
+            Message::Typing(_) => Some(0),
             _ => None
         }
     }
@@ -1968,7 +1962,7 @@ impl MessageInst {
 
     pub fn get_send_participants(&self, my_handles: &[String]) -> Vec<String> {
         let mut target_participants = self.conversation.as_ref().unwrap().participants.clone();
-        if let Message::Delivered | Message::Typing | Message::StopTyping = self.message {
+        if let Message::Delivered | Message::Typing(_) = self.message {
             // do not send delivery reciepts to other devices on same acct
             target_participants.retain(|p| {
                 !my_handles.contains(p)
@@ -2131,14 +2125,16 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             },
-            Message::StopTyping => {
-                let raw = RawIMessage {
+            Message::Typing(typing) => {
+                let raw = RawEncryptedTyping {
                     participants: conversation.participants.clone(),
                     sender_guid: conversation.sender_guid.clone(),
                     pv: 0,
                     gv: "8".to_string(),
-                    v: "1".to_string(),
+                    v: if !*typing { Some("1".to_string()) } else { None },
                     cv_name: conversation.cv_name.clone(),
+                    gt: if conversation.participants.len() > 2 { Some(true) } else { None },
+                    u: if *typing { Some(true) } else { None },
                     ..Default::default()
                 };
         
@@ -2369,7 +2365,6 @@ impl MessageInst {
             },
             Message::Delivered => panic!("no enc body!"),
             Message::Read => panic!("no enc body!"),
-            Message::Typing => panic!("no enc body!"),
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),
@@ -2503,6 +2498,16 @@ impl MessageInst {
         if let Ok(loaded) = plist::from_value::<RawSmsActivateMessage>(&value) {
             if !loaded.wc && loaded.ar {
                 return wrapper.to_message(None, Message::EnableSmsActivation(true));
+            }
+        }
+        if wrapper.is_typing == Some(0) {
+            if let Ok(loaded) = plist::from_value::<RawEncryptedTyping>(&value) {
+                return wrapper.to_message(Some(ConversationData { 
+                    participants: loaded.participants.clone(),
+                    cv_name: loaded.cv_name.clone(),
+                    sender_guid: loaded.sender_guid.clone(),
+                    after_guid: None,
+                }), Message::Typing(loaded.u == Some(true)));
             }
         }
         if let Ok(loaded) = plist::from_value::<RawSmsDeactivateMessage>(&value) {

@@ -68,6 +68,7 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-send-later-messages", Value::Boolean(true)),
         ("supports-certified-delivery-v1", Value::Boolean(true)),
         ("supports-transcript-backgrounds", Value::Boolean(true)),
+        ("supports-gti", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
@@ -222,12 +223,11 @@ impl IMClient {
             }).ok())
         }
 
-        // typing
         if let IDSRecvMessage {
             sender: Some(sender),
             target: Some(target),
             is_typing: Some(0),
-            message,
+            message: None,
             ..
         } = &payload {
             return Ok(payload.to_message(Some(ConversationData {
@@ -235,11 +235,7 @@ impl IMClient {
                 cv_name: None,
                 sender_guid: None,
                 after_guid: None,
-            }), if message.is_some() {
-                Message::StopTyping
-            } else {
-                Message::Typing
-            }).ok())
+            }), Message::Typing(true)).ok())
         }
 
         // errors

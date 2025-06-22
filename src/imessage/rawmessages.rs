@@ -365,6 +365,21 @@ struct RawMMCSBalloon {
 }
 
 #[derive(Serialize, Deserialize, Default)]
+struct RawEncryptedTyping {
+    pv: u32,
+    #[serde(rename = "p")]
+    participants: Vec<String>,
+    u: Option<bool>,
+    gt: Option<bool>,
+    #[serde(rename = "gid")]
+    sender_guid: Option<String>,
+    gv: String,
+    v: Option<String>,
+    #[serde(rename = "n")]
+    cv_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
 struct RawIMessage {
     #[serde(rename = "t")]
     text: Option<String>,

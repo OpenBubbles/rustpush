@@ -2,12 +2,14 @@
 use std::{collections::HashMap, time::{Duration, SystemTime}};
 
 use async_trait::async_trait;
-use open_absinthe::nac::{HardwareConfig, ValidationCtx};
+use open_absinthe::nac::ValidationCtx;
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{activation::ActivationInfo, util::{encode_hex, get_bag, REQWEST, plist_to_buf, IDS_BAG}, DebugMeta, OSConfig, PushError, RegisterMeta};
+
+pub use open_absinthe::nac::HardwareConfig;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MacOSConfig {
