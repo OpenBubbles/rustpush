@@ -9,6 +9,8 @@ use crate::util::{NSData, NSUUID, NSURL};
 struct NotificationData {
     pub ams: String,
     pub amc: u64,
+    pub amd: Option<String>,
+    pub amb: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -446,11 +448,11 @@ struct RawIMessage {
 struct RawBalloonData {
     ldtext: Option<String>,
     #[serde(flatten)]
-    layout: BalloonLayout,
+    layout: Option<BalloonLayout>,
     #[serde(rename = "an")]
     app_name: String,
     #[serde(rename = "ai")]
-    app_icon: NSData,
+    app_icon: Option<NSData>,
     session_identifier: Option<NSUUID>,
     live_layout_info: Option<NSData>,
     #[serde(rename = "URL")]
@@ -462,14 +464,20 @@ impl Serialize for RawBalloonData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
             S: Serializer {
-        let mut serialized = plist::to_value(&self.layout).map_err(serde::ser::Error::custom)?;
-        let Some(dict) = serialized.as_dictionary_mut() else { panic!("not a dictionary!") };
-
-        dict.extend([
+        let mut dict = Dictionary::from_iter([
             ("an".to_string(), self.app_name.clone().into()),
-            ("ai".to_string(), plist::to_value(&self.app_icon).map_err(serde::ser::Error::custom)?),
             ("URL".to_string(), plist::to_value(&self.url).map_err(serde::ser::Error::custom)?)
-        ].into_iter());
+        ]);
+
+        if let Some(layout) = &self.layout {
+            let serialized = plist::to_value(&layout).map_err(serde::ser::Error::custom)?;
+            let Some(d) = serialized.into_dictionary() else { panic!("not a dictionary!") };
+            dict.extend(d)
+        }
+
+        if let Some(app_icon) = &self.app_icon {
+            dict.insert("ai".to_string(), plist::to_value(&app_icon).map_err(serde::ser::Error::custom)?);
+        }
 
         if let Some(appid) = &self.appid {
             dict.insert("appid".to_string(), appid.into());
@@ -487,7 +495,7 @@ impl Serialize for RawBalloonData {
             dict.insert("liveLayoutInfo".to_string(), plist::to_value(&live_layout_info).map_err(serde::ser::Error::custom)?);
         }
         
-        serialized.serialize(serializer)
+        dict.serialize(serializer)
     }
 }
 

@@ -675,11 +675,11 @@ pub enum BalloonLayout {
 pub struct Balloon {
     pub url: String,
     pub session: Option<String>, // UUID
-    pub layout: BalloonLayout,
+    pub layout: Option<BalloonLayout>,
     pub ld_text: Option<String>,
     pub is_live: bool,
 
-    pub icon: Vec<u8>,
+    pub icon: Option<Vec<u8>>,
 }
 
 impl Balloon {
@@ -701,7 +701,7 @@ impl Balloon {
             layout: unpacked.layout,
             ld_text: unpacked.ldtext,
             is_live: unpacked.live_layout_info.is_some(),
-            icon: ungzip(&*unpacked.app_icon)?,
+            icon: unpacked.app_icon.map(|a| ungzip(&a).unwrap()),
         })
     }
 
@@ -710,10 +710,10 @@ impl Balloon {
             item: RawBalloonData {
                 ldtext: self.ld_text.clone(),
                 layout: self.layout.clone(),
-                app_icon: NSData {
-                    data: gzip(&self.icon)?.into(),
+                app_icon: self.icon.as_ref().map(|icon| NSData {
+                    data: gzip(&icon).unwrap().into(),
                     class: NSDataClass::NSMutableData
-                },
+                }),
                 app_name: app.name.clone(),
                 session_identifier: self.session.as_ref().map(|session| Uuid::from_str(&session).unwrap().into()),
                 live_layout_info: if self.is_live {
@@ -912,7 +912,8 @@ pub enum ReactMessageType {
     },
     Extension {
         spec: ExtensionApp,
-        body: MessageParts
+        body: MessageParts,
+        is_meta: bool,
     },
 }
 
@@ -950,11 +951,11 @@ impl ReactMessageType {
                     )
                 }
             },
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body } => {
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body, .. } => {
                 body.raw_text()
             }
             ,
-            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body } => {
+            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body, .. } => {
                 "\u{fffd}".to_string() // replacement character
             }
         }
@@ -967,8 +968,9 @@ impl ReactMessageType {
             } else {
                 reaction.get_idx() + 3000
             },
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _ } => 1000,
-            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _ } => 2,
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _, .. } => 1000,
+            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, is_meta: false } => 2,
+            Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, is_meta: true } => 4000,
         }
     }
 
@@ -979,14 +981,14 @@ impl ReactMessageType {
 
     fn notification(&self) -> bool {
         match self {
-            Self::React { reaction: _, enable: _ } => true,
-            Self::Extension { spec: _, body: _ } => false,
+            Self::React { .. } => true,
+            Self::Extension { is_meta, .. } => *is_meta,
         }
     }
 
     fn prid(&self) -> Option<String> {
         match self {
-            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _ } => Some("3cN".to_string()),
+            Self::Extension { spec: ExtensionApp { balloon: None, .. }, body: _, .. } => Some("3cN".to_string()),
             _ => None,
         }
     }
@@ -994,14 +996,14 @@ impl ReactMessageType {
     fn get_xml(&self) -> Option<String> {
         match self {
             Self::React { reaction: _, enable: _ } => None,
-            Self::Extension { spec: _, body } => {
+            Self::Extension { spec: _, body, .. } => {
                 Some(body.to_xml(None))
             },
         }
     }
 
     fn is_balloon(&self) -> bool {
-        matches!(self, Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _ })
+        matches!(self, Self::Extension { spec: ExtensionApp { balloon: Some(_), .. }, body: _, .. })
     }
 }
 
@@ -2157,13 +2159,15 @@ impl MessageInst {
                 let text = react.get_text();
 
                 let mut balloon_id: Option<String> = None;
+                let mut balloon_name: Option<String> = None;
                 let mut balloon_part: Option<Vec<u8>> = None;
                 let mut app_info: Option<Data> = None;
-                if let ReactMessageType::Extension { spec: app_obj, body: _ } = &react.reaction {
+                if let ReactMessageType::Extension { spec: app_obj, body: _, .. } = &react.reaction {
                     let (app, balloon) = app_obj.to_raw()?;
                     app_info = if balloon.is_none() { Some(app.into()) } else { None };
                     balloon_part = balloon;
                     balloon_id = Some(app_obj.bundle_id.clone());
+                    balloon_name = Some(app_obj.name.clone());
                 }
 
                 let (balloon_part, balloon_part_mmcs) = if let Some(balloon_part) = balloon_part {
@@ -2187,7 +2191,9 @@ impl MessageInst {
                     cv_name: conversation.cv_name.clone(),
                     notification: if react.reaction.notification() { Some(plist_to_bin(&NotificationData {
                         ams: react.to_text.clone(),
-                        amc: 1
+                        amc: if balloon_name.is_some() { 9 } else { 1 },
+                        amd: balloon_name,
+                        amb: balloon_id.clone(),
                     }).unwrap().into()) } else { None },
                     amk: if let Some(part) = react.to_part { format!("p:{}/{}", part, react.to_uuid) } else { react.to_uuid.clone() },
                     type_spec: app_info,
@@ -2637,7 +2643,7 @@ impl MessageInst {
             }), Message::RenameMessage(RenameMessage { new_name: loaded.new_name.clone() }));
         }
         if let Ok(loaded) = plist::from_value::<RawReactMessage>(&value) {
-            let (to_uuid, to_part) = if loaded.amt == 2 {
+            let (to_uuid, to_part) = if loaded.amt == 2 || loaded.amt == 4000 {
                 (loaded.amk, None)
             } else {
                 let target_msg_data = Regex::new(r"p:([0-9]+)/([0-9A-F\-]+)").unwrap()
@@ -2646,16 +2652,17 @@ impl MessageInst {
             };
             
             let msg = match loaded.amt {
-                2 => {
+                2 | 4000 => {
                     let balloon_part = Self::get_balloon(loaded.balloon_part, loaded.balloon_part_mmcs, apns).await;
-                    let (Some(xml), Some(balloon), Some(balloon_id)) = (&loaded.xml, &balloon_part, &loaded.balloon_id) else {
+                    let (Some(balloon), Some(balloon_id)) = (&balloon_part, &loaded.balloon_id) else {
                         return Err(PushError::BadMsg)
                     };
                     
                     let data = ExtensionApp::from_bp(balloon, balloon_id)?;
                     ReactMessageType::Extension {
                         spec: data,
-                        body: MessageParts::parse_parts(xml, None),
+                        body: loaded.xml.as_ref().map(|xml| MessageParts::parse_parts(xml, None)).unwrap_or(MessageParts(vec![])),
+                        is_meta: loaded.amt == 4000,
                     }
                 },
                 1000 => {
@@ -2666,6 +2673,7 @@ impl MessageInst {
                     ReactMessageType::Extension {
                         spec: data,
                         body: MessageParts::parse_parts(xml, None),
+                        is_meta: false,
                     }
                 },
                 2007 | 3007 => {

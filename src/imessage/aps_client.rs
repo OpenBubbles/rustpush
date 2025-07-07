@@ -69,6 +69,7 @@ pub const MADRID_SERVICE: IDSService = IDSService {
         ("supports-certified-delivery-v1", Value::Boolean(true)),
         ("supports-transcript-backgrounds", Value::Boolean(true)),
         ("supports-gti", Value::Boolean(true)),
+        ("supports-polls", Value::Boolean(true)),
     ],
     flags: 17,
     capabilities_name: "Messenger"
