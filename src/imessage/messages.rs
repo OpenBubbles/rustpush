@@ -1589,6 +1589,12 @@ impl SetTranscriptBackgroundMessage {
     }
 }
 
+#[derive(Clone)]
+pub struct TypingApp {
+    pub bundle_id: String,
+    pub icon: Vec<u8>,
+}
+
 #[repr(C)]
 #[derive(Clone)]
 pub enum Message {
@@ -1598,7 +1604,7 @@ pub enum Message {
     React(ReactMessage),
     Delivered,
     Read,
-    Typing(bool),
+    Typing(bool, Option<TypingApp>),
     Unsend(UnsendMessage),
     Edit(EditMessage),
     IconChange(IconChangeMessage),
@@ -1652,7 +1658,7 @@ impl Message {
             Self::ChangeParticipants(_) => 190,
             Self::Delivered => 101,
             Self::Read => 102,
-            Self::Typing(_) => 100,
+            Self::Typing(_, _) => 100,
             Self::Edit(_) => 118,
             Self::Unsend(_) => 118,
             Self::IconChange(_) => 190,
@@ -1730,7 +1736,7 @@ impl Message {
             return Some(true)
         }
         match self {
-            Self::Typing(_) => Some(true),
+            Self::Typing(_, _) => Some(true),
             Self::Delivered => Some(true),
             Self::Edit(_) => Some(true),
             Self::Unsend(_) => Some(true),
@@ -1772,7 +1778,7 @@ impl fmt::Display for Message {
             Message::Delivered => {
                 write!(f, "delivered")
             },
-            Message::Typing(typing) => {
+            Message::Typing(typing, _) => {
                 write!(f, "{}", if *typing { "typing" } else { "stopped typing" })
             },
             Message::Edit(e) => {
@@ -1932,7 +1938,7 @@ impl MessageInst {
         match &self.message {
             Message::Read => false,
             Message::Delivered => false,
-            Message::Typing(typing) => self.conversation.as_ref().is_some_and(|a| a.participants.len() > 2) || !*typing,
+            Message::Typing(typing, app) => self.conversation.as_ref().is_some_and(|a| a.participants.len() > 2) || app.is_some() || !*typing,
             Message::MessageReadOnDevice => false,
             Message::PeerCacheInvalidate => false,
             Message::Unschedule => false,
@@ -1943,7 +1949,7 @@ impl MessageInst {
 
     pub fn get_ex(&self) -> Option<u32> {
         match &self.message {
-            Message::Typing(_) => Some(0),
+            Message::Typing(_, _) => Some(0),
             _ => None
         }
     }
@@ -1964,7 +1970,7 @@ impl MessageInst {
 
     pub fn get_send_participants(&self, my_handles: &[String]) -> Vec<String> {
         let mut target_participants = self.conversation.as_ref().unwrap().participants.clone();
-        if let Message::Delivered | Message::Typing(_) = self.message {
+        if let Message::Delivered | Message::Typing(_, _) = self.message {
             // do not send delivery reciepts to other devices on same acct
             target_participants.retain(|p| {
                 !my_handles.contains(p)
@@ -2127,9 +2133,9 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             },
-            Message::Typing(typing) => {
+            Message::Typing(typing, app) => {
                 let raw = RawEncryptedTyping {
-                    participants: conversation.participants.clone(),
+                    participants: Some(conversation.participants.clone()),
                     sender_guid: conversation.sender_guid.clone(),
                     pv: 0,
                     gv: "8".to_string(),
@@ -2137,6 +2143,8 @@ impl MessageInst {
                     cv_name: conversation.cv_name.clone(),
                     gt: if conversation.participants.len() > 2 { Some(true) } else { None },
                     u: if *typing { Some(true) } else { None },
+                    bundle_id: app.as_ref().map(|a| a.bundle_id.clone()),
+                    icon: app.as_ref().map(|a| gzip_normal(&a.icon).unwrap().into()),
                     ..Default::default()
                 };
         
@@ -2508,12 +2516,16 @@ impl MessageInst {
         }
         if wrapper.is_typing == Some(0) {
             if let Ok(loaded) = plist::from_value::<RawEncryptedTyping>(&value) {
+                debug!("Got typing");
                 return wrapper.to_message(Some(ConversationData { 
-                    participants: loaded.participants.clone(),
+                    participants: loaded.participants.clone().unwrap_or(vec![wrapper.sender.clone().expect("No sender?"), wrapper.target.clone().expect("No target?")]),
                     cv_name: loaded.cv_name.clone(),
                     sender_guid: loaded.sender_guid.clone(),
                     after_guid: None,
-                }), Message::Typing(loaded.u == Some(true)));
+                }), Message::Typing(loaded.u == Some(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp { 
+                    bundle_id: bid.clone(), 
+                    icon: ungzip(icon.as_ref())?, 
+                }) } else { None }));
             }
         }
         if let Ok(loaded) = plist::from_value::<RawSmsDeactivateMessage>(&value) {

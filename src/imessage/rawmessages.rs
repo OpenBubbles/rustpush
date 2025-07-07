@@ -370,7 +370,11 @@ struct RawMMCSBalloon {
 struct RawEncryptedTyping {
     pv: u32,
     #[serde(rename = "p")]
-    participants: Vec<String>,
+    participants: Option<Vec<String>>,
+    #[serde(rename = "tic")]
+    icon: Option<Data>,
+    #[serde(rename = "bid")]
+    bundle_id: Option<String>,
     u: Option<bool>,
     gt: Option<bool>,
     #[serde(rename = "gid")]

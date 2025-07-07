@@ -236,7 +236,7 @@ impl IMClient {
                 cv_name: None,
                 sender_guid: None,
                 after_guid: None,
-            }), Message::Typing(true)).ok())
+            }), Message::Typing(true, None)).ok())
         }
 
         // errors
