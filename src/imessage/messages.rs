@@ -2144,7 +2144,7 @@ impl MessageInst {
                     gt: if conversation.participants.len() > 2 { Some(true) } else { None },
                     u: if *typing { Some(true) } else { None },
                     bundle_id: app.as_ref().map(|a| a.bundle_id.clone()),
-                    icon: app.as_ref().map(|a| gzip_normal(&a.icon).unwrap().into()),
+                    icon: app.as_ref().map(|a| gzip(&a.icon).unwrap().into()),
                     ..Default::default()
                 };
         
