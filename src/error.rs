@@ -5,6 +5,7 @@ use omnisette::AnisetteError;
 #[cfg(feature = "macos-validation-data")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
+use plist::Value;
 use thiserror::Error;
 use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Elapsed};
 
@@ -152,4 +153,18 @@ pub enum PushError {
     CircleHTTPError(#[from] icloud_auth::Error),
     #[error("Circle error {0}")]
     IdmsCircleError(i32),
+    #[error("Escrow error {0:?}")]
+    EscrowError(Value),
+    #[error("Unimplemented escrow format {0}")]
+    UnimplementedEscrow(u32),
+    #[error("Mismatched escrow key: {0}")]
+    MismatchedEscrowKey(&'static str),
+    #[error("Peer misrepresented their hash: computed: {0} claimed: {1}")]
+    MisrepresentedPeer(String, String),
+    #[error("Peer not found!")]
+    PeerNotFound,
+    #[error("Wrong circle step {0}")]
+    WrongStep(u32),
+    #[error("Decryption Key not found {0}")]
+    DecryptionKeyNotFound(String),
 }

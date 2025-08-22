@@ -1,11 +1,15 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put::put_data::Chunk, authorize_put_response::UploadTarget, Container as ProtoContainer, HttpRequest}, util::{decode_hex, encode_hex, plist_to_bin, REQWEST}, APSConnectionResource};
+use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put::put_data::{Chunk, FordDesc}, authorize_put_response::{upload_target::ChunkIdentifier, UploadTarget}, Container as ProtoContainer, FordChunk, FordChunkItem, FordItem, HttpRequest}, util::{decode_hex, encode_hex, plist_to_bin, REQWEST}, APSConnectionResource};
+use aes::Aes256;
+use aes_siv::siv::CmacSiv;
+use hkdf::Hkdf;
 use log::{debug, info, warn};
-use openssl::{hash::{Hasher, MessageDigest}, sha::{sha256, Sha1}, symm::{decrypt, encrypt, Cipher}};
+use openssl::{hash::{Hasher, MessageDigest}, pkey::PKey, sha::{sha1, sha256, Sha1}, sign::{self, Signer}, symm::{decrypt, encrypt, Cipher}};
 use plist::Data;
 use prost::Message;
 use reqwest::{header::{HeaderMap, HeaderName}, Body, Client, Response};
+use sha2::Sha256;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use async_trait::async_trait;
@@ -13,6 +17,7 @@ use serde::{Serialize, Deserialize};
 use rand::{Rng, RngCore};
 use std::io::{Read, Write};
 use std::str::FromStr;
+use aes_siv::KeyInit;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -114,7 +119,9 @@ fn gen_chunk_sig(chunk: &[u8], prefix: u8) -> ([u8; 21], [u8; 17]) {
 pub struct PreparedPut {
     pub total_sig: Vec<u8>,
     pub chunk_sigs: Vec<ChunkDesc>,
-    pub total_len: usize
+    pub total_len: usize,
+    pub ford_key: Option<[u8; 32]>,
+    pub ford: Option<([u8; 21], Vec<u8>)>,
 }
 
 pub async fn prepare_put(mut reader: impl ReadContainer + Send + Sync, encrypt: bool, prefix: u8) -> Result<PreparedPut, PushError> {
@@ -131,7 +138,7 @@ pub async fn prepare_put(mut reader: impl ReadContainer + Send + Sync, encrypt: 
         chunk_sigs.push(ChunkDesc {
             id: signature,
             size: chunk.len(),
-            key: if encrypt { Some(key) } else { None },
+            key: if encrypt { ChunkEncryption::V1(key) } else { ChunkEncryption::None },
         });
         total_len += chunk.len();
         chunk = reader.read(5242880).await?;
@@ -142,7 +149,96 @@ pub async fn prepare_put(mut reader: impl ReadContainer + Send + Sync, encrypt: 
             total_hasher.finish().to_vec()
         ].concat(),
         chunk_sigs,
-        total_len
+        total_len,
+        ford_key: None,
+        ford: None,
+    })
+}
+
+pub async fn prepare_put_v2(mut reader: impl ReadContainer + Send + Sync, boundary_key: &[u8]) -> Result<PreparedPut, PushError> {
+    let mut total_len = 0;
+    let mut total_hasher = openssl::sha::Sha256::new();
+    total_hasher.update(b"com.apple.DataObjectSaltV2");
+    let mut chunk_sigs: Vec<ChunkDesc> = vec![];
+    
+    let mut ford_references = vec![];
+    let mut chunk = reader.read(5242880).await?;
+    // chunk data into chunks of 5MB, generating a signature for each chunk
+    while chunk.len() > 0 {
+        total_hasher.update(&chunk);
+
+        let mut chunk_key: [u8; 33] = rand::random();
+        chunk_key[0] = 0x04;
+
+        let hk = Hkdf::<Sha256>::new(None, &chunk_key[1..]);
+        let mut expanded_key = [0u8; 0x60];
+        hk.expand("signature-key".as_bytes(), &mut expanded_key).unwrap();
+
+        let plaintext_hash = sha256(&chunk);
+        let sig_hmac = PKey::hmac(&expanded_key[0x00..0x20])?;
+        let mut h = Signer::new(MessageDigest::sha256(), &sig_hmac)?.sign_oneshot_to_vec(&plaintext_hash)?;
+        h.insert(0, 0x84);
+        h.resize(21, 0);
+        
+        ford_references.push(FordChunkItem {
+            key: chunk_key.to_vec(),
+            chunk_len: (chunk.len() as u32).to_le_bytes().to_vec(),
+        });
+
+        chunk_sigs.push(ChunkDesc {
+            id: h.try_into().unwrap(),
+            size: chunk.len(),
+            key: ChunkEncryption::V2(chunk_key, (chunk.len() as u32).to_le_bytes()),
+        });
+        total_len += chunk.len();
+        chunk = reader.read(5242880).await?;
+    }
+
+    let hash = total_hasher.finish();
+
+    let hk = Hkdf::<Sha256>::new(None, boundary_key);
+    let mut file_key = [0u8; 0x20];
+    hk.expand("file-key".as_bytes(), &mut file_key).unwrap();
+
+    let hk = Hkdf::<Sha256>::new(None, &file_key);
+    let mut checksum = [0u8; 0x20];
+    hk.expand(&hash, &mut checksum).unwrap();
+
+    let hmac = PKey::hmac(&checksum)?;
+    let mut signature = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&hash)?;
+    signature.insert(0, 0x04);
+    signature.resize(21, 0);
+
+    let total_ford = FordChunk {
+        item: Some(FordItem {
+            chunks: ford_references,
+            checksum: checksum.to_vec()
+        })
+    };
+    let ford_key: [u8; 32] = rand::random();
+
+    let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), &ford_key);
+    let mut result = [0u8; 64];
+    hk.expand(&[], &mut result).unwrap();
+
+    let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
+    let ford_iv: [u8; 16] = rand::random();
+    // first byte is 4 if initial key is 256 bit, 3 otherwise
+    let data = cipher.encrypt::<&[&[u8]], &&[u8]>(&[&ford_iv, &[0x04]], &total_ford.encode_to_vec()).unwrap();
+    let encrypted_ford = [&[0x04][..], &ford_iv, &data].concat();
+
+    let mut ford_signature = sha1(&ford_key).to_vec();
+    ford_signature.insert(0, 0x01);
+
+    Ok(PreparedPut {
+        total_sig: signature,
+        chunk_sigs,
+        total_len,
+        ford_key: Some(ford_key),
+        ford: Some((
+            ford_signature.try_into().unwrap(),
+            encrypted_ford,
+        ))
     })
 }
 
@@ -159,12 +255,11 @@ struct MMCSPutContainer {
     dsid: String,
     confirm_url: String,
     buffer: Option<Vec<u8>>,
-    index: HashMap<String, ChunkDesc>,
     user_agent: String,
 }
 
 impl MMCSPutContainer {
-    fn new(target: UploadTarget, index: HashMap<String, ChunkDesc>, length: usize, finish_binary: Option<Vec<u8>>, dsid: String, confirm_url: String, user_agent: String) -> MMCSPutContainer {
+    fn new(target: UploadTarget, length: usize, finish_binary: Option<Vec<u8>>, dsid: String, confirm_url: String, user_agent: String) -> MMCSPutContainer {
         MMCSPutContainer {
             target,
             hasher: Hasher::new(MessageDigest::md5()).unwrap(),
@@ -176,24 +271,12 @@ impl MMCSPutContainer {
             dsid,
             confirm_url,
             buffer: None,
-            index,
             user_agent
         }
     }
     
-    fn get_chunks(&self) -> Vec<ChunkDesc> {
-        self.target.chunks.iter().enumerate().map(|(idx, chunk)| {
-            let len = if idx == self.target.chunks.len() - 1 {
-                self.length % 5242880
-            } else {
-                5242880
-            };
-            ChunkDesc {
-                id: (&chunk.chunk_id[..]).try_into().unwrap(),
-                size: len,
-                key: self.index[&encode_hex(&chunk.chunk_id)].key,
-            }
-        }).collect()
+    fn get_chunks(&self, index: &HashMap<String, ChunkDesc>) -> Vec<ChunkDesc> {
+        self.target.chunks.iter().map(|chunk| index[&encode_hex(&chunk_id_to_id(chunk))].clone()).collect()
     }
 
     // opens an HTTP stream if not already open
@@ -300,6 +383,25 @@ impl WriteContainer for MMCSPutContainer {
     }
 }
 
+enum SplitContainer<T> {
+    Data(T),
+    Ford(FileContainer<Cursor<Vec<u8>>>),
+}
+
+
+#[async_trait]
+impl<T: Send + Sync> Container for SplitContainer<T> { }
+
+#[async_trait]
+impl<T: ReadContainer + Send + Sync> ReadContainer for SplitContainer<T> {
+    async fn read(&mut self, len: usize) -> Result<Vec<u8>, PushError> {
+        match self {
+            Self::Data(t) => t.read(len).await,
+            Self::Ford(cont) => cont.read(len).await,
+        }
+    }
+}
+
 
 pub struct FileContainer<T> {
     inner: T,
@@ -376,8 +478,10 @@ pub fn put_authorize_body(config: &MMCSConfig, inputs: &[(&PreparedPut, Option<S
             chunks: prepared.chunk_sigs.iter().map(|chunk| mmcsp::authorize_put::put_data::Chunk {
                 sig: chunk.id.to_vec(),
                 size: chunk.size as u32,
-                encryption_key: chunk.key.map(|c| c.to_vec()),
+                encryption_key: if let ChunkEncryption::V1(e) = chunk.key { Some(e.to_vec()) } else { None },
             }).collect(),
+            ford_sig: prepared.ford.as_ref().map(|c| c.0.to_vec()),
+            ford_desc: prepared.ford.as_ref().map(|c| FordDesc { len: c.1.len() as u32 }),
             footer: Some(mmcsp::authorize_put::put_data::Footer {
                 chunk_count: prepared.chunk_sigs.len() as u32,
                 profile_type: "kCKProfileTypeFixed".to_string(),
@@ -393,11 +497,26 @@ pub fn put_authorize_body(config: &MMCSConfig, inputs: &[(&PreparedPut, Option<S
     (get_headers(config.mme_client_info.to_string()), buf)
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct AuthorizedOperation {
     pub url: String,
     pub body: Vec<u8>,
     pub dsid: String,
+}
+
+fn ford_idx_to_id(idx: u32) -> [u8; 21] {
+    let mut data = vec![0x7f];
+    data.extend(idx.to_le_bytes());
+    data.resize(21, 0);
+    data.try_into().unwrap()
+}
+
+fn chunk_id_to_id(id: &ChunkIdentifier) -> [u8; 21] {
+    if let Some(chunk_id) = &id.chunk_id {
+        chunk_id.clone().try_into().unwrap()
+    } else if let Some(ford_idx) = &id.ford_index {
+        ford_idx_to_id(*ford_idx)
+    } else { panic!("no chunk id") }
 }
 
 // upload data to mmcs
@@ -410,25 +529,50 @@ pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<Str
 
     let response = mmcsp::AuthorizePutResponse::decode(&mut Cursor::new(body)).unwrap();
 
+
+    let mut sources = inputs.iter_mut().map(|(prepared, _, container)| ChunkedContainer::new(prepared.chunk_sigs.clone().into_iter().map(|mut i| {
+        i.key = ChunkEncryption::None;
+        i
+    }).collect(), SplitContainer::Data(container.take().expect("Duplicate PUT containers??")))).collect::<Vec<_>>();
+
+    let mut index: HashMap<String, ChunkDesc> = inputs.iter().flat_map(|s| s.0.chunk_sigs.iter().map(|c| (encode_hex(&c.id), *c))).collect::<HashMap<_, _>>();
+
+    let mut ford_ctr = 0;
     for state in &response.current_states {
+        if let Some(ford_id) = &state.ford_id {
+            let ford_data = inputs.iter().find_map(|f| {
+                if let Some(ford) = &f.0.ford {
+                    if &ford.0[..] == &ford_id[..] {
+                        return Some(ford.1.clone())
+                    }
+                }
+                None
+            }).unwrap();
+
+            let desc = ChunkDesc {
+                id: ford_idx_to_id(ford_ctr),
+                size: ford_data.len(),
+                key: ChunkEncryption::None,
+            };
+
+            index.insert(encode_hex(&ford_idx_to_id(ford_ctr)), desc.clone());
+            
+            sources.push(ChunkedContainer::new(vec![desc], SplitContainer::Ford(FileContainer::new(Cursor::new(ford_data)))));
+            ford_ctr += 1;
+        }
+
         let Some(receipt) = &state.receipt else { continue };
         receipts.insert(state.signature.clone(), receipt.clone());
     }
 
-    let sources = inputs.iter_mut().map(|(prepared, _, container)| ChunkedContainer::new(prepared.chunk_sigs.clone().into_iter().map(|mut i| {
-        i.key = None;
-        i
-    }).collect(), container.take().expect("Duplicate PUT containers??"))).collect::<Vec<_>>();
-
-    let index: HashMap<String, ChunkDesc> = inputs.iter().flat_map(|s| s.0.chunk_sigs.iter().map(|c| (encode_hex(&c.id), *c))).collect::<HashMap<_, _>>();
 
     let targets: Vec<ChunkedContainer<MMCSPutContainer>> = response.targets.iter().map(|target| {
         let len = target.chunks.iter().fold(0, |acc, chunk| {
-            let wanted_chunk = index[&encode_hex(&chunk.chunk_id)];
+            let wanted_chunk = index[&encode_hex(&chunk_id_to_id(chunk))];
             wanted_chunk.size + acc
         });
-        let target = MMCSPutContainer::new(target.clone(), index.clone(), len, response.confirm_data.clone(), dsid.clone(), url.clone(), config.user_agent.clone());
-        ChunkedContainer::new(target.get_chunks(), target)
+        let target = MMCSPutContainer::new(target.clone(), len, response.confirm_data.clone(), dsid.clone(), url.clone(), config.user_agent.clone());
+        ChunkedContainer::new(target.get_chunks(&index), target)
     }).collect();
 
     // and, hopefully, everything "just works."
@@ -507,7 +651,81 @@ pub trait WriteContainer: Container {
 pub struct ChunkDesc {
     id: [u8; 21],
     size: usize,
-    key: Option<[u8; 17]>,
+    key: ChunkEncryption,
+}
+
+impl ChunkDesc {
+    fn encrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
+        Ok(match self.key {
+            ChunkEncryption::V1(key) => encrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V2(key, _) => {
+                let hk = Hkdf::<Sha256>::new(None, &key[1..]);
+                let mut expanded_key = [0u8; 0x60];
+                hk.expand("signature-key".as_bytes(), &mut expanded_key).unwrap();
+
+                let hmac = PKey::hmac(&expanded_key[0x20..0x40])?;
+
+                let mut id = self.id[1..].to_vec();
+                id.resize(40, 0);
+                id[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+                let h = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&id)?;
+
+                let plaintext_hash = sha256(&data);
+
+                let result = encrypt(Cipher::aes_256_ctr(), &&expanded_key[0x40..0x60], Some(&h[..16]), &data)?;
+
+                let sig_hmac = PKey::hmac(&expanded_key[0x00..0x20])?;
+                let h = Signer::new(MessageDigest::sha256(), &sig_hmac)?.sign_oneshot_to_vec(&plaintext_hash)?;
+
+                assert_eq!(&h[..self.id.len() - 1], &self.id[1..]);
+
+                result
+            },
+            ChunkEncryption::None => data,
+        })
+    }
+
+    fn decrypt(&self, data: Vec<u8>) -> Result<Vec<u8>, PushError> {
+        Ok(match self.key {
+            ChunkEncryption::V1(key) => decrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?,
+            ChunkEncryption::V2(key, len) => {
+                let hk = Hkdf::<Sha256>::new(None, &key[1..]);
+                let mut expanded_key = [0u8; 0x60];
+                hk.expand("signature-key".as_bytes(), &mut expanded_key).unwrap();
+
+                let hmac = PKey::hmac(&expanded_key[0x20..0x40])?;
+
+                let mut id = self.id[1..].to_vec();
+                id.resize(40, 0);
+                id[32..36].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+                let h = Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&id)?;
+
+                let mut result = decrypt(Cipher::aes_256_ctr(), &&expanded_key[0x40..0x60], Some(&h[..16]), &data)?;
+                // padded with zeros sometimes
+                let length = u32::from_le_bytes(len) as usize;
+                result.resize(length, 0);
+
+                let plaintext_hash = sha256(&result);
+                
+                let sig_hmac = PKey::hmac(&expanded_key[0x00..0x20])?;
+                let h = Signer::new(MessageDigest::sha256(), &sig_hmac)?.sign_oneshot_to_vec(&plaintext_hash)?;
+
+                assert_eq!(&h[..self.id.len() - 1], &self.id[1..]);
+
+                result
+            },
+            ChunkEncryption::None => data,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ChunkEncryption {
+    V1([u8; 17]),
+    V2([u8; 33], [u8; 4]),
+    None,
 }
 
 // used for files on disk and containers, for files there is just one container with the chunks in "correct order"
@@ -544,11 +762,9 @@ impl<T: ReadContainer + Send + Sync> ChunkedContainer<T> {
     async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), PushError> {
         let reading_chunk = &self.chunks[self.current_chunk];
         self.current_chunk += 1;
-        let mut data = self.container.read(reading_chunk.size).await?;
+        let data = self.container.read(reading_chunk.size).await?;
 
-        if let Some(key) = &reading_chunk.key {
-            data = decrypt(Cipher::aes_128_cfb128(), &key[1..], None, &data)?;
-        }
+        let data = reading_chunk.decrypt(data)?;
 
         Ok((reading_chunk.id, data))
     }
@@ -557,11 +773,10 @@ impl<T: ReadContainer + Send + Sync> ChunkedContainer<T> {
 impl<T: WriteContainer + Send + Sync> ChunkedContainer<T> {
     async fn write_chunk(&mut self, chunk: &([u8; 21], Vec<u8>)) -> Result<(), PushError> {
         let chunk_id = chunk.0;
-        let mut chunk_value = chunk.1.clone();
+        let chunk_value = chunk.1.clone();
         let reading_chunk = &self.chunks.iter().find(|c| &c.id[..] == &chunk.0).expect("Written chunk not found?");
-        if let Some(key) = &reading_chunk.key {
-            chunk_value = encrypt(Cipher::aes_128_cfb128(), &key[1..], None, &chunk_value)?;
-        }
+
+        let chunk_value = reading_chunk.encrypt(chunk_value)?;
 
         // are we current chunk?
         if Some(chunk_id) == self.wanted_chunk() {
@@ -712,13 +927,26 @@ impl MMCSGetContainer {
         }
     }
 
-    fn get_chunks(&self) -> Vec<ChunkDesc> {
-        self.container.chunks.iter().map(|chunk| ChunkDesc {
-            id: chunk.meta.clone().unwrap().checksum.try_into().unwrap(),
-            size: chunk.meta.as_ref().unwrap().size as usize,
-            key: chunk.meta.clone().unwrap().encryption_key.map(|i| i.try_into().unwrap()),
-        }).collect()
+    fn get_chunks(&self, keys: &HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)>) -> Vec<ChunkDesc> {
+        self.container.chunks.iter().filter_map(|chunk| chunk.meta.as_ref().map(|meta| ChunkDesc {
+            id: meta.checksum.clone().try_into().unwrap(),
+            size: meta.size as usize,
+            key: if let Some((key, len)) = keys.get(&meta.checksum) {
+                ChunkEncryption::V2(key.clone().try_into().unwrap(), len.clone().try_into().unwrap())
+            } else if let Some(key) = &meta.encryption_key {
+                ChunkEncryption::V1(key.clone().try_into().unwrap())
+            } else { ChunkEncryption::None },
+        })).collect()
     }
+    
+    fn get_ford_chunks(&self) -> Vec<ChunkDesc> {
+        self.container.chunks.iter().filter_map(|chunk| chunk.encryption.as_ref().map(|meta| ChunkDesc {
+            id: meta.for_chunks.as_ref().unwrap().keys_container.clone().try_into().unwrap(),
+            size: meta.size as usize,
+            key: ChunkEncryption::None,
+        })).collect()
+    }
+
 
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
@@ -762,15 +990,15 @@ impl ReadContainer for MMCSGetContainer {
     }
 }
 
-pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &str, impl WriteContainer + Send + Sync)]) -> Result<AuthorizedOperation, PushError> {
+pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &str, impl WriteContainer + Send + Sync, Option<Vec<u8>>)]) -> Result<AuthorizedOperation, PushError> {
     let confirmation = mmcsp::AuthorizeGet {
-        item: files.iter().map(|(sig, object, _)| mmcsp::authorize_get::Item {
+        item: files.iter().map(|(sig, object, _, _)| mmcsp::authorize_get::Item {
             signature: sig.to_vec(),
             object: object.to_string(),
         }).collect()
     };
     let buf: Vec<u8> = confirmation.encode_to_vec();
-    let (sig, object, _) = &files[0];
+    let (sig, object, _, _) = &files[0];
     let request = send_mmcs_req(&REQWEST, config, &url, "authorizeGet", &format!("{} {}", encode_hex(&sig), object), config.dsid.as_ref().unwrap(), &buf).await?;
     
     Ok(AuthorizedOperation {
@@ -780,8 +1008,8 @@ pub async fn authorize_get(config: &MMCSConfig, url: &str, files: &[(Vec<u8>, &s
     })
 }
 
-pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync)>, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<(), PushError> {
-    let mut files = files.into_iter().map(|(a, b, c)| (a, b, Some(c))).collect::<Vec<_>>();
+pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, files: Vec<(Vec<u8>, &str, impl WriteContainer + Send + Sync, Option<Vec<u8>>)>, progress: impl FnMut(usize, usize) + Send + Sync, ford: bool) -> Result<(), PushError> {
+    let mut files = files.into_iter().map(|(a, b, c, k)| (a, b, Some(c), k)).collect::<Vec<_>>();
 
     let AuthorizedOperation { url, body, dsid } = authorized;
 
@@ -799,26 +1027,90 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
 
     let total_bytes = response.f1.as_ref().expect("no container list?").containers.iter()
         .fold(0, |acc, container| acc + 
-                container.chunks.iter().fold(0, |acc, chunk| acc + chunk.meta.as_ref().unwrap().size)) as usize;
+                container.chunks.iter().fold(0, |acc, chunk| acc + chunk.meta.as_ref().map(|m| m.size).unwrap_or(0))) as usize;
+
+    let mut ford_containers = vec![];
     
+    let containers = &response.f1.as_ref().unwrap().containers;
+    let targets = response.f1.as_ref().unwrap().references.iter().filter_map(|wanted_chunks| {
+        let Some(container) = files.iter_mut().find(|container| &container.0 == &wanted_chunks.file_checksum && container.2.is_some()) else { return None };
+
+        if let Some(ford) = &wanted_chunks.ford_reference {
+            ford_containers.push((wanted_chunks.chunk_references.clone(), ford.clone(), vec![0u8; 0], container.3.clone().expect("Ford chunk has no key!")));
+        }
+
+        Some(ChunkedContainer::new(wanted_chunks.chunk_references.iter().map(|chunk| {
+            let container = containers.get(chunk.container_index as usize).unwrap();
+            let chunk = &container.chunks[chunk.chunk_index as usize];
+            if let Some(meta) = &chunk.meta {
+                ChunkDesc {
+                    id: meta.checksum.clone().try_into().unwrap(),
+                    size: meta.size as usize,
+                    key: ChunkEncryption::None, // do not re-encrypt for output
+                }
+            } else { panic!("bad chunk type?") }
+        }).collect(), container.2.take().unwrap()))
+    }).collect();
+
+    let mut ford_keymap: HashMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    if !ford_containers.is_empty() {
+        let ford_sources: Vec<ChunkedContainer<MMCSGetContainer>> = response.f1.as_ref().unwrap().containers.iter().map(|container| {
+            let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
+            ChunkedContainer::new(container.get_ford_chunks(), container)
+        }).collect();
+
+        let targets = ford_containers.iter_mut().map(|c| {
+            let container = containers.get(c.1.container_index as usize).unwrap();
+            let chunk = &container.chunks[c.1.chunk_index as usize].encryption.as_ref().expect("Ford chunk has no ford meta?");
+            
+            ChunkedContainer::new(vec![
+                ChunkDesc {
+                    id: chunk.for_chunks.as_ref().unwrap().keys_container.clone().try_into().unwrap(),
+                    size: chunk.size as usize,
+                    key: ChunkEncryption::None, // do not re-encrypt for output
+                }
+            ], FileContainer::new(Cursor::new(&mut c.2)))
+        }).collect::<Vec<_>>();
+
+        let mut matcher = MMCSMatcher {
+            sources: ford_sources,
+            targets,
+            reciepts: vec![],
+            total: total_bytes
+        };
+        matcher.transfer_chunks(config, |a, b| { }).await?;
+
+        for (references, _ford_ref, ford, key) in ford_containers {
+        
+            let hk = Hkdf::<Sha256>::new(Some("PCSMMCS2".as_bytes()), &key);
+            let mut result = [0u8; 64];
+            hk.expand(&[], &mut result).unwrap();
+
+            let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
+            // first byte is 4 if initial key is 256 bit, 3 otherwise
+            let data = cipher.decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..]).unwrap();
+            println!("{}", encode_hex(&data));
+
+            let chunks = FordChunk::decode(Cursor::new(&data))?;
+            let item = chunks.item.expect("Ford chunks missing?");
+            for (ford, reference) in item.chunks.into_iter().zip(references.iter()) {
+                let container = containers.get(reference.container_index as usize).unwrap();
+                let chunk = &container.chunks[reference.chunk_index as usize];
+
+                ford_keymap.insert(chunk.meta.as_ref().unwrap().checksum.clone(), (ford.key, ford.chunk_len));
+            }
+
+            let mut total_hasher = Sha1::new();
+            total_hasher.update(&ford);
+            println!("{}", encode_hex(&total_hasher.finish()))
+        }
+    }
+
     let sources: Vec<ChunkedContainer<MMCSGetContainer>> = response.f1.as_ref().unwrap().containers.iter().map(|container| {
         let container = MMCSGetContainer::new(container.clone(), config.user_agent.clone());
-        ChunkedContainer::new(container.get_chunks(), container)
+        ChunkedContainer::new(container.get_chunks(&ford_keymap), container)
     }).collect();
-    
-    let data = &response.f1.as_ref().unwrap().containers;
-    let targets = response.f1.as_ref().unwrap().references.iter().map(|wanted_chunks| {
-        let container = files.iter_mut().find(|container| &container.0 == &wanted_chunks.file_checksum && container.2.is_some()).expect("no file??");
-        ChunkedContainer::new(wanted_chunks.chunk_references.iter().map(|chunk| {
-            let container = data.get(chunk.container_index as usize).unwrap();
-            let chunk = &container.chunks[chunk.chunk_index as usize];
-            ChunkDesc {
-                id: chunk.meta.clone().unwrap().checksum.try_into().unwrap(),
-                size: chunk.meta.as_ref().unwrap().size as usize,
-                key: None, // do not re-encrypt for output
-            }
-        }).collect(), container.2.take().unwrap())
-    }).collect();
+
 
     let mut matcher = MMCSMatcher {
         sources,
@@ -838,7 +1130,7 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
             confirm_data: None,
         };
         let buf: Vec<u8> = confirmation.encode_to_vec();
-        let resp = send_mmcs_req(&REQWEST, config, &url, "getComplete", &format!("{} {}", data[0].cl_auth_p1, data[0].cl_auth_p2), &dsid, &buf).await?;
+        let resp = send_mmcs_req(&REQWEST, config, &url, "getComplete", &format!("{} {}", containers[0].cl_auth_p1, containers[0].cl_auth_p2), &dsid, &buf).await?;
         if !resp.status().is_success() {
             panic!("confirm failed {}", resp.status())
         }

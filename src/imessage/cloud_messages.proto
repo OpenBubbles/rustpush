@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package cloudmessagesp;
+
+message ChatProto {
+    optional uint32 unk1 = 2; // always 0
+}
+
+message MessageProto2 {
+    optional string reply = 2;
+}
+
+message MessageProto {
+    uint32 unk1 = 1; // always 1, is finished or ck sync state
+    optional string groupTitle = 2;
+    string text = 3;
+    bytes attributedBody = 4;
+    optional string balloonBundleId = 5;
+    optional bytes payloadData = 6;
+    optional bytes messageSummaryInfo = 7;
+    optional string effect = 8;
+    optional uint64 dateRead = 9;
+    optional uint32 unk10 = 10; // always 0
+    optional uint32 unk11 = 11; // always 0
+    optional uint64 dateDelivered = 13;
+    optional uint32 unk14 = 14; // always 0
+    optional uint32 associatedMessageType = 15;
+    optional string associatedMessageGuid = 16;
+    optional uint32 associatedMessageRangeLocation = 17; // always 0
+    optional uint32 associatedMessageRangeLength = 18;
+}
+
+message MessageProto3 {
+    uint32 unk2 = 2; // always 0
+    uint32 unk3 = 3; // always 0 
+}
+
+message MessageProto4 {
+    optional string associated_message_emoji = 2;
+    string service = 4;
+    uint32 schedule_type = 5; // test is 0, unconfirmed
+    uint32 schedule_state = 6;
+    string groupId = 7;
+    uint32 sent_or_received_off_grid = 8; // test is 0, uncomfirmed
+}

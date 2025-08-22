@@ -188,7 +188,7 @@ impl PRPosterTitleStyleConfiguration {
             self.title_style = Some(PRPosterContentMaterialStyle::PRPosterContentVibrantMaterialStyle);
             return Ok(())
         }
-        self.title_style = Some(plist::from_value(&KeyedArchive::expand(self.title_content_style.as_ref())?)?);
+        self.title_style = Some(plist::from_value(&KeyedArchive::expand_root(self.title_content_style.as_ref())?)?);
         self.title_content_style.clear();
         Ok(())
     }
@@ -744,6 +744,6 @@ fn read_archive<T: Read + Seek, R: DeserializeOwned>(archive: &mut ZipArchive<T>
         warn!("Error reading file {path}");
     }
     archive.by_name(path)?.read_to_end(&mut manifest)?;
-    Ok(plist::from_value(&KeyedArchive::expand(&manifest)?)?)
+    Ok(plist::from_value(&KeyedArchive::expand_root(&manifest)?)?)
 }
 

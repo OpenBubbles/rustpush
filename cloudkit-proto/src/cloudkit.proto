@@ -28,6 +28,15 @@ message RecordDeleteRequest {
   optional RecordIdentifier record = 1;
 }
 
+message ZoneDeleteRequest {
+  optional RecordZoneIdentifier zone = 1;
+  optional uint32 unk2 = 2; // 0
+}
+
+message ZoneSaveRequest {
+  optional Zone zone = 1;
+}
+
 // Based on https://gist.github.com/horrorho/9c0ff20055b854f4298750cfad635fe2
 // and https://github.com/horrorho/InflatableDonkey/blob/master/src/main/resources/cloud_kit.proto
 message RequestOperation {
@@ -91,12 +100,325 @@ message RequestOperation {
   
     optional Header header = 1;
     optional Operation request = 2;
+    optional ZoneSaveRequest zoneSaveRequest = 200;
     optional ZoneRetrieveRequest zoneRetrieveRequest = 201;
+    optional ZoneDeleteRequest zoneDeleteRequest = 202;
     optional RecordSaveRequest recordSaveRequest = 210;
     optional RecordRetrieveRequest recordRetrieveRequest = 211;
+    optional RetrieveChangesRequest retrieveChangesRequest = 213;
     optional RecordDeleteRequest recordDeleteRequest = 214;
     optional QueryRetrieveRequest queryRetrieveRequest = 220;
     optional AssetUploadTokenRetrieveRequest assetUploadTokenRetrieveRequest = 230;
+    optional FunctionInvokeRequest functionInvokeRequest = 1101;
+  }
+
+  message FunctionInvokeResponse {
+    optional bytes serializedResult = 1;
+    // attestation optional 2
+  }
+
+  message FunctionInvokeRequest {
+    optional string service = 1;
+    optional string name = 2;
+    optional bytes parameters = 3;
+  }
+
+  
+  message PeerPermanentInfo {
+    optional uint64 epoch = 1;
+    optional bytes signingKey = 2;
+    optional bytes encryptionKey = 3;
+    optional string machineId = 4;
+    optional string modelId = 5;
+    optional uint64 creationTime = 6;
+  }
+
+  message PeerStableInfo {
+    optional uint64 clock = 1;
+    optional uint64 frozenPolicyVersion = 2;
+    optional string frozenPolicyHash = 3;
+    repeated bytes secrets = 4;
+    optional string osVersion = 5;
+    optional string deviceName = 6;
+    optional bytes recoverySigningPublicKey = 7;
+    optional bytes recoveryEncryptionPublicKey = 8;
+    optional string serialNumber = 9;
+    optional uint64 flexiblePolicyVersion = 10;
+    optional string flexiblePolicyHash = 11;
+    optional uint32 userControllableViewStatus = 12;
+    repeated bytes custodianRecoveryKeys = 13;
+    optional bytes secureElementIdentity = 14;
+    optional bytes walrus = 15;
+    optional bytes webAccess = 16;
+    optional bool isInheritedAccount = 18;
+  }
+
+  message PeerDisposition {
+    message DispositionType {
+      optional bytes ancientEpoch = 1;
+      optional bytes policyProhibits = 2;
+      optional bytes unknownMachineId = 3;
+      optional bytes duplicateMachineId = 4;
+      optional bytes disallowedMachineId = 5;
+      optional bytes evictedMachineId = 6;
+      optional bytes unknownReasonRemovalMachineId = 7;
+      optional bytes ghostedMachineId = 8;
+    }
+
+    optional string peerId = 1;
+    optional DispositionType type = 2;
+  }
+
+  message PeerDynamicInfo {
+    optional uint64 clock = 1;
+    repeated string includeds = 2;
+    repeated string excludeds = 3;
+    repeated PeerDisposition dispositions = 4;
+    repeated string preapprovals = 5;
+  }
+
+  message SignedInfo {
+    optional bytes info = 1;
+    optional bytes signature = 2;
+  }
+
+  message Voucher {
+    optional uint32 reason = 1;
+    optional string beneficiary = 2;
+    optional string sponsor = 3;
+  }
+
+  message CuttlefishPeer {
+    optional string hash = 1;
+    optional SignedInfo permanentInfo = 2;
+    optional SignedInfo stableInfo = 3;
+    optional SignedInfo dynamicInfo = 4;
+    optional SignedInfo voucher = 5;
+  }
+
+  message OTPrivateKey {
+    optional uint32 keyType = 1;
+    optional bytes keyData = 2;
+  }
+
+  message OTInternalBottle {
+    optional OTPrivateKey signingKey = 3;
+    optional OTPrivateKey encryptionKey = 4;
+  }
+
+  message OTBottle {
+    message OTAuthenticatedCiphertext {
+      optional bytes ciphertext = 1;
+      optional bytes authenticationCode = 2;
+      optional bytes initializationVector = 3;
+    }
+    optional string peerID = 1; // hash
+    optional string bottleID = 2; // uuid
+    // 3-7 are reserved (litearlly bytes reserved3..7)
+    optional bytes escrowedSigningKey = 8;
+    optional bytes escrowedEncryptionKey = 9;
+    optional bytes peerSigningKey = 10;
+    optional bytes peerEncryptionKey = 11;
+    optional OTAuthenticatedCiphertext ciphertext = 12;
+  }
+
+  message Bottle {
+    optional bytes bottle = 2;
+    optional bytes escrowedSigningKey = 3;
+    optional bytes escrowedKeySignature = 4;
+    optional bytes peerKeySignature = 5;
+    optional string peerID = 6;
+    optional string bottleID = 7;
+  }
+
+  message ViewKeys {
+    message ViewKey {
+      optional string keyId = 1;
+      optional string topLevelKeyId = 2;
+      optional uint32 keyNumber = 3;
+      optional string key = 4;
+      optional string harware = 5;
+    }
+    optional string service = 1;
+    optional ViewKey topLevelKey = 2;
+    optional ViewKey classA = 3;
+    optional ViewKey classC = 4;
+    optional ViewKey oldTopLevelKey = 5;
+  }
+
+  message TlkShare {
+    optional string service = 1;
+    optional uint64 curve = 2;
+    optional uint64 epoch = 3;
+    optional string keyId = 4;
+    optional uint32 poisoned = 5;
+    optional string receiver = 6;
+    optional string receiverPublicEncryptionKey = 7;
+    optional string sender = 8;
+    optional string signature = 9;
+    optional uint32 version = 10;
+    optional string wrappedKey = 11;
+  }
+
+  message CuttlefishEstablshRequest {
+    optional CuttlefishPeer peer = 1;
+    optional Bottle bottle = 2;
+    repeated ViewKeys keys = 3;
+    repeated TlkShare shares = 4;
+  }
+
+  message CuttlefishTimestamp {
+    optional uint64 msSinceEpoch = 1;
+    optional uint64 entropy = 2;
+  }
+
+  message IdmsTrustedDevicesVersion {
+    optional string versionString = 1;
+    optional CuttlefishTimestamp timestamp = 2;
+  }
+
+  message CuttlefishMetrics {
+
+  }
+
+  message CuttlefishJoinWithVoucherRequest {
+    optional string restorePoint = 1;
+    optional CuttlefishPeer peer = 2;
+    optional Bottle bottle = 3;
+    repeated TlkShare shares = 4;
+    repeated ViewKeys keys = 5;
+    // optional IdmsTrustedDevicesVersion version = 6;
+    // optional CuttlefishMetrics metrics = 7;
+  }
+
+  message CuttlefishRecord {
+    optional Record inner = 2;
+  }
+
+  message CuttlefishRecoverableViewKeys {
+    optional CuttlefishRecord tlk = 1;
+    optional CuttlefishRecord classA = 2;
+    optional CuttlefishRecord classB = 3;
+  }
+
+  message CuttlefishRecoverableTlkShare {
+    optional string service = 1;
+    optional CuttlefishRecoverableViewKeys viewkeys = 2;
+    optional CuttlefishRecord share = 3;
+  }
+
+  message CuttlefishSerializedKey {
+    optional string uuid = 1;
+    optional string zoneName = 2;
+    optional string keyclass = 3;
+    optional bytes key = 4;
+  }
+
+  message CuttlefishFetchChangesRequest {
+    optional string syncToken = 1;
+  }
+
+  message CuttlefishChange {
+    // 2 is tlkshare type?
+    optional CuttlefishPeer add = 3;
+  }
+
+  message CuttlefishChanges {
+    optional string syncToken = 1;
+    repeated CuttlefishChange changes = 2;
+  }
+
+  message CuttlefishFetchChangesResponse {
+    optional CuttlefishChanges changes = 1;
+  }
+
+  message CuttlefishFetchViableBottleRequest {
+    optional uint32 filter = 1;
+    optional bytes metrics = 2;
+  }
+
+  message CuttlefishResetRequest {
+    optional uint32 reason = 1;
+  }
+
+  message CuttlefishResetResponse { }
+
+  message OctagonPairingMessage {
+    message Step1 {
+      optional uint64 epoch = 1;
+    }
+    message Step4 {
+      optional string peer_id = 1;
+      optional bytes permanent_info = 2;
+      optional bytes permanent_info_sig = 3;
+      optional bytes stable_info = 4;
+      optional bytes stable_info_sig = 5;
+    }
+    message SupportsOctagon {
+      optional bool supportsOctagon = 1;
+    }
+    message SupportsSOS {
+      optional bool supportsSOS = 2;
+    }
+    message Step5 {
+      optional bytes voucher = 1;
+      optional bytes voucher_sig = 2;
+    }
+    optional Step1 step1 = 1;
+    optional Step4 step4 = 2;
+    optional Step5 step5 = 3;
+    optional SupportsOctagon supportsOctagon = 5;
+    optional SupportsSOS supportsSOS = 6;
+  }
+
+  message OctagonWrapper {
+    optional OctagonPairingMessage inner = 1;
+  }
+
+  message EscrowMeta {
+
+  }
+
+  message EscrowData {
+    optional string id = 1;
+    optional Bottle bottle = 2;
+    optional EscrowMeta meta = 4;
+  }
+
+  message CuttlefishFetchViableBottleResponse {
+    repeated EscrowData valid = 1;
+    // 2 is also EscrowData, is legacy
+    repeated EscrowMeta partial = 3;
+  }
+
+  message CuttlefishFetchRecoverableTlkSharesResponse {
+    repeated CuttlefishRecoverableTlkShare shares = 1;
+  }
+
+  message CuttlefishUpdateTrustResponse {
+    optional CuttlefishChanges changes = 1;
+  }
+
+  message CuttlefishJoinWithVoucherResponse {
+    optional CuttlefishChanges changes = 1;
+  }
+
+  message CuttlefishEstablishResponse {
+    optional CuttlefishChanges changes = 1;
+    repeated CuttlefishRecord records = 2;
+  }
+
+  message CuttlefishUpdateTrustRequest {
+    optional string restorePoint = 1;
+    optional string peerId = 2;
+    optional SignedInfo stableInfo = 3;
+    optional SignedInfo dynamicInfo = 4;
+    repeated TlkShare tlkshares = 5;
+    repeated ViewKeys viewKeys = 6;
+  }
+
+  message CuttlefishFetchRecoverableTlkSharesRequest {
+    optional string forPeer = 1;
   }
 
   message AssetUploadData {
@@ -106,6 +428,7 @@ message RequestOperation {
     optional string host = 8;
     optional string dsid = 9;
     optional RecordIdentifier associatedRecord = 10;
+    optional bytes fordSig = 17;
   }
 
   message AssetUploadTokenRetrieveRequest {
@@ -141,8 +464,10 @@ message RequestOperation {
 
   message RecordSaveRequest {
     optional Record record = 1;
-    optional uint32 unk2 = 2; 
-    optional uint32 unk6 = 6;
+    optional bool merge = 2; 
+    optional uint32 saveSemantics = 6;
+    optional string zoneProtectionInfoTag = 7;
+    optional string recordProtectionInfoTag = 8;
   }
   
   message ResponseOperation {
@@ -259,10 +584,62 @@ message RequestOperation {
     optional Operation response = 2;
     optional Result result = 3;
     optional BundledRequests bundled = 4;
+    optional ZoneSaveResponse zoneSaveResponse = 200;
     optional ZoneRetrieveResponse zoneRetrieveResponse = 201;
+    optional ZoneDeleteResponse zoneDeleteResponse = 202;
     optional RecordRetrieveResponse recordRetrieveResponse = 211;
+    optional RetrieveChangesResponse retrieveChangesResponse = 213;
     optional QueryRetrieveResponse queryRetrieveResponse = 220;
     optional AssetUploadTokenRetrieveResponse assetUploadTokenRetrieveResponse = 230;
+    optional FunctionInvokeResponse functionInvokeResponse = 1101;
+  }
+
+  message ZoneSaveResponse {
+    
+  }
+
+  message ZoneDeleteResponse { }
+
+  message RetrieveChangesRequest {
+    optional bytes syncContinuationToken = 1;
+    optional RecordZoneIdentifier zoneIdentifier = 2;
+    optional RequestedFields requestedFields = 3;
+    optional uint32 maxChanges = 4;
+    optional int32 requestedChangesTypes = 5;
+    optional AssetsToDownload assetsToDownload = 6;
+    optional bool newestFirst = 7;
+    optional bool ignoreCallingDeviceChanges = 8;
+    optional bool includeMergeableDeltas = 9;
+  }
+
+  message RetrieveChangesResponse {
+    message RecordChange {
+      optional RecordIdentifier identifier = 1;
+      optional string etag = 2;
+      optional Record.Type recordType = 3;
+      optional int32 type = 4;
+      optional Record record = 5;
+    }
+
+    // message RecordDelta {
+    //  optional MergeIdentifier identifier = 1;
+    //  optional RecordIdentifier recordIdentifier = 2;
+    //  optional Record.Field.Identifier fieldIdentifier = 3;
+    //  optional MergeableDelta = 5;
+    //  optional Record.Type = 6;
+    // }
+
+    repeated RecordChange change = 1;
+    optional bytes syncContinuationToken = 2;
+    optional bytes clientChangeToken = 3;
+    optional int32 status = 4;
+    // share changes, we don't support them
+    repeated bytes changedShares = 5;
+    optional bool pendingArchivedRecords = 6;
+    // RecordDelta
+    repeated bytes changedDeltas = 7;
+    repeated bytes syncObligations = 8;
+    optional bytes zoneAttributesChanges = 12;
   }
 
   message AssetUploadTokenRetrieveResponse {
@@ -329,6 +706,7 @@ message RequestOperation {
       MESCAL_SIGNATURE_TYPE = 1000;
       MESCAL_SESSION_INFO_TYPE = 1001;
       MESCAL_CERTIFICATE_TYPE = 1002;
+      FUNCTION_INVOKE_TYPE = 1101;
     }
   
     optional string operationUUID = 1;
@@ -525,6 +903,11 @@ message RequestOperation {
         message Identifier {
           optional string name = 1;
         }
+
+        message EncryptedValue {
+          optional int64 signedValue = 3;
+          optional string stringValue = 6;
+        }
   
         message Value {
           enum Type {
@@ -563,6 +946,7 @@ message RequestOperation {
           optional Asset assetValue = 10;
           repeated Value listValues = 11;
           optional Package packageValue = 12;
+          optional bool isEncrypted = 13;
           }
   
           optional Identifier identifier = 1;
@@ -597,6 +981,7 @@ message RequestOperation {
       repeated Record.Field pluginFields = 12;
       optional ProtectionInfo protectionInfo = 13;
       optional uint32 permission = 15;
+      optional bytes pcsKey = 24;
   }
   
   message RequestedFields {
@@ -621,6 +1006,11 @@ message RequestOperation {
   }
   
   message RecordIdentifier {
+     optional Identifier value = 1;
+     optional RecordZoneIdentifier zoneIdentifier = 2;
+  }
+
+  message MergeIdentifier {
      optional Identifier value = 1;
      optional RecordZoneIdentifier zoneIdentifier = 2;
   }

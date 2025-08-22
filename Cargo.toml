@@ -50,6 +50,9 @@ hkdf = "0.12.4"
 aes-gcm = "0.10.3"
 cloudkit-proto = { path = "./cloudkit-proto" }
 cloudkit-derive = { path = "./cloudkit-derive" }
+aes-siv = "0.7.0"
+chrono = "0.4.41"
+bitflags = "2.9.1"
 
 [build-dependencies]
 prost-build = { version = "0.12.0" }

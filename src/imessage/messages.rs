@@ -612,7 +612,7 @@ pub enum MessageType {
 // defined in rawmessages.rs
 impl ExtensionApp {
     fn from_ati(ati: &[u8], bp: Option<&[u8]>) -> Result<ExtensionApp, PushError> {
-        let expanded = KeyedArchive::expand(&ungzip(&ati)?)?;
+        let expanded = KeyedArchive::expand_root(&ungzip(&ati)?)?;
         debug!("ati: {:?}", plist_to_string(&expanded));
         let raw_ext: NSArray<NSDictionary<ExtensionApp>> = plist::from_value(&expanded)?;
         let mut ext = raw_ext.objects.into_iter().next().unwrap().item;
@@ -688,7 +688,7 @@ impl Balloon {
     }
 
     fn unpack_raw(bp: &[u8]) -> Result<RawBalloonData, PushError> {
-        let unpacked: NSDictionary<RawBalloonData> = plist::from_value(&KeyedArchive::expand(&ungzip(&bp)?)?)?;
+        let unpacked: NSDictionary<RawBalloonData> = plist::from_value(&KeyedArchive::expand_root(&ungzip(&bp)?)?)?;
         let NSDictionary { class: _, item: unpacked } = unpacked;
         Ok(unpacked)
     }
@@ -1386,7 +1386,7 @@ impl MMCSFile {
             dsid: apns_response.object,
         };
 
-        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container)], progress).await?;
+        get_mmcs(&mmcs_config, authorized, vec![(self.signature.clone(), &self.object, recieve_container, None)], progress, false).await?;
 
         Ok(())
     }
@@ -2855,7 +2855,7 @@ impl MessageInst {
                     debug!("a");
                     let unpacked = BaseBalloonBody::from_bin(ungzip(&balloon_part)?);
                     debug!("b");
-                    let payload: RichLink = plist::from_value(&KeyedArchive::expand(unpacked.payload.as_ref())?)?;
+                    let payload: RichLink = plist::from_value(&KeyedArchive::expand_root(unpacked.payload.as_ref())?)?;
                     debug!("c");
                     Ok::<_, PushError>((unpacked, payload))
                 })() {

@@ -205,6 +205,26 @@ impl<T: HasPublic> CompactECKey<T> {
     }
 }
 
+impl CompactECKey<Private> {
+    // private keys here are [public compressed + private number]
+    pub fn decompress_private(key: [u8; 64]) -> Self {
+        let compact_key = CompactECKey::decompress(key[..32].try_into().unwrap());
+        let private_number = BigNum::from_slice(&key[32..]).unwrap();
+        Self(EcKey::from_private_components(compact_key.group(), &private_number, compact_key.public_key()).unwrap())
+    }
+
+    pub fn compress_private(&self) -> [u8; 64] {
+        let mut output = [0u8; 64];
+        let public = self.compress();
+        output[..32].copy_from_slice(&public);
+
+        let private = self.0.private_key().to_vec_padded(32).unwrap();
+        output[32..].copy_from_slice(&private);
+        
+        output
+    }
+}
+
 impl CompactECKey<Public> {
     pub fn decompress(key: [u8; 32]) -> Self {
         let mut ctx = BigNumContext::new().unwrap();

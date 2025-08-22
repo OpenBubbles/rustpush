@@ -575,11 +575,11 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         };
 
         let url = &files[0].0.url;
-        let files_map = files.into_iter().map(|(a, b)| (decode_hex(&a.checksum).unwrap(), a.token.as_str(), FileContainer::new(b))).collect::<Vec<_>>();
+        let files_map = files.into_iter().map(|(a, b)| (decode_hex(&a.checksum).unwrap(), a.token.as_str(), FileContainer::new(b), None)).collect::<Vec<_>>();
         
         let authorized = authorize_get(&mmcs_config, url, &files_map).await?;
         
-        get_mmcs(&mmcs_config, authorized, files_map, progress).await?;
+        get_mmcs(&mmcs_config, authorized, files_map, progress, false).await?;
         Ok(())
     }
 

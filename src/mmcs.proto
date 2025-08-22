@@ -17,9 +17,14 @@ message AuthorizePut {
             optional string f102 = 102;
             optional string f104 = 104;
         }
+        message FordDesc {
+            uint32 len = 1;
+        }
         bytes sig = 1;
         optional string token = 2;
         repeated Chunk chunks = 3;
+        optional bytes ford_sig = 4;
+        optional FordDesc ford_desc = 6;
         Footer footer = 8;
     }
     repeated PutData data = 1;
@@ -64,6 +69,16 @@ message HTTPRequest {
 }
 
 message Container {
+    message EncryptionMeta {
+        message EncryptedChunks {
+            bytes container = 1;
+            bytes keys_container = 2;
+        }
+        uint32 size = 1;
+        uint32 offset = 2;
+        EncryptedChunks for_chunks = 3;
+    }
+
     message ChunkMeta {
         bytes checksum = 1;
         optional bytes encryption_key = 2;
@@ -72,6 +87,7 @@ message Container {
     }
     message ChunkWrapper {
         ChunkMeta meta = 1;
+        EncryptionMeta encryption = 2;
     }
     HTTPRequest request = 1;
     string clAuthP1 = 3;
@@ -87,6 +103,21 @@ message AuthorizeGet {
     repeated Item item = 1;
 }
 
+
+message FordChunkItem {
+    bytes key = 1;
+    bytes chunk_len = 2;
+}
+
+message FordItem {
+    repeated FordChunkItem chunks = 1;
+    bytes checksum = 2;
+}
+
+message FordChunk {
+    FordItem item = 1;
+}
+
 message AuthorizeGetResponse {
     message F1 {
         message ChunkReferences {
@@ -96,7 +127,9 @@ message AuthorizeGetResponse {
             }
             bytes fileChecksum = 1;
             repeated ChunkReference chunkReferences = 2;
+            bytes fordChecksum = 3;
             uint32 f5 = 5;
+            ChunkReference fordReference = 6;
         }
         repeated Container containers = 1;
         repeated ChunkReferences references = 2;
@@ -123,7 +156,8 @@ message PutCompleteResponse {
 message AuthorizePutResponse {
     message UploadTarget {
         message ChunkIdentifier {
-            bytes chunk_id = 1;
+            optional bytes chunk_id = 1;
+            optional uint32 ford_index = 2;
         }
         string clAuthP1 = 1;
         HTTPRequest request = 2;
@@ -134,6 +168,7 @@ message AuthorizePutResponse {
         bytes signature = 1;
         optional string receipt = 3;
         uint32 f2 = 2;
+        optional bytes fordId = 4;
     }
     repeated UploadTarget targets = 1;
     uint32 f3 = 3;
