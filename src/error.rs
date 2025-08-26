@@ -167,4 +167,8 @@ pub enum PushError {
     WrongStep(u32),
     #[error("Decryption Key not found {0}")]
     DecryptionKeyNotFound(String),
+    #[error("Not in clique!")]
+    NotInClique,
+    #[error("Missing group photo!")]
+    MissingGroupPhoto,
 }

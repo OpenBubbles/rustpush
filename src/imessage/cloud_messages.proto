@@ -31,15 +31,15 @@ message MessageProto {
 }
 
 message MessageProto3 {
-    uint32 unk2 = 2; // always 0
-    uint32 unk3 = 3; // always 0 
+    optional uint32 unk2 = 2; // always 0
+    optional uint32 unk3 = 3; // always 0 
 }
 
 message MessageProto4 {
     optional string associated_message_emoji = 2;
-    string service = 4;
-    uint32 schedule_type = 5; // test is 0, unconfirmed
-    uint32 schedule_state = 6;
-    string groupId = 7;
-    uint32 sent_or_received_off_grid = 8; // test is 0, uncomfirmed
+    optional string service = 4;
+    optional uint32 schedule_type = 5; // test is 0, unconfirmed
+    optional uint32 schedule_state = 6;
+    optional string groupId = 7;
+    optional uint32 sent_or_received_off_grid = 8; // test is 0, uncomfirmed
 }

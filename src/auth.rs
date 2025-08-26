@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, s
 use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
 use hkdf::Hkdf;
-use icloud_auth::{AppleAccount, CircleSendMessage};
+use icloud_auth::{AppleAccount, CircleSendMessage, LoginState};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{ec::EcKey, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
@@ -47,6 +47,41 @@ impl LoginDelegate {
                 ("com.apple.mobileme", Value::Dictionary(Dictionary::new()))
             }
         }
+    }
+}
+
+pub struct TokenProvider<T: AnisetteProvider> {
+    account: Arc<Mutex<AppleAccount<T>>>,
+    mme_delegate: Mutex<Option<MobileMeDelegateResponse>>,
+    os_config: Arc<dyn OSConfig>,
+}
+
+impl<T: AnisetteProvider> TokenProvider<T> {
+    pub async fn get_gsa_token(&self, token: &str) -> Option<String> {
+        self.account.lock().await.get_token(token).await
+    }
+
+    pub async fn refresh_mme(&self) -> Result<(), PushError> {
+        let mut mme = self.mme_delegate.lock().await;
+        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
+        let account = self.account.lock().await;
+
+        let Some(spd) = &account.spd else { panic!("No spd!") };
+        let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+
+        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, adsid, None, 
+            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+
+        *mme = delegates.mobileme;
+
+        Ok(())
+    }
+
+    pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
+        if self.mme_delegate.lock().await.is_none() {
+            self.refresh_mme().await?;
+        }
+        self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
 }
 
@@ -640,7 +675,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         Ok(())
     }
 
-    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<Option<String>, PushError> {
+    pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<Option<LoginState>, PushError> {
         if let Some(ec) = &request.ec {
             return Err(PushError::IdmsCircleError(*ec))
         }
@@ -664,10 +699,14 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
 
                 self.saved_step = Some(request.clone());
 
-                return Ok(Some(decoded));
+                return Ok(Some(self.account.lock().await.verify_2fa(decoded).await?));
             },
             6 => {
                 let step5: CircleStep5 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep1");
+                if step5.voucher.is_empty() {
+                    warn!("Not joining clique because peer did not send voucher!");
+                    return Ok(Some(LoginState::LoggedIn))
+                }
                 use prost::Message;
                 let message = OctagonPairingMessage::decode(Cursor::new(&step5.voucher))?;
                 let info = SignedInfo {
@@ -675,6 +714,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                     signature: message.step5.as_ref().unwrap().voucher_sig.clone(),
                 };
                 self.trusted_peers.as_ref().unwrap().join_clique(self.saved_device_password.as_ref().unwrap(), Some(info), &[], vec![]).await?;
+                return Ok(Some(LoginState::LoggedIn))
             }
             _circlestep => {
                 warn!("Ignoring unknown circle step {_circlestep}");
@@ -686,7 +726,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
     pub async fn setup_trusted_peers(&mut self, peers: Arc<KeychainClient<P>>, device_password: &[u8]) -> Result<(), PushError> {
         peers.ensure_user_identity().await?;
 
-        let Some(request) = &self.saved_step else { panic!("pulled from under our feet?") };
+        let Some(request) = &self.saved_step else { return Ok(()) };
         if request.step != 4 {
             return Err(PushError::WrongStep(request.step))
         }
@@ -878,9 +918,9 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                         atxid: request.atxnid.clone(),
                         circlestep: 5,
                         idmsdata: Some(request.idmsdata.clone()),
-                        pakedata: base64_encode(&rasn::der::encode(&CircleError {
-                            extra_code: 5.into(),
-                            meta: vec![].into(),
+                        pakedata: base64_encode(&rasn::der::encode(&CircleStep5 {
+                            circle_step: 5.into(),
+                            voucher: vec![].into(),
                         }).expect("outer encoding failed")),
                         ptkn: encode_hex(&self.push_token).to_uppercase(),
                         ec: None,

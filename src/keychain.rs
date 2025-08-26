@@ -1048,6 +1048,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn is_in_clique(&self) -> bool {
+        let _ = self.sync_changes().await;
         self.state.read().await.user_identity.as_ref().map(|u| u.is_in_clique()).unwrap_or(false)
     }
 
@@ -1119,6 +1120,19 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn sync_keychain(&self, zones: &[&str]) -> Result<(), PushError> {
+        if !self.is_in_clique().await {
+            return Err(PushError::NotInClique)
+        }
+
+        let state = self.state.read().await;
+        if state.keystore.0.is_empty() {
+            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
+            drop(state);
+            self.store_keys(&shares).await;
+        } else {
+            drop(state);
+        }
+
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
@@ -1607,6 +1621,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let voucher = other_identity.vouch_for(my_identity.identifier.clone())?;
 
+        drop(state);
+
         let shares = self.fetch_shares_for(&other_identity).await?;
         self.join_clique(device_password, Some(voucher), &shares, vec![]).await?;
         Ok(())
@@ -1676,9 +1692,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         if with_tlk_shares.is_empty() {
             let state = state.downgrade();
             // fetch tlk shares
-            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await.unwrap();
+            let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
             drop(state);
             self.store_keys(&shares).await;
+        } else {
+            drop(state);
+            self.store_keys(with_tlk_shares).await;
         }
 
         info!("Joined clique!");
@@ -1857,6 +1876,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let cert_bytes = base64_decode(&club_cert);
         let escrow_blob = create_escrow_blob(&state.dsid, password, record, label, &cert_bytes, &formatted_time)?;
 
+        let mut numeric_length = None;
+        if let Ok(str) = str::from_utf8(password) {
+            if str.chars().all(|c| c.is_ascii_digit()) {
+                numeric_length = Some(str.len() as u32)
+            }
+        }
+
         let metadata = EscrowMetadata {
             serial: self.config.get_serial_number(),
             build: self.config.get_register_meta().software_version,
@@ -1864,7 +1890,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             timestamp: formatted_time.to_string(),
             bottle_id,
             client_metadata: Value::Dictionary(Dictionary::from_iter([
-                ("SecureBackupUsesNumericPassphrase", Value::Boolean(false)),
+                ("SecureBackupUsesNumericPassphrase", Value::Boolean(numeric_length.is_some())),
                 ("SecureBackupUsesComplexPassphrase", Value::Integer(1.into())),
                 ("device_name", Value::String(self.config.get_device_name())),
                 ("SecureBackupMetadataTimestamp", Value::String(formatted_time.to_string())),
@@ -1872,7 +1898,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 ("device_model_class", Value::String("iMac".to_string())), // iPhone, other classes?
                 ("device_mid", Value::String(mid.to_string())),
                 ("device_model", Value::String(self.config.get_register_meta().hardware_version)),
-                ("SecureBackupNumericPassphraseLength", Value::Integer(0.into())),
+                ("SecureBackupNumericPassphraseLength", Value::Integer(numeric_length.unwrap_or(0).into())),
                 ("device_model_version", Value::String(self.config.get_register_meta().hardware_version)),
             ])),
             escrowed_spki: escrowed_signing_key.into(),

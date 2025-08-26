@@ -624,7 +624,7 @@ impl ExtensionApp {
         Ok(ext)
     }
 
-    fn from_bp(bp: &[u8], bid: &str) -> Result<ExtensionApp, PushError> {
+    pub fn from_bp(bp: &[u8], bid: &str) -> Result<ExtensionApp, PushError> {
         let raw = Balloon::unpack_raw(bp)?;
 
         Ok(ExtensionApp {
@@ -635,7 +635,7 @@ impl ExtensionApp {
         })
     }
 
-    fn to_raw(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
+    pub fn to_raw(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
         let arr = NSArray {
             objects: vec![NSDictionary {
                 class: NSDictionaryClass::NSDictionary,

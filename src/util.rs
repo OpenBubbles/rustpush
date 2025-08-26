@@ -1270,7 +1270,7 @@ impl NSDictionaryTypedCoder {
 
 pub struct NSString(pub String);
 impl NSString {
-    fn decode(val: &StCollapsedValue) -> Self {
+    pub fn decode(val: &StCollapsedValue) -> Self {
         let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
         assert_eq!(class, "NSString");
         let StCollapsedValue::String(text) = &fields[0][0] else { panic!("no text?") };
