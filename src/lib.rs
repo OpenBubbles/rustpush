@@ -43,7 +43,7 @@ pub use util::{NSArrayClass, ResourceState, NSDictionaryClass, NSURL, NSArray, R
 pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager};
 pub use ids::CertifiedContext;
-pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate, CircleClientSession};
+pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
 pub use error::PushError;
 pub use cloudkit_proto;
 pub use cloudkit_derive;

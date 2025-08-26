@@ -7,7 +7,7 @@ use openssl::sha::sha1;
 use plist::{Date, Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState};
+use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState};
 use rand::Rng;
 use uuid::Uuid;
 use tokio::{process::Command, runtime::Handle, select, sync::{Mutex, RwLock}};
@@ -20,7 +20,6 @@ use notify::{event::{CreateKind, ModifyKind, RemoveKind}, Config, Event, EventKi
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedStreamsState {
     dsid: String,
-    mme_authtoken: String,
     host: String,
     pub albums: Vec<SharedAlbum>,
 }
@@ -29,7 +28,6 @@ impl SharedStreamsState {
     pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Option<SharedStreamsState> {
         Some(SharedStreamsState {
             dsid,
-            mme_authtoken: delegate.tokens.get("mmeAuthToken")?.clone(),
             host: delegate.config.get("com.apple.Dataclass.SharedStreams")?.as_dictionary().unwrap().get("url")?.as_string().unwrap().to_string(),
             albums: vec![],
         })
@@ -219,12 +217,15 @@ pub struct SharedStreamClient<P: AnisetteProvider> {
     config: Arc<dyn OSConfig>,
     aps: APSConnection,
     root_tag: Mutex<Option<String>>,
-    account: Arc<Mutex<AppleAccount<P>>>,
+    token_provider: Arc<TokenProvider<P>>,
 }
 
 impl<P: AnisetteProvider> SharedStreamClient<P> {
     async fn get_headers(&self) -> Result<HeaderMap, PushError> {
         let state_lock = self.state.read().await;
+
+        let mme_token = self.token_provider.get_mme_token("mmeAuthToken").await?;
+
         let mut map = HeaderMap::new();
         map.insert("User-Agent", self.config.get_normal_ua("mstreamd/721.0.150").parse().unwrap());
         map.insert("x-apple-mme-sharedstreams-version", "6oWcrYvjLx0f".parse().unwrap()); // lord knows what this means
@@ -233,7 +234,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         map.insert("x-apple-i-device-type", "1".parse().unwrap());
         map.insert("Accept", "*/*".parse().unwrap());
         map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());
-        map.insert("Authorization", format!("X-MobileMe-AuthToken {}", base64_encode(format!("{}:{}", state_lock.dsid, state_lock.mme_authtoken).as_bytes())).parse().unwrap());
+        map.insert("Authorization", format!("X-MobileMe-AuthToken {}", base64_encode(format!("{}:{}", state_lock.dsid, mme_token).as_bytes())).parse().unwrap());
         
         drop(state_lock);
 
@@ -244,24 +245,6 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 
         Ok(map)
-    }
-
-    pub async fn reauth(&self) -> Result<(), PushError> {
-        let mut account = self.account.lock().await;
-        let pet = account.get_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
-        
-        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, 
-        account.spd.as_ref().unwrap().get("adsid").expect("no adsid").as_string().unwrap(), None, 
-        &mut *self.anisette.lock().await, &*self.config, &[LoginDelegate::MobileMe]).await?;
-
-        drop(account);
-        
-        let mut locked = self.state.write().await;
-        locked.mme_authtoken = delegates.mobileme.unwrap().tokens["mmeAuthToken"].clone();
-
-        (self.update_state)(&*locked);
-
-        Ok(())
     }
 
     pub async fn get_album<T: DeserializeOwned>(&self, album: &str, url: &str, enter: impl Serialize) -> Result<T, PushError> {
@@ -276,7 +259,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             .send().await?;
         
         if resp.status().as_u16() == 401 {
-            self.reauth().await?;
+            self.token_provider.refresh_mme().await?;
         }
         
         let resp = resp.bytes().await?;
@@ -301,7 +284,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         }
 
         if resp.status().as_u16() == 401 {
-            self.reauth().await?;
+            self.token_provider.refresh_mme().await?;
         }
 
         let resp = resp.error_for_status()?.bytes().await?;
@@ -602,7 +585,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         Ok(Some(self.get_changes().await?))
     }
 
-    pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, account: Arc<Mutex<AppleAccount<P>>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
+    pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, token_provider: Arc<TokenProvider<P>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
         SharedStreamClient {
             _interest_token: aps.request_topics(vec!["com.apple.sharedstreams"]).await.0,
             state: RwLock::new(state),
@@ -611,7 +594,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             root_tag: Mutex::new(None),
             aps,
             config,
-            account,
+            token_provider,
         }
     }
 

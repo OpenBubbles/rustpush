@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
@@ -53,10 +53,20 @@ impl LoginDelegate {
 pub struct TokenProvider<T: AnisetteProvider> {
     account: Arc<Mutex<AppleAccount<T>>>,
     mme_delegate: Mutex<Option<MobileMeDelegateResponse>>,
+    mme_refreshed: Mutex<SystemTime>,
     os_config: Arc<dyn OSConfig>,
 }
 
 impl<T: AnisetteProvider> TokenProvider<T> {
+    pub fn new(account: Arc<Mutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
+        Arc::new(Self {
+            account,
+            os_config,
+            mme_delegate: Mutex::new(None),
+            mme_refreshed: Mutex::new(SystemTime::UNIX_EPOCH),
+        })
+    }
+
     pub async fn get_gsa_token(&self, token: &str) -> Option<String> {
         self.account.lock().await.get_token(token).await
     }
@@ -73,12 +83,15 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
 
         *mme = delegates.mobileme;
+        *self.mme_refreshed.lock().await = SystemTime::now();
 
         Ok(())
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
-        if self.mme_delegate.lock().await.is_none() {
+        // refresh every week
+        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
+            > Duration::from_secs(60 * 60 * 24 * 7) {
             self.refresh_mme().await?;
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()

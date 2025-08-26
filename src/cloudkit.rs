@@ -17,7 +17,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{auth::MobileMeDelegateResponse, ids::CompactECKey, keychain::KeychainClient, mmcs::{get_headers, get_mmcs, put_authorize_body, put_mmcs, AuthorizedOperation, MMCSConfig, PreparedPut}, mmcsp::FordChunk, pcs::{PCSKey, PCSPrivateKey, PCSService, PCSShareProtection}, prepare_put, util::{base64_decode, base64_encode, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key, REQWEST}, FileContainer, OSConfig, PushError};
+use crate::{auth::{MobileMeDelegateResponse, TokenProvider}, ids::CompactECKey, keychain::KeychainClient, mmcs::{get_headers, get_mmcs, put_authorize_body, put_mmcs, AuthorizedOperation, MMCSConfig, PreparedPut}, mmcsp::FordChunk, pcs::{PCSKey, PCSPrivateKey, PCSService, PCSShareProtection}, prepare_put, util::{base64_decode, base64_encode, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key, REQWEST}, FileContainer, OSConfig, PushError};
 
 fn undelimit_response(resp: &mut impl Read) -> Vec<Vec<u8>> {
     let mut response: Vec<Vec<u8>> = vec![];
@@ -616,17 +616,13 @@ pub fn record_identifier_public(id: &str) -> cloudkit_proto::RecordIdentifier {
 
 #[derive(Serialize, Deserialize)]
 pub struct CloudKitState {
-    token: String,
     dsid: String,
-    mme_token: String,
 }
 
 impl CloudKitState {
-    pub fn new(dsid: String, delegate: &MobileMeDelegateResponse) -> Option<Self> {
+    pub fn new(dsid: String) -> Option<Self> {
         Some(Self {
             dsid,
-            token: delegate.tokens.get("cloudKitToken")?.clone(),
-            mme_token: delegate.tokens.get("mmeAuthToken")?.clone(),
         })
     }
 }
@@ -635,6 +631,7 @@ pub struct CloudKitClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
     pub state: RwLock<CloudKitState>,
     pub config: Arc<dyn OSConfig>,
+    pub token_provider: Arc<TokenProvider<P>>,
 }
 
 pub struct CloudKitContainer<'t> {
@@ -689,11 +686,18 @@ impl<'t> CloudKitContainer<'t> {
             cloud_kit_user_id: String,
         }
 
-        let response: CkInitResponse = self.headers(&client, REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"), &session).await?
+        let mme_token = client.token_provider.get_mme_token("mmeAuthToken").await?;
+
+        let response = self.headers(&client, REQWEST.post("https://gateway.icloud.com/setup/setup/ck/v1/ckAppInit"), &session).await?
             .query(&[("container", &self.containerid)])
-            .basic_auth(&state.dsid, Some(&state.mme_token))
-            .send().await?
-            .json().await?;
+            .basic_auth(&state.dsid, Some(&mme_token))
+            .send().await?;
+
+        if response.status().as_u16() == 401 {
+            client.token_provider.refresh_mme().await?;
+        }
+
+        let response: CkInitResponse = response.json().await?;
 
         drop(state);
 
@@ -873,13 +877,20 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         let request_uuids = (0..ops.len()).map(|_| Uuid::new_v4().to_string().to_uppercase()).collect::<Vec<_>>();
         let request = ops.iter().enumerate().map(|(idx, op)| self.build_request(op, self.client.config.as_ref(), idx == 0, request_uuids[idx].clone())).collect::<Vec<_>>().concat();
 
-        let token: Vec<u8> = self.headers(&self.client, REQWEST.post(Op::link()), session).await?
+        let token = self.client.token_provider.get_mme_token("cloudKitToken").await?;
+
+        let response = self.headers(&self.client, REQWEST.post(Op::link()), session).await?
             .header("x-cloudkit-userid", &self.user_id)
-            .header("x-cloudkit-authtoken", &self.client.state.read().await.token)
+            .header("x-cloudkit-authtoken", &token)
             .headers(ops[0].custom_headers())
             .body(gzip_normal(&request)?)
-            .send().await?
-            .bytes().await?
+            .send().await?;
+
+        if response.status().as_u16() == 401 {
+            self.client.token_provider.refresh_mme().await?;
+        }
+        
+        let token: Vec<u8> = response.bytes().await?
             .into();
         let mut cursor = Cursor::new(token);
 
