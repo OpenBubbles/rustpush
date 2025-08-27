@@ -57,6 +57,43 @@ pub struct TokenProvider<T: AnisetteProvider> {
     os_config: Arc<dyn OSConfig>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct StorageInfoBytes {
+    pub total_storage: u64,
+    pub used_storage: u64,
+    pub commerce_storage_in_bytes: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct QuotaInfoBytes {
+    pub total_quota: u64,
+    pub total_used: u64,
+    pub total_available: u64,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct StorageData {
+    pub storage_info_in_bytes: StorageInfoBytes,
+    pub quota_info_in_bytes: QuotaInfoBytes,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct StorageUsageByMedia {
+    pub display_label: String,
+    pub display_color: String,
+    pub usage_in_bytes: u64,
+    pub media_key: String,
+    pub display_color_dark: String,
+    pub text_color: String,
+    pub text_color_dark: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct QuotaData {
+    pub storage_data: StorageData,
+    pub storage_usage_by_media: Vec<StorageUsageByMedia>,
+}
+
 impl<T: AnisetteProvider> TokenProvider<T> {
     pub fn new(account: Arc<Mutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
         Arc::new(Self {
@@ -65,6 +102,37 @@ impl<T: AnisetteProvider> TokenProvider<T> {
             mme_delegate: Mutex::new(None),
             mme_refreshed: Mutex::new(SystemTime::UNIX_EPOCH),
         })
+    }
+
+    pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
+        let token = self.get_mme_token("mmeAuthToken").await?;
+
+        let quota_url = self.mme_delegate.lock().await.as_ref().expect("no MMe?")
+            .config.get("com.apple.Dataclass.Quota").expect("No Quota?").as_dictionary().unwrap()
+            .get("storageInfoURL").expect("no storage info url?").as_string().unwrap().to_string();
+        
+        let account = self.account.lock().await;
+        let dsid = account.spd.as_ref().unwrap().get("DsPrsId").expect("no dsid???s").as_unsigned_integer().unwrap().to_string();
+        let adsid = account.spd.as_ref().unwrap().get("adsid").expect("No adsid!").as_string().unwrap().to_string();
+
+        let anisette = account.anisette.clone();
+        drop(account);
+
+        let anisette_headers: HeaderMap = anisette.lock().await.get_headers().await?.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
+
+        let data = REQWEST.get(quota_url)
+            .basic_auth(&format!("{}", dsid), Some(token))
+            .header("X-Client-UDID", self.os_config.get_udid().to_lowercase())
+            .header("X-MMe-Country", "US")
+            .header("X-MMe-Client-Info", self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"))
+            .header("X-MMe-Language", "en")
+            .header("X-Apple-ADSID", adsid)
+            .headers(anisette_headers)
+            .send().await?
+            .bytes().await?;
+        
+
+        Ok(plist::from_bytes(&data)?)
     }
 
     pub async fn get_gsa_token(&self, token: &str) -> Option<String> {

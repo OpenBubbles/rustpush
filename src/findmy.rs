@@ -33,16 +33,13 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FindMyState {
     dsid: String,
-    udid: String,
     user: String,
 }
 
 impl FindMyState {
     pub fn new(dsid: String, user: String) -> Option<FindMyState> {
-        let udid: [u8; 20] = rand::thread_rng().gen();
         Some(FindMyState {
             dsid,
-            udid: encode_hex(&udid),
             user
         })
     }
@@ -296,7 +293,7 @@ impl<P: AnisetteProvider> FindMyPhoneClient<P> {
             "apsToken": encode_hex(&token).to_uppercase(),
             "clientTimestamp": ms_since_epoch,
             "deviceListVersion": 1,
-            "deviceUDID": self.state.udid,
+            "deviceUDID": config.get_udid().to_lowercase(),
             "fmly": true,
             "inactiveTime": 0,
             "frontMostWindow": false,
@@ -365,7 +362,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
 
         let state = self.state.state.lock().await;
         let request = REQWEST.post(format!("https://p{}-fmfmobile.icloud.com/fmipservice/friends/{}/{}/{}", self.server, 
-                if self.daemon { format!("fmfd/{}", state.dsid) } else { state.dsid.clone() }, state.udid.to_uppercase(), path))
+                if self.daemon { format!("fmfd/{}", state.dsid) } else { state.dsid.clone() }, config.get_udid().to_uppercase(), path))
             .headers(get_find_my_headers(config, "2.0", &mut *self.anisette.lock().await, if self.daemon { "FMFD/1.0" } else { "Find%20My/375.20" }).await?)
             .header("X-FMF-Model-Version", "1")
             .basic_auth(&state.dsid, Some(&token));
@@ -386,7 +383,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
                 "currentTime": ms_since_epoch,
                 "deviceClass": "Mac",
                 "deviceHasPasscode": true,
-                "deviceUDID": state.udid,
+                "deviceUDID": config.get_udid().to_lowercase(),
                 "fencingEnabled": true,
                 "isFMFAppRemoved": false,
                 "osVersion": meta.user_version,
@@ -407,7 +404,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
                 "countryCode": "US",
                 "currentTime": ms_since_epoch,
                 "deviceClass": "Mac",
-                "deviceUDID": state.udid,
+                "deviceUDID": config.get_udid().to_lowercase(),
                 "frontMostWindow": false,
                 "legacyFallbackData": {},
                 "limitedPrecision": false,
