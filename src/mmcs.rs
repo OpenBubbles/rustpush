@@ -139,6 +139,7 @@ pub async fn prepare_put(mut reader: impl ReadContainer + Send + Sync, encrypt: 
             id: signature,
             size: chunk.len(),
             key: if encrypt { ChunkEncryption::V1(key) } else { ChunkEncryption::None },
+            offset: None,
         });
         total_len += chunk.len();
         chunk = reader.read(5242880).await?;
@@ -189,6 +190,7 @@ pub async fn prepare_put_v2(mut reader: impl ReadContainer + Send + Sync, bounda
             id: h.try_into().unwrap(),
             size: chunk.len(),
             key: ChunkEncryption::V2(chunk_key, (chunk.len() as u32).to_le_bytes()),
+            offset: None,
         });
         total_len += chunk.len();
         chunk = reader.read(5242880).await?;
@@ -553,6 +555,7 @@ pub async fn put_mmcs(config: &MMCSConfig, inputs: Vec<(&PreparedPut, Option<Str
                 id: ford_idx_to_id(ford_ctr),
                 size: ford_data.len(),
                 key: ChunkEncryption::None,
+                offset: None,
             };
 
             index.insert(encode_hex(&ford_idx_to_id(ford_ctr)), desc.clone());
@@ -652,6 +655,7 @@ pub struct ChunkDesc {
     id: [u8; 21],
     size: usize,
     key: ChunkEncryption,
+    offset: Option<usize>,
 }
 
 impl ChunkDesc {
@@ -733,6 +737,7 @@ struct ChunkedContainer<T: Container> {
     chunks: Vec<ChunkDesc>,
     // either reading or writing
     current_chunk: usize,
+    current_offset: usize,
     // only used when writing
     cached_chunks: HashMap<[u8; 21], Vec<u8>>,
     container: T,
@@ -743,6 +748,7 @@ impl<T: Container + Send + Sync> ChunkedContainer<T> {
         Self {
             chunks,
             current_chunk: 0,
+            current_offset: 0,
             cached_chunks: HashMap::new(),
             container,
         }
@@ -762,7 +768,19 @@ impl<T: ReadContainer + Send + Sync> ChunkedContainer<T> {
     async fn read_next(&mut self) -> Result<([u8; 21], Vec<u8>), PushError> {
         let reading_chunk = &self.chunks[self.current_chunk];
         self.current_chunk += 1;
+
+        // skip over FORD chunks
+        if let Some(offset) = reading_chunk.offset {
+            if offset != self.current_offset {
+                let seek_offset = offset - self.current_offset;
+                warn!("Seeking {} bytes!", seek_offset);
+                self.container.read(seek_offset).await?;
+                self.current_offset += seek_offset;
+            }
+        }
+
         let data = self.container.read(reading_chunk.size).await?;
+        self.current_offset += data.len();
 
         let data = reading_chunk.decrypt(data)?;
 
@@ -936,6 +954,7 @@ impl MMCSGetContainer {
             } else if let Some(key) = &meta.encryption_key {
                 ChunkEncryption::V1(key.clone().try_into().unwrap())
             } else { ChunkEncryption::None },
+            offset: Some(meta.offset as usize)
         })).collect()
     }
     
@@ -944,6 +963,7 @@ impl MMCSGetContainer {
             id: meta.for_chunks.as_ref().unwrap().keys_container.clone().try_into().unwrap(),
             size: meta.size as usize,
             key: ChunkEncryption::None,
+            offset: Some(meta.offset as usize),
         })).collect()
     }
 
@@ -1047,6 +1067,7 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
                     id: meta.checksum.clone().try_into().unwrap(),
                     size: meta.size as usize,
                     key: ChunkEncryption::None, // do not re-encrypt for output
+                    offset: None,
                 }
             } else { panic!("bad chunk type?") }
         }).collect(), container.2.take().unwrap()))
@@ -1068,6 +1089,7 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
                     id: chunk.for_chunks.as_ref().unwrap().keys_container.clone().try_into().unwrap(),
                     size: chunk.size as usize,
                     key: ChunkEncryption::None, // do not re-encrypt for output
+                    offset: None,
                 }
             ], FileContainer::new(Cursor::new(&mut c.2)))
         }).collect::<Vec<_>>();
