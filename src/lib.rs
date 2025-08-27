@@ -86,7 +86,7 @@ pub trait OSConfig: Sync + Send {
     fn get_serial_number(&self) -> String;
     fn get_gsa_hardware_headers(&self) -> HashMap<String, String>;
     fn get_aoskit_version(&self) -> String;
-    fn get_udid(&self) -> String { "55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string() }
+    fn get_udid(&self) -> String;
 
     fn get_adi_mme_info(&self, for_item: &str) -> String {
         self.get_mme_clientinfo(for_item)

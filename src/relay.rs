@@ -17,7 +17,7 @@ pub struct VersionsResp {
     versions: Versions,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Versions {
     software_build_id: String,
     software_name: String,
@@ -27,7 +27,7 @@ pub struct Versions {
     unique_device_id: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RelayConfig {
     pub version: Versions,
     pub icloud_ua: String,
@@ -37,6 +37,7 @@ pub struct RelayConfig {
     pub host: String,
     pub code: String,
     pub beeper_token: Option<String>,
+    pub udid: Option<String>,
 }
 
 impl RelayConfig {
@@ -69,6 +70,10 @@ impl OSConfig for RelayConfig {
             serial_number: self.version.serial_number.clone(),
             unique_device_id: self.version.unique_device_id.clone().to_uppercase(),
         }
+    }
+
+    fn get_udid(&self) -> String {
+        self.udid.clone().expect("missing udid!")
     }
 
     fn get_normal_ua(&self, item: &str) -> String {

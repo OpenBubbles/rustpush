@@ -21,6 +21,7 @@ pub struct MacOSConfig {
     pub device_id: String,
     pub icloud_ua: String,
     pub aoskit_version: String,
+    pub udid: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +55,10 @@ impl OSConfig for MacOSConfig {
             serial_number: self.inner.platform_serial_number.clone(),
             unique_device_id: self.device_id.clone().to_uppercase(),
         }
+    }
+
+    fn get_udid(&self) -> String {
+        self.udid.clone().expect("missing udid!")
     }
 
     fn get_normal_ua(&self, item: &str) -> String {
