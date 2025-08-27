@@ -171,4 +171,8 @@ pub enum PushError {
     NotInClique,
     #[error("Missing group photo!")]
     MissingGroupPhoto,
+    #[error("PCS Share key not found!")]
+    ShareKeyNotFound,
+    #[error("BatchError {0}")]
+    BatchError(Arc<PushError>),
 }

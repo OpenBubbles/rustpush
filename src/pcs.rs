@@ -538,7 +538,7 @@ impl PCSShareProtection {
 
     pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState) -> Result<(PCSKey, Vec<CompactECKey<Private>>), PushError> {
         let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items["Engram"].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).unwrap();
+        let item = keychain.items["Engram"].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).ok_or(PushError::ShareKeyNotFound)?;
         let decoded = PCSPrivateKey::from_dict(item, keychain);
 
         let key = decoded.key();

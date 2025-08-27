@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, sync::Arc};
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
+use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, request_operation::header::IsolationLevel, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
@@ -1106,7 +1106,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             }, None, true));
         }
         
-        security_container.perform_operations(&CloudKitSession::new(), &ops).await?;
+        security_container.perform_operations_checked(&CloudKitSession::new(), &ops, IsolationLevel::Zone).await?;
 
         let zone = state.items.entry(zone.to_string()).or_default();
         if let Some(tag) = associated_tag {
@@ -1136,9 +1136,9 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
-        let item = security_container.perform_operations(&CloudKitSession::new(), 
+        let item = security_container.perform_operations_checked(&CloudKitSession::new(), 
             &zones.iter().map(|zone| FetchRecordChangesOperation::new(security_container.private_zone(zone.to_string()), 
-                state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>()).await?;
+                state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await?;
 
         let state = &mut *state;
 
@@ -1274,7 +1274,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         drop(state);
 
-        security.perform_operations(&CloudKitSession::new(), &delete_ops).await?;
+        security.perform_operations_checked(&CloudKitSession::new(), &delete_ops, IsolationLevel::Zone).await?;
 
         let _: CuttlefishResetResponse = self.invoke_cuttlefish("reset", CuttlefishResetRequest {
             reason: Some(3),

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use cloudkit_derive::CloudKitRecord;
+use cloudkit_proto::request_operation::header::IsolationLevel;
 use cloudkit_proto::retrieve_changes_response::RecordChange;
 use cloudkit_proto::sealed::PlistKind;
 use cloudkit_proto::{base64_encode, Asset, CloudKitBytes, CloudKitBytesKind, CloudKitEncryptedValue, CloudKitRecord, Date, RecordZoneIdentifier};
@@ -25,7 +26,7 @@ use cloudkit_proto::RecordIdentifier;
 use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -190,7 +191,7 @@ pub struct CloudProp {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub legacy_group_identifiers: Vec<String>,
     pub group_photo_guid: Option<String>,
-    #[serde(rename = "lsmd")]
+    #[serde(rename = "LSMD")]
     pub last_modification_date: Option<plist::Date>, // not actually optional, just to get around default trait
 }
 impl CloudKitBytesKind for CloudProp {
@@ -484,36 +485,36 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok((response.sync_continuation_token().to_vec(), results))
     }
 
-    async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<(), PushError> {
+    async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         let container = self.get_container().await?;
 
         let zone = container.private_zone(zone.to_string());
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
 
-        let mut operations = vec![];
-        for (record_id, chat) in records {
-            operations.push(SaveRecordOperation::new(record_identifier(zone.clone(), &record_id), chat, Some(&key), true));
+        let mut results = HashMap::new();
+        let records = records.into_iter().collect::<Vec<_>>();
+
+        for batch in records.chunks(256) {
+            let mut operations = vec![];
+            let mut ids = vec![];
+            for (record_id, chat) in batch {
+                operations.push(SaveRecordOperation::new(record_identifier(zone.clone(), &record_id), chat, Some(&key), true));
+                ids.push(record_id.clone());
+            }
+
+            let mut result: HashMap<usize, Result<(), PushError>> = match container.perform_operations(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await {
+                Ok(item) => item.into_iter().enumerate().collect(),
+                Err(e) => {
+                    let joined = Arc::new(e);
+                    results.extend(ids.into_iter().map(|r| (r, Err(PushError::BatchError(joined.clone())))));
+                    continue;
+                }
+            };
+
+            results.extend(ids.into_iter().enumerate().map(|(idx, r)| (r, result.remove(&idx).unwrap())));
         }
 
-        container.perform_operations(&CloudKitSession::new(), &operations).await?;
-
-        Ok(())
-    }
-
-    pub async fn get_msg(&self) -> Result<(), PushError> {
-        let container = self.get_container().await?;
-
-        let chat_zone: cloudkit_proto::RecordZoneIdentifier = container.private_zone("messageManateeZone".to_string());
-
-        let key = container.get_zone_encryption_config(&chat_zone, &self.keychain, &MESSAGES_SERVICE).await?;
-
-
-        let resp = container.perform(&CloudKitSession::new(),
-            FetchRecordOperation::new(&ALL_ASSETS, record_identifier(chat_zone.clone(), "90dea4447225f16d28bc29e187c3d637376d736c75dd69e4b8b9072eee7f7cb2"))).await?;
-
-        let message: CloudMessage = resp.get_record(Some(&key));
-        println!("{:?}", message);
-        Ok(())
+        Ok(results)
     }
 
     async fn delete_records(&self, zone: &str, records: &[String]) -> Result<(), PushError> {
@@ -526,8 +527,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
         }
 
-        container.perform_operations(&CloudKitSession::new(), &operations).await?;
+        container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await?;
 
+        Ok(())
+    }
+
+    pub async fn reset(&self) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+
+        container.keys.lock().await.clear();
+        
+        container.perform_operations_checked(&CloudKitSession::new(), &[
+            ZoneDeleteOperation::new(container.private_zone("chatManateeZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("messageManateeZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("attachmentManateeZone".to_string())),
+        ], IsolationLevel::Operation).await?;
         Ok(())
     }
 
@@ -535,7 +549,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.sync_records("chatManateeZone", continuation_token).await
     }
 
-    pub async fn save_chats(&self, chats: HashMap<String, CloudChat>) -> Result<(), PushError> {
+    pub async fn save_chats(&self, chats: HashMap<String, CloudChat>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         self.save_records("chatManateeZone", chats).await
     }
 
@@ -547,7 +561,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.sync_records("messageManateeZone", continuation_token).await
     }
 
-    pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<(), PushError> {
+    pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         self.save_records("messageManateeZone", messages).await
     }
 
@@ -559,7 +573,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.sync_records("attachmentManateeZone", continuation_token).await
     }
 
-    pub async fn save_attachments(&self, attachments: HashMap<String, CloudAttachment>) -> Result<(), PushError> {
+    pub async fn save_attachments(&self, attachments: HashMap<String, CloudAttachment>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
         self.save_records("attachmentManateeZone", attachments).await
     }
 
@@ -577,7 +591,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
 
         let invoke = container.perform_operations(&CloudKitSession::new(), 
-            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>())).await?;
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
         let records = FetchedRecords::new(&invoke);
 
         let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
@@ -592,7 +606,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
 
         let invoke = container.perform_operations(&CloudKitSession::new(), 
-            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>())).await?;
+            &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
         let records = FetchedRecords::new(&invoke);
         let record: Vec<CloudChat> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
 

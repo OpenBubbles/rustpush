@@ -3,7 +3,7 @@ use std::{collections::HashMap, io::{Cursor, Read, Write}, marker::PhantomData, 
 use aes::{cipher::consts::U12, Aes128, Aes256};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use aes_siv::siv::CmacSiv;
-use cloudkit_proto::{record, AssetGetResponse, AssetsToDownload, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
+use cloudkit_proto::{record, request_operation::header::IsolationLevel, AssetGetResponse, AssetsToDownload, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
 use hkdf::Hkdf;
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
 use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private}, sha::sha1, sign::{Signer, Verifier}};
@@ -55,10 +55,10 @@ impl FetchedRecords {
         }).expect("No record found?")
     }
 
-    pub fn new(records: &[FetchedRecord]) -> Self {
+    pub fn new(records: &[Result<FetchedRecord, PushError>]) -> Self {
         Self {
-            assets: records.iter().flat_map(|a| &a.assets).cloned().collect(),
-            responses: records.iter().map(|a| &a.response).cloned().collect()
+            assets: records.iter().filter_map(|a| a.as_ref().ok()).flat_map(|a| &a.assets).cloned().collect(),
+            responses: records.iter().filter_map(|a| a.as_ref().ok()).map(|a| &a.response).cloned().collect()
         }
     }
 }
@@ -793,7 +793,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         Ok(key)
     }
 
-    pub fn build_request<Op: CloudKitOp>(&self, operation: &Op, config: &dyn OSConfig, is_first: bool, uuid: String) -> Vec<u8> {
+    pub fn build_request<Op: CloudKitOp>(&self, operation: &Op, config: &dyn OSConfig, is_first: bool, uuid: String, isolation_level: IsolationLevel) -> Vec<u8> {
         let debugmeta = config.get_debug_meta();
         let mut op = cloudkit_proto::RequestOperation {
             header: if is_first { Some(cloudkit_proto::request_operation::Header {
@@ -824,7 +824,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 device_hardware_id: if Op::is_fetch() { None } else { Some(config.get_udid()) },
                 target_database: Some(self.database_type.into()),
                 user_id_container_id: None,
-                isolation_level: Some(cloudkit_proto::request_operation::header::IsolationLevel::Zone.into()),
+                isolation_level: Some(isolation_level.into()),
                 group: if Op::is_grouped() { Some("EphemeralGroup".to_string()) } else { None }, // initialfetch sometimes
                 unk1: Some(0),
                 mmcs_headers: if Op::provides_assets() {
@@ -873,9 +873,13 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         buf
     }
 
-    pub async fn perform_operations<Op: CloudKitOp>(&self, session: &CloudKitSession, ops: &[Op]) -> Result<Vec<Op::Response>, PushError> {
+    pub async fn perform_operations_checked<Op: CloudKitOp>(&self, session: &CloudKitSession, ops: &[Op], isolation_level: IsolationLevel) -> Result<Vec<Op::Response>, PushError> {
+        self.perform_operations(session, ops, isolation_level).await?.into_iter().collect()
+    }
+
+    pub async fn perform_operations<Op: CloudKitOp>(&self, session: &CloudKitSession, ops: &[Op], isolation_level: IsolationLevel) -> Result<Vec<Result<Op::Response, PushError>>, PushError> {
         let request_uuids = (0..ops.len()).map(|_| Uuid::new_v4().to_string().to_uppercase()).collect::<Vec<_>>();
-        let request = ops.iter().enumerate().map(|(idx, op)| self.build_request(op, self.client.config.as_ref(), idx == 0, request_uuids[idx].clone())).collect::<Vec<_>>().concat();
+        let request = ops.iter().enumerate().map(|(idx, op)| self.build_request(op, self.client.config.as_ref(), idx == 0, request_uuids[idx].clone(), isolation_level)).collect::<Vec<_>>().concat();
 
         let token = self.client.token_provider.get_mme_token("cloudKitToken").await?;
 
@@ -901,17 +905,19 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         for request_uuid in request_uuids {
             let op = response.iter().find(|r| r.response.as_ref().unwrap().operation_uuid() == &request_uuid).expect("Operation UUID has no response?");
             let result = op.result.as_ref().expect("No Result?");
-            if result.code() != cloudkit_proto::response_operation::result::Code::Success {
-                return Err(PushError::CloudKitError(result.clone()))
-            }
-            responses.push(Op::retrieve_response(op));
+            
+            responses.push(if result.code() != cloudkit_proto::response_operation::result::Code::Success {
+                Err(PushError::CloudKitError(result.clone()))
+            } else {
+                Ok(Op::retrieve_response(op))
+            });
         }
 
         Ok(responses)
     }
 
     pub async fn perform<Op: CloudKitOp>(&self, session: &CloudKitSession, op: Op) -> Result<Op::Response, PushError> {
-        Ok(self.perform_operations(session, &[op]).await?.remove(0))
+        Ok(self.perform_operations(session, &[op], IsolationLevel::Zone).await?.remove(0)?)
     }
 
     pub async fn get_assets<V: Write + Send + Sync>(&self, responses: &[AssetGetResponse], assets: Vec<(&cloudkit_proto::Asset, V)>) -> Result<(), PushError> {

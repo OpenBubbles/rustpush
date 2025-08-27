@@ -8,7 +8,7 @@ use plist::Data;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use cloudkit_proto::RecordIdentifier;
+use cloudkit_proto::{request_operation::header::IsolationLevel, RecordIdentifier};
 use cloudkit_proto::CloudKitEncryptor;
 use crate::{cloudkit::{public_zone, record_identifier, record_identifier_public, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ALL_ASSETS}, mmcsp::container, util::{base64_decode, bin_deserialize, bin_serialize, encode_hex}, IMClient, Message};
 use std::io::Seek;
@@ -293,7 +293,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             &ALL_ASSETS,
             &public_zone(),
             &records
-        )).await?);
+        ), IsolationLevel::Zone).await?);
         let record = records.get_record::<IMessageRawNicknameRecord>(&message.cloud_kit_record_key, None);
         let mut result_ad: Vec<u8> = vec![];
         let mut cursor_ad = Cursor::new(&mut result_ad);
@@ -406,10 +406,10 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
             }, None, false));
         }
 
-        if let Err(e) = container.perform_operations(&session, &raw_ops).await {
+        if let Err(e) = container.perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone).await {
             if let Some((record, _)) = self.get_my_record().await? {
                 self.delete_my_record(&record.record_id).await?;
-                container.perform_operations(&session, &raw_ops).await?;
+                container.perform_operations_checked(&session, &raw_ops, IsolationLevel::Zone).await?;
             } else {
                 return Err(e);
             }
