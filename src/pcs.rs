@@ -1,10 +1,11 @@
 
-use std::{collections::BTreeSet, time::SystemTime};
+use std::{collections::BTreeSet, io::Cursor, time::SystemTime};
 
 use aes::{cipher::consts::U12, Aes128};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use chrono::Utc;
 use cloudkit_proto::CloudKitEncryptor;
+use log::info;
 use omnisette::AnisetteProvider;
 use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
 use plist::{Dictionary, Value};
@@ -20,6 +21,9 @@ pub struct PCSService<'t> {
     pub zone: &'t str,
     pub r#type: i64,
     pub keychain_type: i32,
+    pub v2: bool,
+    // use zone-level record protection, as opposed to record protection on each record
+    pub global_record: bool,
 }
 
 const MASTER_SERVICE: PCSService = PCSService {
@@ -28,10 +32,12 @@ const MASTER_SERVICE: PCSService = PCSService {
     zone: "ProtectedCloudStorage",
     r#type: 1,
     keychain_type: 65537,
+    v2: false,
+    global_record: true // should be unused
 };
 
 // _add_PCSAttributes see references for types
-#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSAttribute {
     key: u32,
     value: rasn::types::OctetString,
@@ -51,7 +57,7 @@ pub struct PCSBuildAndTime {
     time: GeneralizedTime,
 }
 
-#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
 pub struct PCSSignature {
     keyid: rasn::types::OctetString,
     digest: u32, // 1 is sha256, 2 is sha512 (check?)
@@ -61,7 +67,7 @@ pub struct PCSSignature {
 // signature is this struct with signature set to none
 // the ID is found in ProtectedCloudStorage Keychain store.
 // this is known as a "service key"
-#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[rasn(tag(explicit(application, 1)))]
 pub struct PCSPublicKey {
     pcsservice: i64,
@@ -140,15 +146,23 @@ pub async fn get_boundary_key(service: &PCSService<'_>, keychain: &KeychainClien
     }
 }
 
-#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PCSPrivateKey {
-    pub key: rasn::types::OctetString,
-    public: Option<PCSPublicKey>,
+#[derive(Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[rasn(choice)]
+pub enum PCSPrivateKey {
+    V1 {
+        key: rasn::types::OctetString,
+        public: Option<PCSPublicKey>,
+    },
+    #[rasn(tag(application, 5))]
+    V2 {
+        data: rasn::types::OctetString,
+    }
 }
 
 impl PCSPrivateKey {
-    pub fn new(signing_key: Option<&PCSPrivateKey>, service: i64, attributes: Vec<PCSAttribute>) -> Result<Self, PushError> {
+    pub fn new(signature_key: Option<&PCSPrivateKey>, service: i64, v2: bool, attributes: Vec<PCSAttribute>) -> Result<Self, PushError> {
         let key = CompactECKey::new()?;
+        let signing_key = CompactECKey::new()?;
 
         let mut public = PCSPublicKey {
             pcsservice: service, 
@@ -158,17 +172,34 @@ impl PCSPrivateKey {
             signature: None
         };
 
-        let signing_key = if let Some(signing_key) = &signing_key {
-            signing_key.key()
+        let signature_key = if let Some(signature_key) = &signature_key {
+            signature_key.signing_key()
         } else {
-            key.clone()
+            signing_key.clone()
         };
 
-        public.sign(&signing_key)?;
+        public.sign(&signature_key)?;
 
-        Ok(Self {
-            key: key.compress_private().to_vec().into(),
-            public: Some(public)
+        use prost::Message;
+
+        Ok(if v2 {
+            Self::V2 { 
+                data: cloudkit_proto::ProtoPcsKey {
+                    encryption_key: cloudkit_proto::ProtoPcsPrivateKey {
+                        key: key.compress_private().to_vec(),
+                        public: Some(rasn::der::encode(&public).unwrap()),
+                    },
+                    signing_key: Some(cloudkit_proto::ProtoPcsPrivateKey {
+                        key: signature_key.compress_private().to_vec(),
+                        public: None,
+                    }),
+                }.encode_to_vec().into(),
+            }
+        } else {
+            Self::V1 {
+                key: key.compress_private().to_vec().into(),
+                public: Some(public)
+            }
         })
     }
 
@@ -194,13 +225,13 @@ impl PCSPrivateKey {
             drop(state);
             let master_key = Self::get_master_key(keychain).await?;
 
-            let service_key = PCSPrivateKey::new_service_key(&master_key, service.r#type, config)?;
+            let service_key = PCSPrivateKey::new_service_key(&master_key, service.r#type, service.v2, config)?;
             service_key.save_key(&Uuid::new_v4().to_string().to_uppercase(), &keychain, service).await?;
             Ok(service_key)
         }
     }
 
-    pub fn new_service_key(master_key: &PCSPrivateKey, service: i64, config: &dyn OSConfig) -> Result<Self, PushError> {
+    pub fn new_service_key(master_key: &PCSPrivateKey, service: i64, v2: bool, config: &dyn OSConfig) -> Result<Self, PushError> {
         // one day i will fix the config mess, i swear...
         let data = config.get_register_meta();
         let meta = format!("{};{}", data.os_version.split_once(",").unwrap().0, data.software_version);
@@ -220,26 +251,38 @@ impl PCSPrivateKey {
                 }).unwrap().into(),
             }
         ];
-        Self::new(Some(master_key), service, attributes)
+        Self::new(Some(master_key), service, v2, attributes)
     }
 
     pub fn new_master_key() -> Result<Self, PushError> {
-        Self::new(None, 1, vec![])
+        Self::new(None, 1, false, vec![])
+    }
+
+    pub fn public(&self) -> Result<PCSPublicKey, PushError> {
+        use prost::Message;
+        Ok(match self {
+            Self::V1 { key: _, public } => public.clone().expect("no public key!"),
+            Self::V2 { data } => {
+                let decoded = cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data))?;
+                rasn::der::decode(decoded.encryption_key.public.as_ref().expect("no public key!")).unwrap()
+            }
+        })
     }
 
     pub async fn save_key(&self, uuid: &str, keychain: &KeychainClient<impl AnisetteProvider>, service: &PCSService<'_>) -> Result<(), PushError> {
         let dsid = keychain.state.read().await.dsid.clone();
-        if service.r#type != self.public.as_ref().unwrap().pcsservice {
+        let public = self.public()?;
+        if service.r#type != public.pcsservice {
             panic!("mismatched service type!")
         }
-        let id = sha256(&self.key[..32]);
+        let id = sha256(&public.pub_key);
         let keychain_dict = Dictionary::from_iter([
             ("invi", Value::Integer(1.into())), // invisible
             ("sdmn", Value::String("ProtectedCloudStorage".to_string())), // security domain
             ("class", Value::String("inet".to_string())),
             ("srvr", Value::String(dsid.to_string())),
             ("path", Value::String("".to_string())),
-            ("labl", Value::String(format!("PCS {} - {}", service.name, base64_encode(&self.key[..6])))),
+            ("labl", Value::String(format!("PCS {} - {}", service.name, base64_encode(&public.pub_key[..6])))),
             ("agrp", Value::String("com.apple.ProtectedCloudStorage".to_string())),
             ("pdmn", Value::String("ck".to_string())),
             ("type", Value::Integer(service.keychain_type.into())),
@@ -253,13 +296,13 @@ impl PCSPrivateKey {
             ("ptcl", Value::Integer(0.into())),
             ("tomb", Value::Integer(0.into())),
             ("v_Data", Value::Data(rasn::der::encode(self).unwrap())),
-            ("acct", Value::String(base64_encode(&self.key[..32]))),
+            ("acct", Value::String(base64_encode(&public.pub_key))),
         ]);
         
         keychain.insert_keychain(uuid, service.zone, "classC", keychain_dict, Some(&PCSMeta {
-            pcsservice: self.public.as_ref().unwrap().pcsservice,
-            pcspublickey: self.key[..32].to_vec(),
-            pcspublicidentity: rasn::der::encode(self.public.as_ref().unwrap()).unwrap(),
+            pcsservice: public.pcsservice,
+            pcspublickey: public.pub_key.to_vec(),
+            pcspublicidentity: rasn::der::encode(&public).unwrap(),
         }), Some(&format!("com.apple.ProtectedCloudStorage-{}", service.name))).await?;
 
         Ok(())
@@ -278,16 +321,36 @@ impl PCSPrivateKey {
     }
 
     pub fn key(&self) -> CompactECKey<Private> {
-        CompactECKey::decompress_private(self.key[..].try_into().unwrap())
+        use prost::Message;
+        let key = match self {
+            Self::V1 { key, public: _ } => key.to_vec(),
+            Self::V2 { data } => {
+                let decoded = cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data)).unwrap();
+                decoded.encryption_key.key
+            }
+        };
+        CompactECKey::decompress_private(key[..].try_into().unwrap())
+    }
+
+    pub fn signing_key(&self) -> CompactECKey<Private> {
+        use prost::Message;
+        let key = match self {
+            Self::V1 { key, public: _ } => key.to_vec(),
+            Self::V2 { data } => {
+                let decoded = cloudkit_proto::ProtoPcsKey::decode(Cursor::new(data)).unwrap();
+                decoded.signing_key.unwrap_or(decoded.encryption_key).key
+            }
+        };
+        CompactECKey::decompress_private(key[..].try_into().unwrap())
     }
 
     pub fn verify_with_keychain(&self, keychain: &KeychainClientState, keyid: &[u8]) -> Result<bool, PushError> {
-        let Some(public) = &self.public else { panic!("no key for keychain!") };
+        let public = self.public()?;
         let signature = public.signature.as_ref().expect("No signature!");
         
         if keyid == &signature.keyid[..] {
             // self signed
-            public.verify(&self.key())
+            public.verify(&self.signing_key())
         } else {
             let account = Value::Data(signature.keyid.to_vec());
             let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp").expect("No atyp?") == &account).unwrap();
@@ -299,7 +362,7 @@ impl PCSPrivateKey {
                 panic!("Parent key not valid!")
             }
             
-            let key = decoded.key();
+            let key = decoded.signing_key();
             
             public.verify(&key)
         }
@@ -536,9 +599,10 @@ impl PCSShareProtection {
         Ok(self.keyset.keyset.first().unwrap().decryption_key.pub_key.to_vec())
     }
 
-    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState) -> Result<(PCSKey, Vec<CompactECKey<Private>>), PushError> {
+    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(PCSKey, Vec<CompactECKey<Private>>), PushError> {
+        info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
         let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items["Engram"].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).ok_or(PushError::ShareKeyNotFound)?;
+        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).ok_or(PushError::ShareKeyNotFound)?;
         let decoded = PCSPrivateKey::from_dict(item, keychain);
 
         let key = decoded.key();
@@ -550,7 +614,7 @@ impl PCSShareProtection {
         let master_key = PCSKey::random();
         let mut keyset = PCSShareProtectionKeySet {
             unk1: "".to_string(),
-            keys: BTreeSet::from_iter(keys.iter().map(|k| PCSPrivateKey {
+            keys: BTreeSet::from_iter(keys.iter().map(|k| PCSPrivateKey::V1 {
                 key: k.compress_private().to_vec().into(),
                 public: None,
             })),

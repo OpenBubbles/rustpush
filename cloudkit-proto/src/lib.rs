@@ -205,6 +205,30 @@ impl CloudKitEncryptedValue for String {
     }
 }
 
+impl CloudKitEncryptedValue for SystemTime {
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
+        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
+        let duration = self.duration_since(apple_epoch).expect("Before Apple Epoch?").as_secs_f64();
+
+        Some(record::field::Value {
+            r#type: Some(FieldType::DateType as i32),
+            bytes_value: Some(encryptor.encrypt_data(&record::field::EncryptedValue {
+                date_value: Some(Date { time: Some(duration) }),
+                ..Default::default()
+            }.encode_to_vec(), context)),
+            is_encrypted: Some(true),
+            ..Default::default()
+        })
+    }
+
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
+        let d = record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), context)[..]).unwrap().date_value.unwrap();
+        let secs = d.time.expect("Date misses time??");
+        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
+        Some(apple_epoch + Duration::from_secs_f64(secs))
+    }
+}
+
 pub fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);

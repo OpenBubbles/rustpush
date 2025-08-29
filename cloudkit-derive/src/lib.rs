@@ -12,6 +12,7 @@ use syn::{parse_macro_input, Data, DeriveInput, LitStr};
 struct CloudKitRecordAttributes {
     r#type: String,
     encrypted: Flag,
+    rename_all: Option<String>,
 }
 
 #[derive(deluxe::ExtractAttributes)]
@@ -22,11 +23,29 @@ struct CloudKitAttributes {
     unencrypted: Flag,
 }
 
+fn snake_to_camel(s: &str) -> String {
+    let mut camel = String::new();
+    let mut upper_next = false;
+
+    for c in s.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            camel.push_str(&c.to_uppercase().to_string());
+            upper_next = false;
+        } else {
+            camel.push(c);
+        }
+    }
+
+    camel
+}
+
 #[proc_macro_derive(CloudKitRecord, attributes(cloudkit_record, cloudkit))]
 pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as DeriveInput);
 
-    let CloudKitRecordAttributes { r#type, encrypted: record_encrypted } = deluxe::extract_attributes(&mut input).unwrap();
+    let CloudKitRecordAttributes { r#type, encrypted: record_encrypted, rename_all } = deluxe::extract_attributes(&mut input).unwrap();
 
     let name = input.ident;
 
@@ -48,7 +67,18 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
         }
         
         let ident = field.ident.unwrap();
-        let name = rename.unwrap_or_else(|| ident.to_string());
+        let name = rename.unwrap_or_else(|| {
+            if let Some(rename_all) = &rename_all {
+                let name = ident.to_string();
+                return if rename_all == "camelCase" {
+                    snake_to_camel(&name)
+                } else {
+                    panic!("unknown rename {}", rename_all)
+                }
+            }
+
+            ident.to_string()
+        });
         let name_lit = LitStr::new(&name, Span::call_site());
         if is_encrypted {
             fields.push(quote! {

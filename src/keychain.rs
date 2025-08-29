@@ -913,7 +913,7 @@ impl KeychainClientState {
     }
 }
 
-const KEYCHAIN_ZONES: &[&str] = &[
+pub const KEYCHAIN_ZONES: &[&str] = &[
     "AutoUnlock",
     "SecureObjectSync",
     "SE-PTC",

@@ -906,6 +906,7 @@ message RequestOperation {
 
         message EncryptedValue {
           optional int64 signedValue = 3;
+          optional Date dateValue = 5;
           optional string stringValue = 6;
         }
   
@@ -982,6 +983,17 @@ message RequestOperation {
       optional ProtectionInfo protectionInfo = 13;
       optional uint32 permission = 15;
       optional bytes pcsKey = 24;
+  }
+
+  // the abuse of the cloudkit file continues, this should really go in a PCS file, but it only has two messages...
+  message ProtoPCSPrivateKey {
+    required bytes key = 1;
+    optional bytes public = 2;
+  }
+
+  message ProtoPCSKey {
+    required ProtoPCSPrivateKey encryptionKey = 1;
+    optional ProtoPCSPrivateKey signingKey = 2;
   }
   
   message RequestedFields {

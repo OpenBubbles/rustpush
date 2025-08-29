@@ -26,7 +26,7 @@ use cloudkit_proto::RecordIdentifier;
 use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{pcs_key_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -43,6 +43,8 @@ pub const MESSAGES_SERVICE: PCSService = PCSService {
     zone: "Engram",
     r#type: 55,
     keychain_type: 55,
+    v2: false,
+    global_record: true,
 };
 
 pub mod cloudmessagesp {
@@ -477,7 +479,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             };
             if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
 
-            let item = T::from_record_encrypted(&record.record_field, Some((&key, record.record_identifier.as_ref().unwrap())));
+            let item = T::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
 
             results.insert(identifier, Some(item));
         }
