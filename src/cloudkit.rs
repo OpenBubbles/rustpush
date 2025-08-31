@@ -101,9 +101,12 @@ pub trait CloudKitOp {
 
 pub fn pcs_key_for_record(record: &Record, keys: &PCSKeys) -> Result<PCSKey, PushError> {
     let Some(protection) = &record.protection_info else {
-        return Ok(keys.default_record_key.clone().unwrap())
+        let Some(pcskey) = &record.pcs_key else { panic!("No PCS Key??") };
+        let keys = keys.default_record_keys.iter().find(|i| i.key_id().ok().map(|id| pcskey == &id[..pcskey.len()]).unwrap_or(false));
+        
+        return Ok(keys.ok_or(PushError::PCSRecordKeyMissing)?.clone())
     };
-    keys.decode_record_protection(protection)
+    Ok(keys.decode_record_protection(protection)?.remove(0))
 }
 
 pub struct UploadAssetOperation(pub cloudkit_proto::AssetUploadTokenRetrieveRequest);
@@ -196,7 +199,7 @@ impl SaveRecordOperation {
             protection_info_tag: Some(tag.clone()),
             protection_info: Some(der), 
         });
-        let pcs_key = key.decode_record_protection(protection_info.as_ref().unwrap()).expect("Failed to decode record protection");
+        let pcs_key = key.decode_record_protection(protection_info.as_ref().unwrap()).expect("Failed to decode record protection").remove(0);
 
         (Self(cloudkit_proto::RecordSaveRequest {
             record: Some(cloudkit_proto::Record {
@@ -222,8 +225,8 @@ impl SaveRecordOperation {
                 r#type: Some(cloudkit_proto::record::Type {
                     name: Some(R::record_type().to_string())
                 }),
-                record_field: record.to_record_encrypted(key.map(|k| (k.default_record_key.as_ref().expect("No default record key?"), &id))),
-                pcs_key: key.map(|k| k.default_record_key.as_ref().expect("No default record key?").key_id().unwrap()[..4].to_vec()),
+                record_field: record.to_record_encrypted(key.map(|k| (k.default_record_keys.first().expect("No default record key?"), &id))),
+                pcs_key: key.map(|k| k.default_record_keys.first().expect("No default record key?").key_id().unwrap()[..4].to_vec()),
                 ..Default::default()
             }),
             merge: Some(true),
@@ -768,13 +771,13 @@ pub struct QueryResult<T: CloudKitRecord> {
 pub struct PCSKeys {
     zone_keys: Vec<CompactECKey<Private>>,
     zone_protection_tag: Option<String>,
-    default_record_key: Option<PCSKey>,
+    default_record_keys: Vec<PCSKey>,
     pub record_prot_tag: Option<String>,
 }
 
 impl PCSKeys {
 
-    fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<PCSKey, PushError> {
+    fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
         let record_protection: PCSShareProtection = rasn::der::decode(protection.protection_info()).expect("Bad record protection?");
         let mut big_num = BigNumContext::new()?;
         let record_key = CompactECKey::decompress(record_protection.decode_key_public()?.try_into().expect("Decode key not compact!"));
@@ -816,6 +819,12 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         }
     }
 
+    pub async fn clear_cache_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier) {
+        let mut cached_keys = self.keys.lock().await;
+        let zone_name = zone.value.as_ref().unwrap().name().to_string();
+        cached_keys.remove(&zone_name);
+    }
+
     pub async fn get_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier, client: &KeychainClient<T>, pcs_service: &PCSService<'_>) -> Result<PCSKeys, PushError> {
         let mut cached_keys = self.keys.lock().await;
         let zone_name = zone.value.as_ref().unwrap().name().to_string();
@@ -854,14 +863,14 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         let mut keys = PCSKeys {
             zone_keys: keys,
             zone_protection_tag: zone.protection_info.as_ref().unwrap().protection_info_tag.clone(),
-            default_record_key: None,
+            default_record_keys: vec![],
             record_prot_tag: if let Some(record_protection_info) = &zone.record_protection_info {
                 record_protection_info.protection_info_tag.clone()
             } else { None },
         };
 
         if let Some(record_protection_info) = &zone.record_protection_info {
-            keys.default_record_key = Some(keys.decode_record_protection(record_protection_info)?);
+            keys.default_record_keys = keys.decode_record_protection(record_protection_info)?;
         }
         
         cached_keys.insert(zone_name, keys.clone());

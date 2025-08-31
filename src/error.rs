@@ -177,4 +177,6 @@ pub enum PushError {
     BatchError(Arc<PushError>),
     #[error("Invalid 2fa code!")]
     Bad2FaCode,
+    #[error("PCS record key id not found!")]
+    PCSRecordKeyMissing,
 }

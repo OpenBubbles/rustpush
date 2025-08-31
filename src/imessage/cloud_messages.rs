@@ -345,13 +345,19 @@ impl Default for NumOrString {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct MMCSAttachmentMeta {
-    pub mmcs_signature_hex: String,
+    // MMCS attachments
+    pub mmcs_signature_hex: Option<String>,
+    pub mmcs_owner: Option<String>,
+    pub mmcs_url: Option<String>,
+    pub decryption_key: Option<String>,
+
+    // inline attachments
+    pub inline_attachment: Option<String>,
+    pub message_part: Option<String>,
+
     pub file_size: NumOrString,
-    pub decryption_key: String,
     pub uti_type: Option<String>,
-    pub mmcs_owner: String,
     pub mime_type: Option<String>,
-    pub mmcs_url: String,
     pub name: Option<String>,
 }
 
@@ -359,15 +365,32 @@ pub struct MMCSAttachmentMeta {
 impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
     fn into(self) -> Option<MMCSAttachmentMeta> {
         match &self.a_type {
-            AttachmentType::Inline(_inline) => None,
-            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta { 
-                mmcs_signature_hex: encode_hex(&mmcs.signature), 
-                file_size: NumOrString::Num(mmcs.size as u32), 
-                decryption_key: encode_hex(&mmcs.key), 
+            AttachmentType::Inline(_inline) => Some(MMCSAttachmentMeta { 
+                mmcs_signature_hex: None, 
+                decryption_key: None, 
+                mmcs_owner: None, 
+                mmcs_url: None, 
+
+                inline_attachment: Some("ia-0".to_string()),
+                message_part: Some("0".to_string()),
+
+                file_size: NumOrString::Num(_inline.len() as u32), 
                 uti_type: Some(self.uti_type.clone()), 
-                mmcs_owner: mmcs.object.clone(), 
                 mime_type: Some(self.mime.clone()),
-                mmcs_url: mmcs.url.clone(), 
+                name: Some(self.name.clone())
+            }),
+            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta { 
+                mmcs_signature_hex: Some(encode_hex(&mmcs.signature)), 
+                decryption_key: Some(encode_hex(&mmcs.key)), 
+                mmcs_owner: Some(mmcs.object.clone()), 
+                mmcs_url: Some(mmcs.url.clone()), 
+
+                inline_attachment: None,
+                message_part: None,
+
+                file_size: NumOrString::Num(mmcs.size as u32), 
+                uti_type: Some(self.uti_type.clone()), 
+                mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
             })
         }
@@ -399,7 +422,7 @@ pub struct AttachmentMeta {
     #[serde(rename = "ui")]
     pub user_info: Option<MMCSAttachmentMeta>,
     #[serde(rename = "fn")]
-    pub filename: String, //path
+    pub filename: Option<String>, //path
     #[serde(rename = "aui")]
     pub extras: Option<AttachmentMetaExtra>,
     #[serde(rename = "ig")]
@@ -479,7 +502,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             };
             if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
 
-            let item = T::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+            let pcskey = match pcs_key_for_record(&record, &key) {
+                Ok(key) => key,
+                Err(PushError::PCSRecordKeyMissing) => {
+                    container.clear_cache_zone_encryption_config(&zone).await;
+                    return Err(PushError::PCSRecordKeyMissing)
+                },
+                Err(e) => return Err(e)
+            };
+            let item = T::from_record_encrypted(&record.record_field, Some((&pcskey, record.record_identifier.as_ref().unwrap())));
 
             results.insert(identifier, Some(item));
         }
@@ -543,6 +574,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             ZoneDeleteOperation::new(container.private_zone("chatManateeZone".to_string())),
             ZoneDeleteOperation::new(container.private_zone("messageManateeZone".to_string())),
             ZoneDeleteOperation::new(container.private_zone("attachmentManateeZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("chat1ManateeZone".to_string())),
         ], IsolationLevel::Operation).await?;
         Ok(())
     }

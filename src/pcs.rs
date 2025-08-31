@@ -311,7 +311,7 @@ impl PCSPrivateKey {
     pub fn from_dict(dict: &Dictionary, keychain: &KeychainClientState) -> Self {
         let key = dict.get("v_Data").expect("No dat?").as_data().expect("Not data");
 
-        let decoded: PCSPrivateKey = rasn::der::decode(&key).unwrap();
+        let decoded: PCSPrivateKey = rasn::der::decode(&key).expect("Failed to decode private key!");
 
         if !decoded.verify_with_keychain(keychain, dict.get("atyp").expect("No dat?").as_data().expect("Not data")).unwrap() {
             panic!("PCS Master key verification failed!");
@@ -559,6 +559,8 @@ impl PCSShareProtectionKeySet {
 
 #[derive(AsnType, Encode, Decode)]
 pub struct PCSShareProtectionIdentities {
+    #[rasn(tag(explicit(context, 0)))]
+    symm_keys: Option<SetOf<rasn::types::OctetString>>,
     #[rasn(tag(explicit(context, 1)))]
     tag1: PCSShareProtectionIdentitiesTag1,
     #[rasn(tag(explicit(context, 2)))]
@@ -567,8 +569,11 @@ pub struct PCSShareProtectionIdentities {
 
 impl PCSShareProtection {
     fn signature_data(&self) -> PCSObjectSignature {
+        // 5 is the version. non-exist is 1, 5 is 2, 4 is 3,
+        // classic is 2
+        // share is 3
         let data = self.attributes.iter().find(|a| a.key == 5).expect("No signature data");
-        rasn::der::decode(&data.value).expect("failed to decode")
+        rasn::der::decode(&data.value).expect("failed to decode signature data")
     }
 
     fn digest_data(&self, objsig: &PCSObjectSignature) -> Vec<u8> {
@@ -577,12 +582,15 @@ impl PCSShareProtection {
             &self.meta[..],
             &objsig.unk2.to_be_bytes(),
             &objsig.unk1.to_be_bytes(),
-            &0u32.to_be_bytes(),
+            &objsig.symm_key_count.unwrap_or(0).to_be_bytes(),
             &objsig.public.keytype.to_be_bytes(),
             &objsig.public.pub_key[..],
         ].concat();
-        if let Some(keylist) = &objsig.keylist {
-            data.extend_from_slice(&rasn::der::encode(keylist).unwrap());
+        if let Some(attributes) = &objsig.attributes {
+            data.extend_from_slice(&rasn::der::encode(attributes).unwrap());
+        }
+        if let Some(ec_key_list) = &objsig.ec_key_list {
+            data.extend_from_slice(&rasn::der::encode(ec_key_list).unwrap());
         }
         data
     }
@@ -599,7 +607,7 @@ impl PCSShareProtection {
         Ok(self.keyset.keyset.first().unwrap().decryption_key.pub_key.to_vec())
     }
 
-    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(PCSKey, Vec<CompactECKey<Private>>), PushError> {
+    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
         let account = Value::String(base64_encode(&self.decode_key_public()?));
         let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).ok_or(PushError::ShareKeyNotFound)?;
@@ -624,6 +632,7 @@ impl PCSShareProtection {
         keyset.make_checksum();
 
         let identities = PCSShareProtectionIdentities {
+            symm_keys: None,
             tag1: Default::default(),
             identities: if keys.is_empty() { None } else { Some(BTreeSet::from_iter([
                 PCSShareProtectionIdentityData {
@@ -666,10 +675,13 @@ impl PCSShareProtection {
                 pub_key: master_ec_key.public_key().to_bytes(master_ec_key.group(), PointConversionForm::UNCOMPRESSED, &mut num_ctx)?.into(),
             },
             signature: Default::default(),
-            keylist: if keys.is_empty() { None } else { Some(keys.iter().map(|k| PCSKeyRef {
+            ec_key_list: if keys.is_empty() { None } else { Some(keys.iter().map(|k| PCSKeyRef {
                 keytype: 3,
                 pub_key: k.compress().to_vec().into(),
-            }).collect()) }
+            }).collect()) },
+            symm_key_count: None,
+            signature_2: None,
+            attributes: None,
         };
 
         let digest_data = protection.digest_data(&signature);
@@ -705,7 +717,8 @@ impl PCSShareProtection {
         Ok(protection)
     }
 
-    pub fn decode(&self, key: &CompactECKey<Private>) -> Result<(PCSKey, Vec<CompactECKey<Private>>), PushError> {
+    pub fn decode(&self, key: &CompactECKey<Private>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+        info!("Decoding share protection!");
         let master_key = PCSKey::new(key, &self.keyset.keyset.first().unwrap().ciphertext)?;
 
         let sig = self.signature_data();
@@ -723,7 +736,15 @@ impl PCSShareProtection {
         let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
         verifier.update(&digest_data)?;
         if !verifier.verify(&sig.signature.signature)? {
-            panic!("self sig check failed")
+            if let Some(past_signature) = &sig.signature_2 {
+                let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
+                verifier.update(&digest_data)?;
+                if !verifier.verify(&past_signature.signature)? {
+                    panic!("self sig 1 and 2 check failed")
+                }
+            } else {
+                panic!("self sig check failed")
+            }
         }
 
         let hmackey = kdf_ctr_hmac(&master_key.0, "hmackey-of-masterkey".as_bytes(), &[], master_key.0.len());
@@ -747,7 +768,10 @@ impl PCSShareProtection {
             }
         }
 
-        Ok((master_key, keys))
+        let mut pcs_keys = vec![master_key];
+        pcs_keys.extend(identities.symm_keys.unwrap_or_default().into_iter().map(|symm| PCSKey(symm.to_vec())));
+
+        Ok((pcs_keys, keys))
     }
 }
 
@@ -758,6 +782,13 @@ pub struct PCSObjectSignature {
     unk2: u32,
     public: PCSKeyRef,
     signature: PCSSignature,
+    // the ignore fields show up in weird situations, when there are multiple keys?
+    #[rasn(tag(explicit(context, 0)))]
+    symm_key_count: Option<u32>,
+    #[rasn(tag(explicit(context, 1)))]
+    signature_2: Option<PCSSignature>,
     #[rasn(tag(explicit(context, 2)))]
-    keylist: Option<SequenceOf<PCSKeyRef>>,
+    ec_key_list: Option<SequenceOf<PCSKeyRef>>,
+    #[rasn(tag(explicit(context, 3)))]
+    attributes: Option<SequenceOf<PCSAttribute>>,
 }
