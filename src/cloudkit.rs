@@ -186,41 +186,50 @@ impl CloudKitOp for SaveRecordOperation {
 }
 
 impl SaveRecordOperation {
+    // new with a *custom* record protection entry
+    pub fn new_protected<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: &PCSKeys, update: Option<String>) -> (Self, String) {
+        // create a key for this record
+        let record_protection = PCSShareProtection::create(&key.zone_keys[0], &[]).unwrap();
+        let der = rasn::der::encode(&record_protection).unwrap();
+        let tag = encode_hex(&sha1(&der)).to_uppercase();
+        let protection_info = Some(ProtectionInfo { 
+            protection_info_tag: Some(tag.clone()),
+            protection_info: Some(der), 
+        });
+        let pcs_key = key.decode_record_protection(protection_info.as_ref().unwrap()).expect("Failed to decode record protection");
+
+        (Self(cloudkit_proto::RecordSaveRequest {
+            record: Some(cloudkit_proto::Record {
+                record_identifier: Some(id.clone()),
+                r#type: Some(cloudkit_proto::record::Type {
+                    name: Some(R::record_type().to_string())
+                }),
+                record_field: record.to_record_encrypted(Some((&pcs_key, &id))),
+                protection_info,
+                ..Default::default()
+            }),
+            merge: Some(true),
+            save_semantics: Some(if update.is_some() { 3 } else { 2 }),
+            record_protection_info_tag: update,
+            zone_protection_info_tag: key.zone_protection_tag.clone(),
+        }), tag)
+    }
+
     pub fn new<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: Option<&PCSKeys>, update: bool) -> Self {
-        let mut pcs_key_id: Option<Vec<u8>> = None;
-        let mut protection_info: Option<ProtectionInfo> = None;
-        let mut pcs_key: Option<PCSKey> = None;
-
-        if let Some(key) = key {
-            if let Some(global) = &key.default_record_key {
-                pcs_key_id = Some(global.key_id().unwrap()[..4].to_vec());
-                pcs_key = Some(global.clone());
-            } else {
-                // create a key for this record
-                let record_protection = PCSShareProtection::create(&key.zone_keys[0], &[]).unwrap();
-                let der = rasn::der::encode(&record_protection).unwrap();
-                protection_info = Some(ProtectionInfo { 
-                    protection_info_tag: Some(encode_hex(&sha1(&der)).to_uppercase()),
-                    protection_info: Some(der), 
-                });
-            }
-        }
-
         Self(cloudkit_proto::RecordSaveRequest {
             record: Some(cloudkit_proto::Record {
                 record_identifier: Some(id.clone()),
                 r#type: Some(cloudkit_proto::record::Type {
                     name: Some(R::record_type().to_string())
                 }),
-                record_field: record.to_record_encrypted(pcs_key.as_ref().map(|k| (k, &id))),
-                pcs_key: pcs_key_id,
-                protection_info,
+                record_field: record.to_record_encrypted(key.map(|k| (k.default_record_key.as_ref().expect("No default record key?"), &id))),
+                pcs_key: key.map(|k| k.default_record_key.as_ref().expect("No default record key?").key_id().unwrap()[..4].to_vec()),
                 ..Default::default()
             }),
             merge: Some(true),
             save_semantics: Some(if update { 3 } else { 2 }),
-            record_protection_info_tag: None,
-            zone_protection_info_tag: None,
+            record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
+            zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
         })
     }
 }
@@ -467,6 +476,15 @@ impl FetchRecordChangesOperation {
             include_mergeable_deltas: None,
         })
     }
+}
+
+pub fn should_reset(error: Option<&PushError>) -> bool {
+    matches!(error, Some(PushError::CloudKitError(cloudkit_proto::response_operation::Result { error: Some(cloudkit_proto::response_operation::result::Error {
+            client_error: Some(cloudkit_proto::response_operation::result::error::Client {
+                r#type: Some(errortype)
+            }),
+            ..
+        }), .. })) if *errortype == cloudkit_proto::response_operation::result::error::client::Code::FullResetNeeded as i32)
 }
 
 pub struct FunctionInvokeOperation(pub cloudkit_proto::FunctionInvokeRequest);
@@ -749,16 +767,12 @@ pub struct QueryResult<T: CloudKitRecord> {
 #[derive(Clone)]
 pub struct PCSKeys {
     zone_keys: Vec<CompactECKey<Private>>,
+    zone_protection_tag: Option<String>,
     default_record_key: Option<PCSKey>,
+    pub record_prot_tag: Option<String>,
 }
 
 impl PCSKeys {
-    fn new(keys: Vec<CompactECKey<Private>>) -> Self {
-        Self {
-            zone_keys: keys,
-            default_record_key: None,
-        }
-    }
 
     fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<PCSKey, PushError> {
         let record_protection: PCSShareProtection = rasn::der::decode(protection.protection_info()).expect("Bad record protection?");
@@ -837,8 +851,15 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
         let (_parent_key, keys) = zone_protection.decrypt_with_keychain(&data, pcs_service)?;
 
-        let mut keys = PCSKeys::new(keys);
-        
+        let mut keys = PCSKeys {
+            zone_keys: keys,
+            zone_protection_tag: zone.protection_info.as_ref().unwrap().protection_info_tag.clone(),
+            default_record_key: None,
+            record_prot_tag: if let Some(record_protection_info) = &zone.record_protection_info {
+                record_protection_info.protection_info_tag.clone()
+            } else { None },
+        };
+
         if let Some(record_protection_info) = &zone.record_protection_info {
             keys.default_record_key = Some(keys.decode_record_protection(record_protection_info)?);
         }

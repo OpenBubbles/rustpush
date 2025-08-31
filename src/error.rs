@@ -175,4 +175,6 @@ pub enum PushError {
     ShareKeyNotFound,
     #[error("BatchError {0}")]
     BatchError(Arc<PushError>),
+    #[error("Invalid 2fa code!")]
+    Bad2FaCode,
 }

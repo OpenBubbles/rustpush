@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, sync::Arc};
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, request_operation::header::IsolationLevel, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
+use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, request_operation::header::IsolationLevel, response_operation, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
@@ -25,7 +25,7 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{cloudkit::{record_identifier, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation}, pcs::PCSKey};
+use crate::{cloudkit::{record_identifier, should_reset, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation}, pcs::PCSKey};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
@@ -1048,16 +1048,36 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn is_in_clique(&self) -> bool {
-        let _ = self.sync_changes().await;
+        let _ = self.sync_trust().await;
         self.state.read().await.user_identity.as_ref().map(|u| u.is_in_clique()).unwrap_or(false)
     }
 
-    pub async fn sync_changes(&self) -> Result<(), PushError> {
-        info!("Syncing changes!");
+    async fn sync_changes(&self) -> Result<(), PushError> {
         let token = self.state.read().await.state_token.clone();
-        let CuttlefishFetchChangesResponse { changes: Some(changes) } = self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
+
+        let result = self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
             sync_token: token
-        }).await? else { return Ok(()) };
+        }).await;
+        let changes: CuttlefishFetchChangesResponse = match result {
+            Ok(changes) => changes,
+            Err(PushError::CloudKitError(e)) => {
+                info!("result {e:?}");
+                if matches!(&e.error, Some(error) if error.error_description() == ".changeTokenExpired") {
+                    info!("Change token reset, locking");
+                    // someone reset our clique...
+                    let mut lock = self.state.write().await;
+                    info!("Change token reset, locked");
+                    lock.state_token = None;
+                    lock.state.clear();
+                    self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
+                        sync_token: None
+                    }).await?
+                } else { return Err(PushError::CloudKitError(e)) }
+            }
+            Err(e) => return Err(e),
+        };
+
+        let CuttlefishFetchChangesResponse { changes: Some(changes) } = changes else { return Ok(()) };
 
         let mut state = self.state.write().await;
         self.apply_changes(changes, &mut state);
@@ -1136,9 +1156,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
-        let item = security_container.perform_operations_checked(&CloudKitSession::new(), 
+        let mut result = security_container.perform_operations_checked(&CloudKitSession::new(), 
             &zones.iter().map(|zone| FetchRecordChangesOperation::new(security_container.private_zone(zone.to_string()), 
-                state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await?;
+                state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await;
+        if should_reset(result.as_ref().err()) {
+            state.items.clear();
+            result = security_container.perform_operations_checked(&CloudKitSession::new(), 
+                &zones.iter().map(|zone| FetchRecordChangesOperation::new(security_container.private_zone(zone.to_string()), 
+                    state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await;
+        }
+        let item = result?;
 
         let state = &mut *state;
 
@@ -1291,6 +1318,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         info!("Syncing trust!");
 
         let mut state = self.state.write().await;
+
+        if !state.state.contains_key(&state.user_identity.as_ref().unwrap().identifier) {
+            info!("We are not in the clique!");
+            state.user_identity.as_mut().unwrap().current_state = PeerDynamicInfo {
+                clock: Some(0),
+                ..Default::default()
+            };
+            return Ok(());
+        }
+
         if self.fast_forward_trust(&mut state)? {
             let identity = state.user_identity.as_ref().unwrap();
             if let CuttlefishUpdateTrustResponse { changes: Some(changes) } = self.invoke_cuttlefish("updateTrust", CuttlefishUpdateTrustRequest {
@@ -1784,9 +1821,14 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let machine_id = anisette_lock.get_headers().await?.get("X-Apple-I-MD-M").unwrap().clone();
         drop(anisette_lock);
 
-        // TODO: delete old bottles
-        // self.delete(&format!("com.apple.icdp.record.{}", user_identity_ref.identifier.clone())).await?;
-        self.enroll(password, &bottle_label, &machine_id, &escrow_bottle.timestamp, bottle_id, escrowed_signing_key, &plist_to_bin(&escrow_bottle)?).await?;
+        if let Err(e) = self.enroll(password, &bottle_label, &machine_id, &escrow_bottle.timestamp, bottle_id.clone(), escrowed_signing_key.clone(), &plist_to_bin(&escrow_bottle)?).await {
+            if let PushError::EscrowError(_) = &e {
+                self.delete(&bottle_label).await?;
+                self.enroll(password, &bottle_label, &machine_id, &escrow_bottle.timestamp, bottle_id, escrowed_signing_key, &plist_to_bin(&escrow_bottle)?).await?;
+            } else {
+                return Err(e)
+            }
+        }
 
         Ok(bottle)
     }

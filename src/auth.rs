@@ -731,7 +731,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             return Err(PushError::WrongStep(request.step))
         }
 
-        let step2: CircleStep1 = rasn::der::decode(&base64_decode(request.pake.as_ref().unwrap())).expect("failed to decode circlestep1");
+        let step2: CircleStep1 = rasn::der::decode(&base64_decode(request.pake.as_ref().expect("No Pake!"))).expect("failed to decode circlestep1");
         let body: CircleStep1Body = rasn::der::decode(step2.body.as_ref()).expect("failed to decode circlestep1body");
 
         let verifier: SrpClientVerifier<Sha256> = self.srp_client
@@ -758,6 +758,10 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
 
     pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<Option<LoginState>, PushError> {
         if let Some(ec) = &request.ec {
+            if *ec == -9003 {
+                // bad password
+                return Err(PushError::Bad2FaCode);
+            }
             return Err(PushError::IdmsCircleError(*ec))
         }
         let Some(pake) = &request.pake else { return Err(PushError::IdmsCircleError(50)) };

@@ -50,7 +50,19 @@ impl RelayConfig {
             data = data.header("X-Beeper-Access-Token", token.clone());
         }
 
-        let result: VersionsResp = data.send().await?.json().await?;
+        let result = data.send().await?;
+
+        match result.status().as_u16() {
+            200 => {},
+            404 => {
+                return Err(PushError::DeviceNotFound)
+            },
+            _status => {
+                return Err(PushError::RelayError(_status, result.text().await?))
+            }
+        }
+
+        let result: VersionsResp = result.json().await?;
 
         Ok(result.versions)
     }
