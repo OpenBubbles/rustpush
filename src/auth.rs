@@ -680,10 +680,15 @@ pub struct CircleClientSession<P: AnisetteProvider> {
     channel: Option<CircleEncryptedChannel>,
     saved_password: Option<String>,
     saved_device_password: Option<Vec<u8>>,
+    pub session_id: Option<String>,
+    atxid: String,
 }
 
 impl<P: AnisetteProvider> CircleClientSession<P> {
+    // WARN: you, the caller, are responsible for advertising a BLE GATT service with the uuid of session_id
+    // modern OSes may refuse to add you to the circle if you are not in physical proximity
     pub async fn new(dsid: u64, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
+        // note, -0 is the attempt number. Each time there is another attempt (send new code) the -0 increments by 1
         let atxid = format!("{}-0", rand::random::<u32>() / 2);
 
         let srp_client = SrpClient::<Sha256>::new(&G_3072);
@@ -691,17 +696,17 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         let a: [u8; 32] = rand::random();
         let a_pub = srp_client.compute_public_ephemeral(&a);
 
-        account.lock().await.circle(&CircleSendMessage {
+        let response = account.lock().await.circle(&CircleSendMessage {
             atxid: atxid.clone(),
             circlestep: 0,
             idmsdata: None,
-            pakedata: base64_encode(&rasn::der::encode(&CircleStep0 {
+            pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep0 {
                 circle_step: 0.into(),
                 public_ephermeral: a_pub.into(),
                 unk3: 1.into(),
                 req_uuid: Uuid::new_v4().into_bytes().to_vec().into(),
                 tag: "o".as_bytes().into(),
-            }).unwrap()),
+            }).unwrap())),
             ptkn: encode_hex(&push_token).to_uppercase(),
             ec: None,
         }, true).await?;
@@ -717,6 +722,8 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             trusted_peers: None,
             channel: None,
             saved_device_password: None,
+            session_id: response.sid,
+            atxid
         })
     }
 
@@ -748,7 +755,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             atxid: request.atxnid.clone(),
             circlestep: 2,
             idmsdata: Some(request.idmsdata.clone()),
-            pakedata: base64_encode(&step2),
+            pakedata: Some(base64_encode(&step2)),
             ptkn: encode_hex(&self.push_token).to_uppercase(),
             ec: None,
         }, true).await?;
@@ -756,13 +763,29 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
         Ok(())
     }
 
+    pub async fn cancel(&self) -> Result<(), PushError> {
+        self.account.lock().await.circle(&CircleSendMessage {
+            atxid: self.atxid.clone(),
+            circlestep: 0,
+            ptkn: encode_hex(&self.push_token).to_uppercase(),
+            ec: Some(-9004),
+            idmsdata: None,
+            pakedata: None,
+        }, true).await?;
+        return Ok(());
+    }
+
     pub async fn handle_circle_request(&mut self, request: &IdmsCircleMessage) -> Result<Option<LoginState>, PushError> {
         if let Some(ec) = &request.ec {
-            if *ec == -9003 {
-                // bad password
-                return Err(PushError::Bad2FaCode);
+            if *ec != -9005 {
+                if *ec == -9003 {
+                    // bad password
+                    return Err(PushError::Bad2FaCode);
+                }
+                return Err(PushError::IdmsCircleError(*ec))
             }
-            return Err(PushError::IdmsCircleError(*ec))
+            // 9005 is proximity check failed which is expected since we don't support proximity checks.
+            // We can continue anyways, it is a soft error.
         }
         let Some(pake) = &request.pake else { return Err(PushError::IdmsCircleError(50)) };
         match request.step {
@@ -816,6 +839,11 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             return Err(PushError::WrongStep(request.step))
         }
 
+        if request.ec.is_some() {
+            // we failed the proximity check
+            return Err(PushError::CircleOver)
+        }
+
         let state = peers.state.read().await;
         let identity = state.user_identity.as_ref().unwrap();
         let stable_info = identity.sign_payload(peers.generate_stable_info(&state), "TPPB.PeerStableInfo")?;
@@ -848,7 +876,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             atxid: request.atxnid.clone(),
             circlestep: 4,
             idmsdata: Some(request.idmsdata.clone()),
-            pakedata: base64_encode(&message),
+            pakedata: Some(base64_encode(&message)),
             ptkn: encode_hex(&self.push_token).to_uppercase(),
             ec: None,
         }, true).await?;
@@ -937,7 +965,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                     atxid: request.atxnid.clone(),
                     circlestep: 1,
                     idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: base64_encode(&step1),
+                    pakedata: Some(base64_encode(&step1)),
                     ptkn: encode_hex(&self.push_token).to_uppercase(),
                     ec: None,
                 }, false).await?;
@@ -951,10 +979,10 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                         atxid: request.atxnid.clone(),
                         circlestep: 3,
                         idmsdata: Some(request.idmsdata.clone()),
-                        pakedata: base64_encode(&rasn::der::encode(&CircleError {
+                        pakedata: Some(base64_encode(&rasn::der::encode(&CircleError {
                             extra_code: 0.into(),
                             meta: vec![].into()
-                        }).unwrap()),
+                        }).unwrap())),
                         ptkn: encode_hex(&self.push_token).to_uppercase(),
                         ec: Some(-9003),
                     }, false).await?;
@@ -977,7 +1005,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                     atxid: request.atxnid.clone(),
                     circlestep: 3,
                     idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: base64_encode(&message),
+                    pakedata: Some(base64_encode(&message)),
                     ptkn: encode_hex(&self.push_token).to_uppercase(),
                     ec: None,
                 }, false).await?;
@@ -1003,10 +1031,10 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                         atxid: request.atxnid.clone(),
                         circlestep: 5,
                         idmsdata: Some(request.idmsdata.clone()),
-                        pakedata: base64_encode(&rasn::der::encode(&CircleStep5 {
+                        pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep5 {
                             circle_step: 5.into(),
                             voucher: vec![].into(),
-                        }).expect("outer encoding failed")),
+                        }).expect("outer encoding failed"))),
                         ptkn: encode_hex(&self.push_token).to_uppercase(),
                         ec: None,
                     }, false).await?;
@@ -1033,7 +1061,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                     atxid: request.atxnid.clone(),
                     circlestep: 5,
                     idmsdata: Some(request.idmsdata.clone()),
-                    pakedata: base64_encode(&rasn::der::encode(&CircleStep5 {
+                    pakedata: Some(base64_encode(&rasn::der::encode(&CircleStep5 {
                         circle_step: 5.into(),
                         voucher: OctagonPairingMessage {
                             step1: None,
@@ -1045,7 +1073,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                             supports_octagon: Some(Default::default()),
                             supports_sos: Some(Default::default()),
                         }.encode_to_vec().into(),
-                    }).expect("outer encoding failed")),
+                    }).expect("outer encoding failed"))),
                     ptkn: encode_hex(&self.push_token).to_uppercase(),
                     ec: None,
                 }, false).await?;
