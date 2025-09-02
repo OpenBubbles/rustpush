@@ -355,7 +355,7 @@ pub struct MMCSAttachmentMeta {
     pub inline_attachment: Option<String>,
     pub message_part: Option<String>,
 
-    pub file_size: NumOrString,
+    pub file_size: Option<NumOrString>,
     pub uti_type: Option<String>,
     pub mime_type: Option<String>,
     pub name: Option<String>,
@@ -374,7 +374,7 @@ impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
                 inline_attachment: Some("ia-0".to_string()),
                 message_part: Some("0".to_string()),
 
-                file_size: NumOrString::Num(_inline.len() as u32), 
+                file_size: Some(NumOrString::Num(_inline.len() as u32)), 
                 uti_type: Some(self.uti_type.clone()), 
                 mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
@@ -388,7 +388,7 @@ impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
                 inline_attachment: None,
                 message_part: None,
 
-                file_size: NumOrString::Num(mmcs.size as u32), 
+                file_size: Some(NumOrString::Num(mmcs.size as u32)), 
                 uti_type: Some(self.uti_type.clone()), 
                 mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
