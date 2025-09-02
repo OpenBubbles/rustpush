@@ -353,7 +353,7 @@ impl PCSPrivateKey {
             public.verify(&self.signing_key())
         } else {
             let account = Value::Data(signature.keyid.to_vec());
-            let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp").expect("No atyp?") == &account).unwrap();
+            let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp") == Some(&account)).unwrap();
             let key = item.get("v_Data").expect("No dat?").as_data().expect("Not data");
 
             let decoded: PCSPrivateKey = rasn::der::decode(&key).unwrap();
@@ -369,19 +369,20 @@ impl PCSPrivateKey {
     }
 }
 
-#[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSKeyRef {
     keytype: u32,
     pub_key: rasn::types::OctetString,
 }
 
-#[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSShareKey {
     decryption_key: PCSKeyRef,
     ciphertext: rasn::types::OctetString,
+    unk1: Option<u32>,
 }
 
-#[derive(AsnType, Encode, Decode)]
+#[derive(AsnType, Encode, Decode, Debug)]
 pub struct PCSKeySet {
     unk1: u32, // 0
     keyset: SetOf<PCSShareKey>,
@@ -391,8 +392,6 @@ pub struct PCSKeySet {
 pub struct PCSKey(Vec<u8>);
 impl PCSKey {
     fn new(eckey: &CompactECKey<Private>, wrapped: &[u8]) -> Result<Self, PushError> {
-        // do this computation with decrypted if [1] first integer is not 5 
-        // let master_key = kdf_ctr_hmac(&rm_master_key, "MsaeEooevaX fooo 012".as_bytes(), &[], rm_master_key.len());
         Ok(Self(rfc6637_unwrap_key(eckey, &wrapped, "fingerprint".as_bytes())?))
     }
 
@@ -505,14 +504,23 @@ impl CloudKitEncryptor for PCSKey {
     }
 }
 
-#[derive(AsnType, Encode, Decode)]
+#[derive(AsnType, Encode, Decode, Debug, Default)]
+pub struct PCSShareProtectionSignatureData {
+    // 5 is the version. non-exist is 1, 5 is 2, 4 is 3,
+    // classic is 2
+    // share is 3
+    version: u32,
+    data: rasn::types::OctetString,
+}
+
+#[derive(AsnType, Encode, Decode, Debug)]
 #[rasn(tag(explicit(application, 1)))]
 pub struct PCSShareProtection {
     keyset: PCSKeySet,
     #[rasn(tag(explicit(context, 0)))]
     meta: rasn::types::OctetString, // encrypted
-    #[rasn(tag(context, 1))]
-    attributes: SequenceOf<PCSAttribute>, // not sure this should be a sequence, maybe tag should be explicit, not sure
+    #[rasn(tag(explicit(context, 1)))]
+    attributes: PCSShareProtectionSignatureData, // not sure this should be a sequence, maybe tag should be explicit, not sure
     hmac: rasn::types::OctetString,
     #[rasn(tag(explicit(context, 2)))]
     truncated_key_id: rasn::types::OctetString,
@@ -569,11 +577,7 @@ pub struct PCSShareProtectionIdentities {
 
 impl PCSShareProtection {
     fn signature_data(&self) -> PCSObjectSignature {
-        // 5 is the version. non-exist is 1, 5 is 2, 4 is 3,
-        // classic is 2
-        // share is 3
-        let data = self.attributes.iter().find(|a| a.key == 5).expect("No signature data");
-        rasn::der::decode(&data.value).expect("failed to decode signature data")
+        rasn::der::decode(&self.attributes.data).expect("failed to decode signature data")
     }
 
     fn digest_data(&self, objsig: &PCSObjectSignature) -> Vec<u8> {
@@ -604,13 +608,13 @@ impl PCSShareProtection {
     }
 
     pub fn decode_key_public(&self) -> Result<Vec<u8>, PushError> {
-        Ok(self.keyset.keyset.first().unwrap().decryption_key.pub_key.to_vec())
+        Ok(self.keyset.keyset.first().expect("No public keyset! (bad decoding?)").decryption_key.pub_key.to_vec())
     }
 
     pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
         let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct").expect("No acct?") == &account).ok_or(PushError::ShareKeyNotFound)?;
+        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct") == Some(&account)).ok_or(PushError::ShareKeyNotFound)?;
         let decoded = PCSPrivateKey::from_dict(item, keychain);
 
         let key = decoded.key();
@@ -654,11 +658,12 @@ impl PCSShareProtection {
                             pub_key: encrypt.compress().to_vec().into(),
                         },
                         ciphertext: master_key.wrap(encrypt)?.into(),
+                        unk1: None,
                     }
                 ])
             },
             meta: encrypted.into(),
-            attributes: vec![],
+            attributes: Default::default(),
             hmac: Default::default(),
             truncated_key_id: master_key.key_id()?[..4].to_vec().into(),
             signature: Default::default(),
@@ -695,10 +700,10 @@ impl PCSShareProtection {
             signature: signer.sign_to_vec()?.into(),
         };
 
-        protection.attributes.push(PCSAttribute {
-            key: 5,
-            value: rasn::der::encode(&signature).unwrap().into(),
-        });
+        protection.attributes = PCSShareProtectionSignatureData {
+            version: 5,
+            data: rasn::der::encode(&signature).unwrap().into(),
+        };
 
         
         let key = encrypt.get_pkey();
@@ -719,7 +724,7 @@ impl PCSShareProtection {
 
     pub fn decode(&self, key: &CompactECKey<Private>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding share protection!");
-        let master_key = PCSKey::new(key, &self.keyset.keyset.first().unwrap().ciphertext)?;
+        let rm_master_key = PCSKey::new(key, &self.keyset.keyset.first().unwrap().ciphertext)?;
 
         let sig = self.signature_data();
         
@@ -732,7 +737,7 @@ impl PCSShareProtection {
             panic!("sig check failed")
         }
 
-        let key = PKey::from_ec_key(master_key.master_ec_key()?)?;
+        let key = PKey::from_ec_key(rm_master_key.master_ec_key()?)?;
         let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
         verifier.update(&digest_data)?;
         if !verifier.verify(&sig.signature.signature)? {
@@ -745,6 +750,11 @@ impl PCSShareProtection {
             } else {
                 panic!("self sig check failed")
             }
+        }
+
+        let mut master_key = rm_master_key.clone();
+        if self.attributes.version != 5 {
+            master_key = PCSKey(kdf_ctr_hmac(&rm_master_key.0, "MsaeEooevaX fooo 012".as_bytes(), &[], rm_master_key.0.len()));
         }
 
         let hmackey = kdf_ctr_hmac(&master_key.0, "hmackey-of-masterkey".as_bytes(), &[], master_key.0.len());

@@ -638,7 +638,7 @@ impl EncodedPeer {
     pub fn get_peer_info(&self) -> Result<PeerPermanentInfo, PushError> {
         
 
-        let signed_info = self.0.permanent_info.as_ref().unwrap();
+        let signed_info = self.0.permanent_info.as_ref().expect("Permanent info not found");
         // make sure they are who they say they are
         let computed_hash = format!("SHA256:{}", base64_encode(&sha256(&[signed_info.info(), signed_info.signature()].concat())));
         let represented_hash = self.0.hash.as_ref().unwrap();
@@ -693,11 +693,11 @@ impl EncodedPeer {
     }
 
     fn get_stable_info(&self) -> Result<PeerStableInfo, PushError> {
-        self.check_payload(self.0.stable_info.as_ref().unwrap(), "TPPB.PeerStableInfo")
+        self.check_payload(self.0.stable_info.as_ref().expect("Stable info not found"), "TPPB.PeerStableInfo")
     }
 
     fn get_dynamic_info(&self) -> Result<PeerDynamicInfo, PushError> {
-        self.check_payload(self.0.dynamic_info.as_ref().unwrap(), "TPPB.PeerDynamicInfo")
+        self.check_payload(self.0.dynamic_info.as_ref().expect("Dynamic info not found!"), "TPPB.PeerDynamicInfo")
     }
 
     fn get_voucher_unchecked(&self) -> Result<Option<(Voucher, SignedInfo)>, PushError> {
@@ -910,6 +910,11 @@ impl KeychainClientState {
             keystore: KeychainKeyStore(vec![]),
             items: HashMap::new(),
         })
+    }
+
+    // filter out custodian recovery keys
+    pub fn peers(&self) -> impl Iterator<Item = &EncodedPeer> {
+        self.state.values().filter(|v| v.0.dynamic_info.is_some())
     }
 }
 
@@ -1180,7 +1185,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
                 if record.r#type.as_ref().unwrap().name() == CuttlefishEncItem::record_type() {
                     let item = CuttlefishEncItem::from_record(&record.record_field);
-                    let decoded = item.decrypt(&identifier, &record, &state.keystore)?;
+                    let Ok(decoded) = item.decrypt(&identifier, &record, &state.keystore) else {
+                        warn!("Missing decryption key for {}", identifier);
+                        continue;
+                    };
 
                     saved_keychain_zone.keys.insert(identifier, decoded);
                 } else if record.r#type.as_ref().unwrap().name() == CuttlefishCurrentItem::record_type() {
@@ -1318,6 +1326,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         info!("Syncing trust!");
 
         let mut state = self.state.write().await;
+        if state.user_identity.is_none() {
+            info!("No user identity!");
+            return Ok(())
+        }
 
         if !state.state.contains_key(&state.user_identity.as_ref().unwrap().identifier) {
             info!("We are not in the clique!");
@@ -1351,7 +1363,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         // sync up our identity
         let mut current_state = state.user_identity.as_ref().unwrap().current_state.clone();
 
-        let mut forward = state.state.values()
+        let mut forward = state.peers()
                 .filter_map(|d| Some((d.clone(), d.get_dynamic_info().ok()?)))
                 .filter(|d| d.1.clock() > current_state.clock()) // peers with newer info
                 .collect::<Vec<_>>();
@@ -1612,7 +1624,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
     pub fn generate_stable_info(&self, state: &KeychainClientState) -> PeerStableInfo {
         // maximum clock between all our peers
-        let next_stable_clock = state.state.values().filter_map(|d| d.get_stable_info().ok().map(|a| a.clock())).max().unwrap_or(0) + 1;
+        let next_stable_clock = state.peers().filter_map(|d| d.get_stable_info().ok().map(|a| a.clock())).max().unwrap_or(0) + 1;
         PeerStableInfo {
             clock: Some(next_stable_clock),
             frozen_policy_version: Some(5),

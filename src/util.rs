@@ -87,7 +87,7 @@ fn build_proxy() -> Client {
 
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
-    return build_proxy();
+    // return build_proxy();
     let certificates = vec![
         Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
         Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
