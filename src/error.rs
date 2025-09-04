@@ -171,8 +171,8 @@ pub enum PushError {
     NotInClique,
     #[error("Missing group photo!")]
     MissingGroupPhoto,
-    #[error("PCS Share key not found!")]
-    ShareKeyNotFound,
+    #[error("PCS Share key {0} not found!")]
+    ShareKeyNotFound(String),
     #[error("BatchError {0}")]
     BatchError(Arc<PushError>),
     #[error("Invalid 2fa code!")]
@@ -181,4 +181,6 @@ pub enum PushError {
     PCSRecordKeyMissing,
     #[error("Circle is over!")]
     CircleOver,
+    #[error("Too many requests!")]
+    TooManyRequests,
 }

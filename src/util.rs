@@ -1249,7 +1249,9 @@ pub struct NSDictionaryTypedCoder(pub HashMap<String, StCollapsedValue>);
 impl NSDictionaryTypedCoder {
     fn decode(val: &StCollapsedValue) -> Self {
         let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
-        assert_eq!(class, "NSDictionary");
+        if class != "NSDictionary" && class != "NSMutableDictionary" {
+            panic!("Bad string type!");
+        }
         Self(HashMap::from_iter(fields[1..].chunks_exact(2).map(|i| {
             let text = NSString::decode(&i[0][0]);
             (text.0, i[1][0].clone())
@@ -1272,7 +1274,9 @@ pub struct NSString(pub String);
 impl NSString {
     pub fn decode(val: &StCollapsedValue) -> Self {
         let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
-        assert_eq!(class, "NSString");
+        if class != "NSString" && class != "NSMutableString" {
+            panic!("Bad string type!");
+        }
         let StCollapsedValue::String(text) = &fields[0][0] else { panic!("no text?") };
         Self(text.clone())
     }
@@ -1326,7 +1330,9 @@ impl NSAttributedString {
         let mut range_cache: HashMap<u32, NSDictionaryTypedCoder> = HashMap::new();
         
         let StCollapsedValue::Object { class, fields } = val else { panic!("Not an object!") };
-        assert_eq!(class, "NSAttributedString");
+        if class != "NSAttributedString" && class != "NSMutableAttributedString" {
+            panic!("Bad attributed string variant!")
+        }
         
         let mut obj = fields.iter();
         let text = NSString::decode(&obj.next().unwrap()[0]);

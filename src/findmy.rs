@@ -420,22 +420,20 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         let mut state = self.state.state.lock().await;
 
-        let mut result = container.perform(&CloudKitSession::new(),
-            FetchRecordChangesOperation::new(beacon_zone.clone(), state.state_token.clone(), &NO_ASSETS)).await;
+        let mut result = FetchRecordChangesOperation::do_sync(&container, &[(beacon_zone.clone(), state.state_token.clone())], &NO_ASSETS).await;
         if should_reset(result.as_ref().err()) {
             state.state_token = None;
             state.accessories.clear();
-            result = container.perform(&CloudKitSession::new(),
-                FetchRecordChangesOperation::new(beacon_zone, state.state_token.clone(), &NO_ASSETS)).await;
+            result = FetchRecordChangesOperation::do_sync(&container, &[(beacon_zone.clone(), state.state_token.clone())], &NO_ASSETS).await;
         }
 
-        let (_, changes) = result?;
+        let (_, changes, continuation) = result?.remove(0);
         
-        state.state_token = changes.sync_continuation_token.clone();
+        state.state_token = continuation.clone();
 
         let accessories = &mut state.accessories;
         
-        for change in changes.change {
+        for change in changes {
             let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
             let Some(record) = change.record else {
                 accessories.remove(&identifier);
@@ -447,7 +445,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             if record.r#type.as_ref().unwrap().name() == MasterBeaconRecord::record_type() {
                 let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
 
-                println!("Got beacon {:?} {}", item, identifier);
+                info!("Got beacon {:?} {}", item, identifier);
 
                 if let Some(accessory) = accessories.get_mut(&identifier) {
                     accessory.master_record = item;
@@ -524,6 +522,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 let adv = base64_encode(&sha256(&x.to_vec_padded(28)?));
                 key_map.insert(adv.clone(), (id.clone(), key, idx));
                 device_keys.push(adv);
+            
             }
             
             search.push(json!({
@@ -534,6 +533,11 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                 "endDate": end_ts,
                 "primaryIds": device_keys,
             }));
+        }
+
+        if search.is_empty() {
+            info!("Not searching, no item!");
+            return Ok(())
         }
 
         let mut request = self.anisette.lock().await.get_headers().await?.clone();

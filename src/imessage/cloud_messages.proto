@@ -13,8 +13,8 @@ message MessageProto2 {
 message MessageProto {
     uint32 unk1 = 1; // always 1, is finished or ck sync state
     optional string groupTitle = 2;
-    string text = 3;
-    bytes attributedBody = 4;
+    optional string text = 3;
+    optional bytes attributedBody = 4;
     optional string balloonBundleId = 5;
     optional bytes payloadData = 6;
     optional bytes messageSummaryInfo = 7;

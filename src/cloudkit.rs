@@ -3,8 +3,9 @@ use std::{collections::HashMap, io::{Cursor, Read, Write}, marker::PhantomData, 
 use aes::{cipher::consts::U12, Aes128, Aes256};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use aes_siv::siv::CmacSiv;
-use cloudkit_proto::{record, request_operation::header::IsolationLevel, AssetGetResponse, AssetsToDownload, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
+use cloudkit_proto::{record, request_operation::header::IsolationLevel, retrieve_changes_response::RecordChange, AssetGetResponse, AssetsToDownload, CloudKitRecord, ProtectionInfo, Record, RecordIdentifier, RecordZoneIdentifier, ResponseOperation, Zone};
 use hkdf::Hkdf;
+use log::info;
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
 use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private}, sha::sha1, sign::{Signer, Verifier}};
 use plist::Value;
@@ -479,6 +480,30 @@ impl FetchRecordChangesOperation {
             include_mergeable_deltas: None,
         })
     }
+
+    pub async fn do_sync(container: &CloudKitOpenContainer<'_, impl AnisetteProvider>, 
+        zones: &[(cloudkit_proto::RecordZoneIdentifier, Option<Vec<u8>>)], assets: &cloudkit_proto::AssetsToDownload) -> Result<Vec<(Vec<AssetGetResponse>, Vec<RecordChange>, Option<Vec<u8>>)>, PushError> {
+        let mut responses = zones.iter().map(|zone| (vec![], vec![], zone.1.clone())).collect::<Vec<_>>();
+
+        let mut finished_zones = vec![];
+        while finished_zones.len() != zones.len() {
+            let mut sync_zones_here = zones.iter().enumerate().filter(|(_, zone)| !finished_zones.contains(&zone.0)).collect::<Vec<_>>();
+            let operations = container.perform_operations_checked(&CloudKitSession::new(), 
+                &sync_zones_here.iter().map(|(idx, zone)| FetchRecordChangesOperation::new(zone.0.clone(), responses[*idx].2.clone(), assets))
+                                .collect::<Vec<_>>(), IsolationLevel::Zone).await?;
+            for (result, (zone_idx, zone)) in operations.into_iter().zip(sync_zones_here.iter_mut()) {
+                if result.1.status() == 3 {
+                    // done syncing
+                    finished_zones.push(zone.0.clone());
+                }
+                responses[*zone_idx].0.extend(result.0);
+                responses[*zone_idx].1.extend(result.1.change);
+                responses[*zone_idx].2 = result.1.sync_continuation_token.clone();
+            }
+        }
+
+        Ok(responses)
+    }
 }
 
 pub fn should_reset(error: Option<&PushError>) -> bool {
@@ -846,10 +871,13 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                 ..
             })) => {
                 let service = PCSPrivateKey::get_service_key(client, pcs_service, self.client.config.as_ref()).await?;
+                
+                info!("Creating zone {} with service key {}", zone_name, encode_hex(&service.key().compress()));
 
-                let request = ZoneSaveOperation::new(zone.clone(), Some(&service.key()), pcs_service.global_record).unwrap();
+                let request = ZoneSaveOperation::new(zone.clone(), Some(&service.key()), pcs_service.global_record)?;
                 let zone = request.0.clone().zone.unwrap();
-                self.perform(&CloudKitSession::new(), request).await.unwrap();
+                self.perform(&CloudKitSession::new(), request).await?;
+                info!("Created zone");
                 zone
             },
             Err(err) => return Err(err)
@@ -977,6 +1005,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
         if response.status().as_u16() == 401 {
             self.client.token_provider.refresh_mme().await?;
+        }
+        if response.status().as_u16() == 429 {
+            return Err(PushError::TooManyRequests);
         }
         
         let token: Vec<u8> = response.bytes().await?

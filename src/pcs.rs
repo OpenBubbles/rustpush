@@ -12,6 +12,7 @@ use plist::{Dictionary, Value};
 use rasn::{types::{Any, GeneralizedTime, SequenceOf, SetOf}, AsnType, Decode, Encode};
 use aes_gcm::KeyInit;
 use aes_gcm::AeadInPlace;
+use rustls::internal::msgs;
 use uuid::Uuid;
 use crate::{ids::CompactECKey, keychain::{KeychainClient, KeychainClientState, PCSMeta}, util::{base64_decode, base64_encode, decode_hex, encode_hex, kdf_ctr_hmac, rfc6637_unwrap_key, rfc6637_wrap_key}, OSConfig, PushError};
 
@@ -211,7 +212,9 @@ impl PCSPrivateKey {
         } else {
             drop(state);
             let master_key = PCSPrivateKey::new_master_key()?;
+            info!("Creating new master key {}", encode_hex(&master_key.key().compress()));
             master_key.save_key(&Uuid::new_v4().to_string().to_uppercase(), &keychain, &MASTER_SERVICE).await?;
+            info!("Created new master key");
             Ok(master_key)
         }
     }
@@ -226,7 +229,9 @@ impl PCSPrivateKey {
             let master_key = Self::get_master_key(keychain).await?;
 
             let service_key = PCSPrivateKey::new_service_key(&master_key, service.r#type, service.v2, config)?;
+            info!("Creating new service key {} for {}", encode_hex(&master_key.key().compress()), service.name);
             service_key.save_key(&Uuid::new_v4().to_string().to_uppercase(), &keychain, service).await?;
+            info!("Created new service key");
             Ok(service_key)
         }
     }
@@ -614,7 +619,8 @@ impl PCSShareProtection {
     pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
         let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct") == Some(&account)).ok_or(PushError::ShareKeyNotFound)?;
+        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct") == Some(&account))
+            .ok_or(PushError::ShareKeyNotFound(encode_hex(&self.decode_key_public()?)))?;
         let decoded = PCSPrivateKey::from_dict(item, keychain);
 
         let key = decoded.key();

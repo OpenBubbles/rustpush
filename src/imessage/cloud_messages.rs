@@ -6,6 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use backon::{ConstantBuilder, Retryable};
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::request_operation::header::IsolationLevel;
 use cloudkit_proto::retrieve_changes_response::RecordChange;
@@ -400,7 +401,7 @@ impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AttachmentMetaExtra {
     #[serde(rename = "pgens")]
-    pub preview_generation_state: Option<u32>, // set to 1
+    pub preview_generation_state: Option<i32>, // set to 1
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -412,7 +413,7 @@ pub struct AttachmentMeta {
     #[serde(rename = "tb")]
     pub total_bytes: u64,
     #[serde(rename = "st")]
-    pub transfer_state: u32,
+    pub transfer_state: i32,
     #[serde(rename = "is")]
     pub is_sticker: bool,
     #[serde(rename = "aguid")]
@@ -430,7 +431,7 @@ pub struct AttachmentMeta {
     #[serde(rename = "tn")]
     pub transfer_name: String,
     #[serde(rename = "vers")]
-    pub version: u32, // set to 1
+    pub version: i32, // set to 1
     #[serde(rename = "t")]
     pub uti: Option<String>, // uti type
     #[serde(rename = "cdt")]
@@ -474,26 +475,17 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         return Ok(locked.clone().unwrap())
     }
 
-    // todo keep syncing until end
-    async fn sync_records<T: CloudKitRecord>(&self, zone: &str, mut continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>), PushError> {
+    async fn sync_records<T: CloudKitRecord>(&self, zone: &str, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
         let container = self.get_container().await?;
 
         let zone = container.private_zone(zone.to_string());
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
-        let (_assets, mut response) = container.perform(&CloudKitSession::new(),
+        let (_assets, response) = container.perform(&CloudKitSession::new(),
             FetchRecordChangesOperation::new(zone.clone(), continuation_token, &NO_ASSETS)).await?;
-        let mut items = vec![];
-        while !response.change.is_empty() {
-            items.extend(response.change);
-            continuation_token = response.sync_continuation_token.clone();
-            response = container.perform(&CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone.clone(), continuation_token, &NO_ASSETS)).await?.1;
-        }
-
 
         let mut results = HashMap::new();
 
-        for change in &items {
+        for change in &response.change {
             let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
 
             let Some(record) = &change.record else {
@@ -515,7 +507,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             results.insert(identifier, Some(item));
         }
 
-        Ok((response.sync_continuation_token().to_vec(), results))
+        Ok((response.sync_continuation_token().to_vec(), results, response.status()))
     }
 
     async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
@@ -555,12 +547,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
         let zone = container.private_zone(zone.to_string());
 
-        let mut operations = vec![];
-        for record_id in records {
-            operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
+        for batch in records.chunks(256) {
+            let mut operations = vec![];
+            for record_id in batch {
+                operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
+            }
+            (|| async {
+                container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await
+            }).retry(&ConstantBuilder::default().with_delay(Duration::from_secs(5)).with_max_times(3)).await?;
         }
-
-        container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await?;
 
         Ok(())
     }
@@ -575,11 +570,18 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             ZoneDeleteOperation::new(container.private_zone("messageManateeZone".to_string())),
             ZoneDeleteOperation::new(container.private_zone("attachmentManateeZone".to_string())),
             ZoneDeleteOperation::new(container.private_zone("chat1ManateeZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("messageUpdateZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("recoverableMessageDeleteZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("scheduledMessageZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("chatBotMessageZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("chatBotAttachmentZone".to_string())),
+            ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
+
         ], IsolationLevel::Operation).await?;
         Ok(())
     }
 
-    pub async fn sync_chats(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>), PushError> {
+    pub async fn sync_chats(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
         self.sync_records("chatManateeZone", continuation_token).await
     }
 
@@ -591,7 +593,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.delete_records("chatManateeZone", chats).await
     }
 
-    pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>), PushError> {
+    pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
         self.sync_records("messageManateeZone", continuation_token).await
     }
 
@@ -603,7 +605,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.delete_records("messageManateeZone", messages).await
     }
 
-    pub async fn sync_attachments(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>), PushError> {
+    pub async fn sync_attachments(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>, i32), PushError> {
         self.sync_records("attachmentManateeZone", continuation_token).await
     }
 

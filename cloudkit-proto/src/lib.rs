@@ -123,8 +123,7 @@ disjoint_impls! {
 
     impl<T: Serialize + DeserializeOwned + CloudKitBytesKind<Kind = sealed::PlistKind>> CloudKitBytes for T {
         fn from_bytes(v: Vec<u8>) -> Self {
-            // println!("{}", encode_hex(&v));
-            plist::from_bytes(&v).expect("Deserialization failed!")
+            plist::from_bytes(&v).expect(&format!("Deserialization failed! {}", encode_hex(&v)))
         }
 
         fn to_bytes(&self) -> Vec<u8> {

@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, sync::Arc};
+use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, sync::Arc, time::Duration};
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
@@ -32,6 +32,8 @@ use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpSer
 use tokio::sync::{Mutex, RwLock};
 use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS}, ids::{CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch, ec_deserialize_priv, ec_serialize_priv, encode_hex, kdf_ctr_hmac, plist_to_bin, plist_to_string, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt, rfc6637_unwrap_key, NSData, NSDataClass, REQWEST}, APSConnection, APSMessage, IdentityManager, KeyedArchive, OSConfig, PushError};
 
+use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
+use backon::Retryable;
 
 // ansi_x963_kdf (use crate later, current dependencies are broken)
 #[inline]
@@ -1161,23 +1163,21 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
-        let mut result = security_container.perform_operations_checked(&CloudKitSession::new(), 
-            &zones.iter().map(|zone| FetchRecordChangesOperation::new(security_container.private_zone(zone.to_string()), 
-                state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await;
+        let mut result = FetchRecordChangesOperation::do_sync(&security_container, &zones.iter()
+            .map(|zone| (security_container.private_zone(zone.to_string()), state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()))).collect::<Vec<_>>(), &ALL_ASSETS).await;
         if should_reset(result.as_ref().err()) {
             state.items.clear();
-            result = security_container.perform_operations_checked(&CloudKitSession::new(), 
-                &zones.iter().map(|zone| FetchRecordChangesOperation::new(security_container.private_zone(zone.to_string()), 
-                    state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()), &ALL_ASSETS)).collect::<Vec<_>>(), IsolationLevel::Zone).await;
+            result = FetchRecordChangesOperation::do_sync(&security_container, &zones.iter()
+            .map(|zone| (security_container.private_zone(zone.to_string()), state.items.get(*zone).and_then(|z| z.change_tag.clone()).map(|z| z.into()))).collect::<Vec<_>>(), &ALL_ASSETS).await;
         }
         let item = result?;
 
         let state = &mut *state;
 
-        for (zone, (_, item)) in zones.iter().zip(item.into_iter()) {
+        for (zone, (_, changes, change)) in zones.iter().zip(item.into_iter()) {
             let saved_keychain_zone = state.items.entry(zone.to_string()).or_default();
-            saved_keychain_zone.change_tag = Some(item.sync_continuation_token.unwrap().into());
-            for change in item.change {
+            saved_keychain_zone.change_tag = change.clone().map(|i| i.into());
+            for change in changes {
                 let Some(record) = change.record else {
                     warn!("record missing change {:?}", change);
                     continue
@@ -1309,13 +1309,29 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         drop(state);
 
-        security.perform_operations_checked(&CloudKitSession::new(), &delete_ops, IsolationLevel::Zone).await?;
 
-        let _: CuttlefishResetResponse = self.invoke_cuttlefish("reset", CuttlefishResetRequest {
-            reason: Some(3),
-        }).await?;
+        (|| async {
+            (|| async { security.perform_operations_checked(&CloudKitSession::new(), &delete_ops, IsolationLevel::Zone).await })
+                .retry(&ConstantBuilder::default()
+                .with_delay(Duration::ZERO)
+                .with_max_times(3))
+                .notify(|err: &PushError, _dur: Duration| {
+                    println!("erasing keys {:?}", err);
+            }).await?;
 
-        self.join_clique(device_password, None, &shares, viewkeys).await?;
+            let _: CuttlefishResetResponse = self.invoke_cuttlefish("reset", CuttlefishResetRequest {
+                reason: Some(3),
+            }).await?;
+
+            self.join_clique(device_password, None, &shares, viewkeys.clone()).await?;
+            Ok(())
+        })
+            .retry(&ConstantBuilder::default()
+            .with_delay(Duration::ZERO)
+            .with_max_times(2))
+            .notify(|err: &PushError, _dur: Duration| {
+                println!("resetting clique {:?}", err);
+            }).await?;
 
         Ok(())
     }
