@@ -183,4 +183,6 @@ pub enum PushError {
     CircleOver,
     #[error("Too many requests!")]
     TooManyRequests,
+    #[error("PCS Master key not found!")]
+    MasterKeyNotFound,
 }

@@ -5,7 +5,7 @@ use aes::{cipher::consts::U12, Aes128};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use chrono::Utc;
 use cloudkit_proto::CloudKitEncryptor;
-use log::info;
+use log::{info, warn};
 use omnisette::AnisetteProvider;
 use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
 use plist::{Dictionary, Value};
@@ -318,8 +318,14 @@ impl PCSPrivateKey {
 
         let decoded: PCSPrivateKey = rasn::der::decode(&key).expect("Failed to decode private key!");
 
-        if !decoded.verify_with_keychain(keychain, dict.get("atyp").expect("No dat?").as_data().expect("Not data")).unwrap() {
-            panic!("PCS Master key verification failed!");
+        match decoded.verify_with_keychain(keychain, dict.get("atyp").expect("No dat?").as_data().expect("Not data")) {
+            Ok(true) => {},
+            Ok(false) => {
+                panic!("PCS Master key verification failed!");
+            }
+            Err(e) => {
+                warn!("PCS master key verification failed {e}");
+            }
         }
 
         decoded
@@ -358,7 +364,8 @@ impl PCSPrivateKey {
             public.verify(&self.signing_key())
         } else {
             let account = Value::Data(signature.keyid.to_vec());
-            let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp") == Some(&account)).unwrap();
+            let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp") == Some(&account))
+                .ok_or(PushError::MasterKeyNotFound)?;
             let key = item.get("v_Data").expect("No dat?").as_data().expect("Not data");
 
             let decoded: PCSPrivateKey = rasn::der::decode(&key).unwrap();
@@ -372,6 +379,21 @@ impl PCSPrivateKey {
             public.verify(&key)
         }
     }
+}
+
+fn get_ciphertext_key(ciphertext: &[u8]) -> (Vec<u8>, usize) {
+    let encryption_version = ciphertext[0];
+    if encryption_version != 3 {
+        panic!("Unimplemented encryption version {encryption_version}");
+    }
+
+    let second_keyid_part_len = ciphertext[3] as usize;
+    let total_tag = [
+        &ciphertext[1..3],
+        &ciphertext[4..4 + second_keyid_part_len]
+    ].concat();
+
+    (total_tag, 4 + second_keyid_part_len)
 }
 
 #[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -443,28 +465,20 @@ impl PCSKey {
     fn decrypt(&self, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, PushError> {
         let encryption_key = kdf_ctr_hmac(&self.0, "encryption key key m".as_bytes(), &[], self.0.len());
 
-        let encryption_version = ciphertext[0];
-        if encryption_version != 3 {
-            panic!("Unimplemented encryption version {encryption_version}");
+        let (required_key, header_len) = get_ciphertext_key(ciphertext);
+
+        if &required_key[..] != &self.key_id()?[..required_key.len()] {
+            panic!("Mismatched key id! Data {} key {}", encode_hex(&ciphertext[..16]), encode_hex(&self.key_id()?));
         }
 
         let tag_len = 12;
-        let second_keyid_part_len = ciphertext[3] as usize;
-        let total_tag = [
-            &ciphertext[1..3],
-            &ciphertext[4..4 + second_keyid_part_len]
-        ].concat();
 
-        if &total_tag[..] != &self.key_id()?[..total_tag.len()] {
-            panic!("Mismatched key id!");
-        }
-
-        let iv = &ciphertext[4 + second_keyid_part_len..4 + second_keyid_part_len + 12];
-        let firstaad = &ciphertext[0..4 + second_keyid_part_len];
+        let iv = &ciphertext[header_len..header_len + 12];
+        let firstaad = &ciphertext[0..header_len];
         let gcm = AesGcm::<Aes128, U12, U12>::new(encryption_key[..].try_into().expect("Bad key size!"));
-        let tag = &ciphertext[4 + second_keyid_part_len + 12..4 + second_keyid_part_len + 12 + tag_len];
+        let tag = &ciphertext[header_len + 12..header_len + 12 + tag_len];
 
-        let mut text = ciphertext[4 + second_keyid_part_len + 12 + tag_len..].to_vec();
+        let mut text = ciphertext[header_len + 12 + tag_len..].to_vec();
 
         gcm.decrypt_in_place_detached(Nonce::from_slice(iv), &[firstaad, aad].concat(), &mut text, Tag::from_slice(tag)).expect("GCM error?");
         Ok(text)
@@ -506,6 +520,20 @@ impl CloudKitEncryptor for PCSKey {
 
     fn encrypt_data(&self, enc: &[u8], context: &[u8]) -> Vec<u8> {
         self.encrypt(enc, context).expect("Encryption failed")
+    }
+}
+
+pub struct PCSKeys(pub Vec<PCSKey>);
+impl CloudKitEncryptor for PCSKeys {
+    fn decrypt_data(&self, dec: &[u8], context: &[u8]) -> Vec<u8> {
+        let (required_key, _) = get_ciphertext_key(dec);
+
+        let key = self.0.iter().find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..]).expect("required key not found!");
+        key.decrypt(dec, context).expect("Decryption failed")
+    }
+
+    fn encrypt_data(&self, enc: &[u8], context: &[u8]) -> Vec<u8> {
+        self.0.first().expect("PCS keyset empty?").encrypt(enc, context).expect("Encryption failed")
     }
 }
 

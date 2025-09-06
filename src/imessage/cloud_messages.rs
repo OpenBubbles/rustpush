@@ -27,7 +27,7 @@ use cloudkit_proto::RecordIdentifier;
 use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{pcs_key_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -408,8 +408,9 @@ pub struct AttachmentMetaExtra {
 pub struct AttachmentMeta {
     #[serde(rename = "mimet")]
     pub mime_type: Option<String>,
+    // yes, these dates can be negative
     #[serde(rename = "sdt")]
-    pub start_date: u64,
+    pub start_date: i64,
     #[serde(rename = "tb")]
     pub total_bytes: u64,
     #[serde(rename = "st")]
@@ -435,7 +436,7 @@ pub struct AttachmentMeta {
     #[serde(rename = "t")]
     pub uti: Option<String>, // uti type
     #[serde(rename = "cdt")]
-    pub created_date: u64,
+    pub created_date: i64,
     pub pathc: Option<String>, // also transfer name
     #[serde(rename = "mdh")]
     pub md5: Option<String>, // first 8 bytes of md5 hash of file
@@ -494,7 +495,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             };
             if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
 
-            let pcskey = match pcs_key_for_record(&record, &key) {
+            let pcskey = match pcs_keys_for_record(&record, &key) {
                 Ok(key) => key,
                 Err(PushError::PCSRecordKeyMissing) => {
                     container.clear_cache_zone_encryption_config(&zone).await;

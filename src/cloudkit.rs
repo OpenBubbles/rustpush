@@ -18,7 +18,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{auth::{MobileMeDelegateResponse, TokenProvider}, ids::CompactECKey, keychain::KeychainClient, mmcs::{get_headers, get_mmcs, put_authorize_body, put_mmcs, AuthorizedOperation, MMCSConfig, PreparedPut}, mmcsp::FordChunk, pcs::{PCSKey, PCSPrivateKey, PCSService, PCSShareProtection}, prepare_put, util::{base64_decode, base64_encode, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key, REQWEST}, FileContainer, OSConfig, PushError};
+use crate::{auth::{MobileMeDelegateResponse, TokenProvider}, ids::CompactECKey, keychain::KeychainClient, mmcs::{get_headers, get_mmcs, put_authorize_body, put_mmcs, AuthorizedOperation, MMCSConfig, PreparedPut}, mmcsp::FordChunk, pcs::{PCSKey, PCSKeys, PCSPrivateKey, PCSService, PCSShareProtection}, prepare_put, util::{base64_decode, base64_encode, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key, REQWEST}, FileContainer, OSConfig, PushError};
 
 fn undelimit_response(resp: &mut impl Read) -> Vec<Vec<u8>> {
     let mut response: Vec<Vec<u8>> = vec![];
@@ -43,7 +43,7 @@ pub struct FetchedRecords {
 }
 
 impl FetchedRecords {
-    pub fn get_record<R: CloudKitRecord>(&self, record_id: &str, key: Option<&PCSKeys>) -> R {
+    pub fn get_record<R: CloudKitRecord>(&self, record_id: &str, key: Option<&PCSZoneConfig>) -> R {
         self.responses.iter().find_map(|response| {
             let r = response.record_retrieve_response.as_ref().expect("No retrieve response?").record.as_ref().expect("No record?");
             if r.record_identifier.as_ref().expect("No record id?").value.as_ref().expect("No identifier").name.as_ref().expect("No name?") == record_id {                
@@ -51,7 +51,7 @@ impl FetchedRecords {
                 if got_type.as_str() != R::record_type() {
                     panic!("Wrong record type, got {} expected {}", got_type, R::record_type());
                 }
-                let key = key.map(|k| pcs_key_for_record(r, k).expect("PCS key failed"));
+                let key = key.map(|k| pcs_keys_for_record(r, k).expect("PCS key failed"));
                 Some(R::from_record_encrypted(&r.record_field, key.as_ref().map(|k| (k, r.record_identifier.as_ref().unwrap()))))
             } else { None }
         }).expect("No record found?")
@@ -100,14 +100,16 @@ pub trait CloudKitOp {
     }
 }
 
-pub fn pcs_key_for_record(record: &Record, keys: &PCSKeys) -> Result<PCSKey, PushError> {
+pub fn pcs_keys_for_record(record: &Record, keys: &PCSZoneConfig) -> Result<PCSKeys, PushError> {
     let Some(protection) = &record.protection_info else {
         let Some(pcskey) = &record.pcs_key else { panic!("No PCS Key??") };
-        let keys = keys.default_record_keys.iter().find(|i| i.key_id().ok().map(|id| pcskey == &id[..pcskey.len()]).unwrap_or(false));
+        if !keys.default_record_keys.iter().any(|i| i.key_id().ok().map(|id| pcskey == &id[..pcskey.len()]).unwrap_or(false)) {
+            return Err(PushError::PCSRecordKeyMissing);
+        }
         
-        return Ok(keys.ok_or(PushError::PCSRecordKeyMissing)?.clone())
+        return Ok(PCSKeys(keys.default_record_keys.clone()))
     };
-    Ok(keys.decode_record_protection(protection)?.remove(0))
+    Ok(PCSKeys(keys.decode_record_protection(protection)?))
 }
 
 pub struct UploadAssetOperation(pub cloudkit_proto::AssetUploadTokenRetrieveRequest);
@@ -191,7 +193,7 @@ impl CloudKitOp for SaveRecordOperation {
 
 impl SaveRecordOperation {
     // new with a *custom* record protection entry
-    pub fn new_protected<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: &PCSKeys, update: Option<String>) -> (Self, String) {
+    pub fn new_protected<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: &PCSZoneConfig, update: Option<String>) -> (Self, String) {
         // create a key for this record
         let record_protection = PCSShareProtection::create(&key.zone_keys[0], &[]).unwrap();
         let der = rasn::der::encode(&record_protection).unwrap();
@@ -219,7 +221,7 @@ impl SaveRecordOperation {
         }), tag)
     }
 
-    pub fn new<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: Option<&PCSKeys>, update: bool) -> Self {
+    pub fn new<R: CloudKitRecord>(id: RecordIdentifier, record: R, key: Option<&PCSZoneConfig>, update: bool) -> Self {
         Self(cloudkit_proto::RecordSaveRequest {
             record: Some(cloudkit_proto::Record {
                 record_identifier: Some(id.clone()),
@@ -244,14 +246,14 @@ pub struct FetchedRecord {
 }
 
 impl FetchedRecord {
-    pub fn get_record<R: CloudKitRecord>(&self, key: Option<&PCSKeys>) -> R {
+    pub fn get_record<R: CloudKitRecord>(&self, key: Option<&PCSZoneConfig>) -> R {
         let r = self.response.record_retrieve_response.as_ref().expect("No retrieve response?").record.as_ref().expect("No record?");
         
         let got_type = r.r#type.as_ref().expect("no TYpe").name.as_ref().expect("No ta");
         if got_type.as_str() != R::record_type() {
             panic!("Wrong record type, got {} expected {}", got_type, R::record_type());
         }
-        let key = key.map(|k| pcs_key_for_record(r, k).expect("no PCS key"));
+        let key = key.map(|k| pcs_keys_for_record(r, k).expect("no PCS key"));
         R::from_record_encrypted(&r.record_field, key.as_ref().map(|k| (k, r.record_identifier.as_ref().unwrap())))
     }
 
@@ -793,14 +795,14 @@ pub struct QueryResult<T: CloudKitRecord> {
 }
 
 #[derive(Clone)]
-pub struct PCSKeys {
+pub struct PCSZoneConfig {
     zone_keys: Vec<CompactECKey<Private>>,
     zone_protection_tag: Option<String>,
     default_record_keys: Vec<PCSKey>,
     pub record_prot_tag: Option<String>,
 }
 
-impl PCSKeys {
+impl PCSZoneConfig {
 
     fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
         let record_protection: PCSShareProtection = rasn::der::decode(protection.protection_info()).expect("Bad record protection?");
@@ -819,7 +821,7 @@ pub struct CloudKitOpenContainer<'t, T: AnisetteProvider> {
     container: CloudKitContainer<'t>,
     pub user_id: String,
     pub client: Arc<CloudKitClient<T>>,
-    pub keys: Mutex<HashMap<String, PCSKeys>>,
+    pub keys: Mutex<HashMap<String, PCSZoneConfig>>,
 }
 
 impl<'t, T: AnisetteProvider> Deref for CloudKitOpenContainer<'t, T> {
@@ -850,7 +852,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         cached_keys.remove(&zone_name);
     }
 
-    pub async fn get_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier, client: &KeychainClient<T>, pcs_service: &PCSService<'_>) -> Result<PCSKeys, PushError> {
+    pub async fn get_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier, client: &KeychainClient<T>, pcs_service: &PCSService<'_>) -> Result<PCSZoneConfig, PushError> {
         let mut cached_keys = self.keys.lock().await;
         let zone_name = zone.value.as_ref().unwrap().name().to_string();
         if let Some(key) = cached_keys.get(&zone_name) {
@@ -888,7 +890,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
 
         let (_parent_key, keys) = zone_protection.decrypt_with_keychain(&data, pcs_service)?;
 
-        let mut keys = PCSKeys {
+        let mut keys = PCSZoneConfig {
             zone_keys: keys,
             zone_protection_tag: zone.protection_info.as_ref().unwrap().protection_info_tag.clone(),
             default_record_keys: vec![],

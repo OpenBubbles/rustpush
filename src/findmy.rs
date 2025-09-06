@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use aes_gcm::KeyInit;
 use uuid::Uuid;
 use crate::{cloudkit::{should_reset, SaveRecordOperation}, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec}};
-use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_key_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
+use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
     name: "com.apple.private.alloy.multiplex1",
@@ -443,7 +443,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             let protection_info_tag = protection_info.protection_info_tag().to_string();
 
             if record.r#type.as_ref().unwrap().name() == MasterBeaconRecord::record_type() {
-                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
 
                 info!("Got beacon {:?} {}", item, identifier);
 
@@ -453,7 +453,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     beacon_records.insert(identifier, item);
                 }
             } else if record.r#type.as_ref().unwrap().name() == BeaconNamingRecord::record_type() {
-                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
 
                 if let Some(accessory) = accessories.get_mut(&item.associated_beacon) {
                     accessory.naming = item;
@@ -462,7 +462,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     naming_records.insert(item.associated_beacon.clone(), (identifier, Some(protection_info_tag), item));
                 }
             } else if record.r#type.as_ref().unwrap().name() == KeyAlignmentRecord::record_type() {
-                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some((&pcs_key_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
 
                 if let Some(accessory) = accessories.get_mut(&item.beacon_identifier) {
                     accessory.alignment = item.clone();
