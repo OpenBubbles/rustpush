@@ -331,11 +331,13 @@ impl CloudKitEncryptedValue for MessageFlags {
     }
 }
 
+// a generic "apple has no schema" type. They really don't.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum NumOrString {
     Num(u32),
     String(String),
+    Bool(bool),
 }
 impl Default for NumOrString {
     fn default() -> Self {
@@ -401,7 +403,7 @@ impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AttachmentMetaExtra {
     #[serde(rename = "pgens")]
-    pub preview_generation_state: Option<i32>, // set to 1
+    pub preview_generation_state: Option<NumOrString>, // set to 1
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -411,8 +413,9 @@ pub struct AttachmentMeta {
     // yes, these dates can be negative
     #[serde(rename = "sdt")]
     pub start_date: i64,
+    // yes, this can be negative, i think apple is trolling...
     #[serde(rename = "tb")]
-    pub total_bytes: u64,
+    pub total_bytes: i64,
     #[serde(rename = "st")]
     pub transfer_state: i32,
     #[serde(rename = "is")]
@@ -430,7 +433,7 @@ pub struct AttachmentMeta {
     #[serde(rename = "ig")]
     pub is_outgoing: bool,
     #[serde(rename = "tn")]
-    pub transfer_name: String,
+    pub transfer_name: Option<String>,
     #[serde(rename = "vers")]
     pub version: i32, // set to 1
     #[serde(rename = "t")]

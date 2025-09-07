@@ -566,7 +566,8 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         let data: FetchPositionsResponse = REQWEST.post("https://gateway.icloud.com/findmyservice/v2/fetch")
             .basic_auth(&format!("{}", state.dsid), Some(token))
             .headers(anisette_headers)
-            .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
+            // must match ADI, skip for mobile
+            // .header("X-MMe-Client-Info", self.config.get_mme_clientinfo("com.apple.icloud.searchpartyuseragent/1.0"))
             .header("x-apple-setup-proxy-request", "true")
             .header("accept-version", "4")
             .header("user-agent", "searchpartyuseragent/1 iMac13,1/13.6.4")
