@@ -13,8 +13,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+
+      - name: Update submodules
+        run: git submodule update --init --recursive --remote
 
       - name: Install Protobuf compiler
         run: |

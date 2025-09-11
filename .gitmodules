@@ -1,3 +1,4 @@
 [submodule "apple-private-apis"]
 	path = apple-private-apis
-	url = git@github.com:OpenBubbles/apple-private-apis.git
+	url = https://github.com/OpenBubbles/apple-private-apis.git
+	branch = master
