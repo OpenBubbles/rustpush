@@ -101,9 +101,13 @@ impl OSConfig for RelayConfig {
         format!("<{}> <{};{};{}> <{}>", self.version.hardware_version, self.version.software_name, self.version.software_version, self.version.software_build_id, item)
     }
 
-    fn get_adi_mme_info(&self, item: &str) -> String {
-        // must be mac for ClearADI
-        format!("<iMac13,1> <macOS;13.6.4;22G513> <{}>", item)
+    fn get_adi_mme_info(&self, item: &str, require_mac: bool) -> String {
+        if require_mac {
+            // must be mac for ClearADI
+            format!("<iMac13,1> <macOS;13.6.4;22G513> <{}>", item)
+        } else {
+            self.get_mme_clientinfo(item)
+        }
     }
 
     fn get_aoskit_version(&self) -> String {

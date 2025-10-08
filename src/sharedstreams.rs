@@ -240,7 +240,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
         let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
 
-        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.CoreMediaStream/1.0 (com.apple.mediastream.mstreamd/1.0)"));
+        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.CoreMediaStream/1.0 (com.apple.mediastream.mstreamd/1.0)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
 
         map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 

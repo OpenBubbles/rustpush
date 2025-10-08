@@ -88,22 +88,22 @@ pub trait OSConfig: Sync + Send {
     fn get_aoskit_version(&self) -> String;
     fn get_udid(&self) -> String;
 
-    fn get_adi_mme_info(&self, for_item: &str) -> String {
+    fn get_adi_mme_info(&self, for_item: &str, require_mac: bool) -> String {
         self.get_mme_clientinfo(for_item)
     }
 
-    fn get_gsa_config(&self, push: &APSState) -> LoginClientInfo {
+    fn get_gsa_config(&self, push: &APSState, require_mac: bool) -> LoginClientInfo {
         LoginClientInfo {
             ak_context_type: "imessage".to_string(),
             client_app_name: "Messages".to_string(),
             client_bundle_id: "com.apple.MobileSMS".to_string(),
-            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)"),
-            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)"),
+            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
+            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
             akd_user_agent: "akd/1.0 CFNetwork/1494.0.7 Darwin/23.4.0".to_string(),
             browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
             hardware_headers: self.get_gsa_hardware_headers(),
             push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
-            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)"),
+            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)", require_mac),
         }
     }
 }

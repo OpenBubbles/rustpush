@@ -75,7 +75,7 @@ async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver
 
     let mut base_headers = anisette.get_headers().await?.clone();
 
-    base_headers.insert("X-Mme-Client-Info".to_string(), config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.findmy/375.20)"));
+    base_headers.insert("X-Mme-Client-Info".to_string(), config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.findmy/375.20)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
 
     map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 

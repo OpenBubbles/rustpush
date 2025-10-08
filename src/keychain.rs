@@ -1892,7 +1892,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
 
-        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)"));
+        base_headers.insert("X-Mme-Client-Info".to_string(), self.config.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.sbd/638.100.48)", !base_headers["X-Mme-Client-Info"].contains("iPhone OS")));
 
         map.extend(base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())));
 
