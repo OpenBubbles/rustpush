@@ -522,7 +522,7 @@ pub struct ResourceManager<T: Resource> {
     name: &'static str,
     pub resource: Arc<T>,
     refreshed_at: Mutex<SystemTime>,
-    request_retries: mpsc::Sender<oneshot::Sender<Result<(), ResourceFailure>>>,
+    request_retries: broadcast::Sender<Result<(), ResourceFailure>>,
     retry_signal: mpsc::Sender<()>,
     retry_now_signal: mpsc::Sender<()>,
     death_signal: Option<mpsc::Sender<()>>,
@@ -541,9 +541,7 @@ impl<T: Resource> Deref for ResourceManager<T> {
 impl<T: Resource> Drop for ResourceManager<T> {
     fn drop(&mut self) {
         let my_ref = self.death_signal.take().expect("Death empty; already dropped?");
-        tokio::spawn(async move {
-            my_ref.send(()).await.unwrap()
-        });
+        let _ = my_ref.try_send(());
     }
 }
 
@@ -570,17 +568,17 @@ pub enum ResourceState {
 
 impl<T: Resource + 'static> ResourceManager<T> {
     pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, generate_timeout: Duration, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
-        let (retry_send, mut retry_recv) = mpsc::channel::<oneshot::Sender<Result<(), ResourceFailure>>>(99999);
-        let (sig_send, mut sig_recv) = mpsc::channel(99999);
-        let (retry_now_send, mut retry_now_recv) = mpsc::channel(99999);
-        let (death_send, mut death_recv) = mpsc::channel(99999);
+        let (retry_send, _) = broadcast::channel::<Result<(), ResourceFailure>>(9999);
+        let (sig_send, mut sig_recv) = mpsc::channel(1);
+        let (retry_now_send, mut retry_now_recv) = mpsc::channel(1);
+        let (death_send, mut death_recv) = mpsc::channel(1);
         let (generated_send, _) = broadcast::channel(99);
 
         let manager = Arc::new(ResourceManager {
             name,
             resource,
             refreshed_at: Mutex::new(SystemTime::UNIX_EPOCH),
-            request_retries: retry_send,
+            request_retries: retry_send.clone(),
             retry_signal: sig_send,
             retry_now_signal: retry_now_send,
             death_signal: Some(death_send),
@@ -592,12 +590,10 @@ impl<T: Resource + 'static> ResourceManager<T> {
 
         let loop_manager = manager.clone();
         tokio::spawn(async move {
-            let mut resolve_items = move |result: Result<(), ResourceFailure>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
+            let resolve_items = move |result: Result<(), ResourceFailure>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
                 while let Ok(_) = sig_recv.try_recv() { }
                 while let Ok(_) = sig_recv_now.try_recv() { }
-                while let Ok(item) = retry_recv.try_recv() {
-                    let _ = item.send(result.clone());
-                }
+                let _ = retry_send.send(result.clone());
             };
 
             'stop: loop {
@@ -674,7 +670,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
     }
 
     pub async fn request_update(&self) {
-        self.retry_signal.send(()).await.unwrap();
+        let _ = self.retry_signal.try_send(());
     }
 
     pub async fn refresh(&self) -> Result<(), PushError> {
@@ -694,14 +690,13 @@ impl<T: Resource + 'static> ResourceManager<T> {
         if elapsed < MAX_RESOURCE_REGEN {
             return Ok(())
         }
-        let (send, confirm) = oneshot::channel();
-        self.request_retries.send(send).await.unwrap();
+        let mut subscribe = self.request_retries.subscribe();
         if now {
-            self.retry_now_signal.send(()).await.unwrap();
+            let _ = self.retry_now_signal.try_send(());
         } else {
-            self.retry_signal.send(()).await.unwrap();
+            let _ = self.retry_signal.try_send(());
         }
-        Ok(tokio::time::timeout(MAX_RESOURCE_WAIT, confirm).await.map_err(|_| PushError::ResourceTimeout)?.unwrap()?)
+        Ok(tokio::time::timeout(MAX_RESOURCE_WAIT, subscribe.recv()).await.map_err(|_| PushError::ResourceTimeout)?.unwrap()?)
     }
 
 }

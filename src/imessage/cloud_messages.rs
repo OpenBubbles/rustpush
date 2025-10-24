@@ -27,7 +27,7 @@ use cloudkit_proto::RecordIdentifier;
 use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -287,6 +287,26 @@ where
     T: Message,
 {
     x.as_ref().map(|a| Data::new(a.encode_to_vec())).serialize(s)
+}
+
+#[derive(CloudKitRecord, Debug, Default, Clone)]
+#[cloudkit_record(type = "MessagesSummary")]
+pub struct CloudMessageSummary {
+    #[cloudkit(rename = "MessageEncryptedV3")]
+    pub messages_summary: Vec<i64>,
+    #[cloudkit(rename = "chatEncryptedv2")]
+    pub chat_summary: Vec<i64>,
+    #[cloudkit(rename = "attachment")]
+    pub attachment_summary: Vec<i64>
+}
+
+impl CloudMessageSummary {
+    fn merge(mut self, other: Self) -> Self {
+        self.attachment_summary.extend(other.attachment_summary);
+        self.chat_summary.extend(other.chat_summary);
+        self.messages_summary.extend(other.messages_summary);
+        self
+    }
 }
 
 #[derive(CloudKitRecord, Debug, Default, Clone)]
@@ -562,6 +582,37 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         }
 
         Ok(())
+    }
+
+    async fn count_zone_records(&self, zone: &str) -> Result<CloudMessageSummary, PushError> {
+        let container = self.get_container().await?;
+
+        let zone = container.private_zone(zone.to_string());
+
+        let session = CloudKitSession::new();
+        let (mut results, _assets) = container.perform(&session, QueryRecordOperation::new(
+            &ALL_ASSETS,
+            zone,
+            cloudkit_proto::Query {
+                types: vec![crate::cloudkit_proto::record::Type { name: Some("MessagesSummary".to_string()) }],
+                filters: vec![],
+                sorts: vec![],
+                distinct: None,
+                query_operator: None,
+            }
+        )).await?;
+
+        Ok(if !results.is_empty() {
+            results.remove(0).result
+        } else { Default::default() })
+    }
+
+    pub async fn count_records(&self) -> Result<CloudMessageSummary, PushError> {
+        let mut def = CloudMessageSummary::default();
+        for zone in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
+            def = def.merge(self.count_zone_records(zone).await?);
+        }
+        Ok(def)
     }
 
     pub async fn reset(&self) -> Result<(), PushError> {

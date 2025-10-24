@@ -79,12 +79,17 @@ pub struct StorageData {
 
 #[derive(Deserialize, Debug)]
 pub struct StorageUsageByMedia {
+    #[serde(default)]
     pub display_label: String,
+    #[serde(default)]
     pub display_color: String,
     pub usage_in_bytes: u64,
     pub media_key: String,
+    #[serde(default)]
     pub display_color_dark: String,
+    #[serde(default)]
     pub text_color: String,
+    #[serde(default)]
     pub text_color_dark: String,
 }
 
@@ -218,7 +223,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();
 
-    if let Some(error) = parsed_dict.get("ErrorID") {
+    if let Some(error) = parsed_dict.get("localizedError") {
         let error = error.as_string().unwrap();
         return Err(PushError::MobileMeError(error.to_string(), parsed_dict.get("description").and_then(|d| d.as_string().map(|s| s.to_string()))));
     }
@@ -623,10 +628,10 @@ impl CircleEncryptedChannel {
         }).unwrap()
     }
 
-    fn decrypt(payload: &[u8], key: [u8; 16]) -> Vec<u8> {
-        let _self: CircleEncryptedPayload = rasn::der::decode(payload).unwrap();
+    fn decrypt(payload: &[u8], key: [u8; 16]) -> Option<Vec<u8>> {
+        let _self: CircleEncryptedPayload = rasn::der::decode(payload).ok()?;
         let cipher = Aes128Gcm16ByteNonce::new(&key.into());
-        cipher.decrypt(Nonce::from_slice(&_self.iv), &*[&_self.ciphertext[..], &_self.tag[..]].concat()).unwrap()
+        cipher.decrypt(Nonce::from_slice(&_self.iv), &*[&_self.ciphertext[..], &_self.tag[..]].concat()).ok()
     }
 
     fn encrypt_to_client(&self, data: &[u8]) -> Vec<u8> {
@@ -634,14 +639,14 @@ impl CircleEncryptedChannel {
     }
 
     fn decrypt_from_server(&self, data: &[u8]) -> Vec<u8> {
-        Self::decrypt(data, self.recv_send)
+        Self::decrypt(data, self.recv_send).expect("Circle Decrypt Failed")
     }
 
     fn encrypt_to_server(&self, data: &[u8]) -> Vec<u8> {
         Self::encrypt(data, self.send_recv)
     }
 
-    fn decrypt_from_client(&self, data: &[u8]) -> Vec<u8> {
+    fn decrypt_from_client(&self, data: &[u8]) -> Option<Vec<u8>> {
         Self::decrypt(data, self.send_recv)
     }
 }
@@ -1016,14 +1021,17 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                 let step4: CircleStep4 = rasn::der::decode(&base64_decode(pake)).expect("failed to decode circlestep0");
 
                 let channel = self.channel.as_ref().unwrap();
-                let wrapper = channel.decrypt_from_client(&step4.welcome);
 
                 let is_in_clique = if let Some(tp) = &self.trusted_peers {
                     tp.is_in_clique().await
                 } else { false };
                 use prost::Message;
 
-                let wrapper = OctagonWrapper::decode(Cursor::new(&wrapper));
+                let wrapper = if let Some(wrapper) = channel.decrypt_from_client(&step4.welcome) {
+                    OctagonWrapper::decode(Cursor::new(&wrapper)).map(|i| i.inner.unwrap())
+                } else {
+                    OctagonPairingMessage::decode(Cursor::new(&step4.welcome))
+                };
 
                 if !is_in_clique || wrapper.is_err() {
                     // Let's just say "I don't have them", because, well, I don't
@@ -1041,7 +1049,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
                     return Ok(true)
                 }
 
-                let wrapper = wrapper.unwrap().inner.unwrap().step4.unwrap();
+                let wrapper = wrapper.unwrap().step4.unwrap();
                 let cuttlefish_peer = EncodedPeer(CuttlefishPeer {
                     hash: wrapper.peer_id,
                     permanent_info: Some(SignedInfo { info: wrapper.permanent_info, signature: wrapper.permanent_info_sig }),
