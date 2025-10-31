@@ -2,6 +2,7 @@ use std::{collections::HashMap, io::Cursor, marker::PhantomData, str::FromStr, s
 
 use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
+use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, CircleSendMessage, LoginState};
 use log::{debug, info, warn};
@@ -17,8 +18,9 @@ use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
 use rand::Rng;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
+use deku::{DekuContainerWrite, DekuUpdate};
 
-use crate::{aps::{get_message, APSInterestToken}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient}, util::{base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip, KeyPair, IDS_BAG, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient}, util::{IDS_BAG, KeyPair, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -272,7 +274,7 @@ struct AuthCertResponse {
     cert: Data,
 }
 
-async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, user_type: IDSUserType) -> Result<IDSUser, PushError> {
+fn generate_auth_csr(user_id: &str) -> Result<(PKey<Private>, Vec<u8>), PushError> {
     let key = PKey::from_rsa(Rsa::generate(2048)?)?;
     
     let mut name = X509Name::builder()?;
@@ -284,9 +286,15 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
     csr.set_subject_name(&name.build())?;
     csr.sign(&key, MessageDigest::sha1())?;
 
+    Ok((key, csr.build().to_der()?))
+}
+
+async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, user_type: IDSUserType) -> Result<IDSUser, PushError> {
+    let (key, csr) = generate_auth_csr(user_id)?;
+
     let auth_cert = AuthCertRequest {
         authentication_data: request,
-        csr: csr.build().to_der()?.into(),
+        csr: csr.into(),
         realm_user_id: user_id.to_string(),
     };
 
@@ -335,6 +343,104 @@ pub async fn authenticate_apple(ids_delegate: IDSDelegateResponse, os_config: &d
 
 pub async fn authenticate_phone(number: &str, phone: AuthPhone, os_config: &dyn OSConfig) -> Result<IDSUser, PushError> {
     authenticate(os_config, &format!("P:{number}"), plist::to_value(&phone)?, IDSUserType::Phone).await
+}
+
+pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_config: &dyn OSConfig, aps: &APSConnection) -> Result<IDSUser, PushError> {
+
+    #[derive(DekuWrite, Clone, Debug)]
+    #[deku(endian = "big")]
+    struct SMSLessSig {
+        header: u16,
+        domain_len: u8,
+        domain: Vec<u8>,
+        carrier_len: u16,
+        carrier: Vec<u8>,
+    }
+
+    let stripped_host =  Url::parse(host).expect("Failed to parse host").domain().expect("No domain name?").to_string();
+    let sig_data = base64_decode(&auth.signature);
+    let sig = SMSLessSig {
+        header: 0x0200,
+        domain_len: stripped_host.len() as u8,
+        domain: stripped_host.as_bytes().to_vec(),
+        carrier_len: sig_data.len() as u16,
+        carrier: sig_data,
+    };
+    
+
+    let user_id = format!("P:{}", auth.phone_number);
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct SmslessAuthRequest {
+        csr: Data,
+        sig: Data,
+        tag: String,
+        user_id: String,
+    }
+
+    let (key, csr) = generate_auth_csr(&user_id)?;
+
+    let request = SmslessAuthRequest {
+        csr: csr.into(),
+        sig: sig.to_bytes()?.into(),
+        tag: "SIM1".to_string(),
+        user_id: user_id.clone(),
+    };
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct AuthMultipleUsers {
+        push_token: Data,
+        authentication_requests: Vec<SmslessAuthRequest>,
+    }
+
+    let users = AuthMultipleUsers {
+        push_token: aps.get_token().await.to_vec().into(),
+        authentication_requests: vec![request]
+    };
+
+    let url = get_bag(IDS_BAG, "id-authenticate-multiple-users").await?.into_string().unwrap();
+
+    let resp = REQWEST.post(url)
+        .header("user-agent", format!("com.apple.invitation-registration {}", os_config.get_version_ua()))
+        .header("x-protocol-version", os_config.get_protocol_version())
+        .header("content-encoding", "gzip")
+        .body(gzip_normal(&plist_to_buf(&users)?)?)
+        .send().await?
+        .bytes().await?;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct ResponseMultipleUsers {
+        authentication_responses: Vec<SmslessAuthResponse>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct SmslessAuthResponse {
+        cert: Data,
+        user_id: String,
+        status: u32,
+    }
+
+    let mut result: ResponseMultipleUsers = plist::from_bytes(&resp)?;
+
+    let response = result.authentication_responses.remove(0);
+
+    if response.status != 0 {
+        return Err(PushError::CertError(plist::from_bytes(&resp)?))
+    }
+
+    let keypair = KeyPair { cert: response.cert.into(), private: key.private_key_to_der()? };
+    
+    Ok(IDSUser {
+        auth_keypair: keypair,
+        user_id: user_id.to_string(),
+        registration: HashMap::new(),
+        user_type: IDSUserType::Phone,
+        protocol_version: os_config.get_protocol_version(),
+    })
 }
 
 pub enum NonceType {

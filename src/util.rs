@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, Range};
@@ -23,8 +24,9 @@ use base64::Engine;
 use prost::Message;
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Certificate, Client, Proxy};
-use serde::de::value;
+use serde::de::{DeserializeOwned, value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::select;
@@ -35,12 +37,12 @@ use uuid::Uuid;
 use std::io::{Write, Read};
 use std::fmt::{Display, Write as FmtWrite};
 
-use rand::thread_rng;
+use rand::{Rng, thread_rng};
 use rand::seq::SliceRandom;
 use futures::FutureExt;
 
 use crate::ids::CompactECKey;
-use crate::PushError;
+use crate::{APSConnection, OSConfig, PushError};
 
 pub const APNS_BAG: &str = "http://init-p01st.push.apple.com/bag";
 pub const IDS_BAG: &str = "https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3";
@@ -453,11 +455,51 @@ impl CarrierAddress {
 #[serde(rename_all = "PascalCase")]
 struct Carrier {
     phone_number_registration_gateway_address: CarrierAddress,
+    carrier_entitlements: CarrierEntitlements,
 }
 
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
-pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> {
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CarrierEntitlements {
+    server_address: String,
+    user_agent: Option<String>,
+    protocol_version: Option<String>,
+}
+
+impl CarrierEntitlements {
+    async fn invoke(&self, requests: &[serde_json::Value], config: &dyn OSConfig) -> Result<Vec<serde_json::Value>, PushError> {
+        let user_agent = self.user_agent.as_ref().map(|i| i.as_str()).unwrap_or("Entitlement/$version ($device) iOS/$iOSVersion ($build) Carrier Settings/$carrierBundleVersion")
+            .replace("$version", "2")
+            .replace("$device", "iPhone")
+            .replace("$iOSVersion", &config.get_debug_meta().user_version)
+            .replace("$build", &config.get_register_meta().software_version);
+
+        let value = gzip_normal(&serde_json::to_vec(requests)?)?;
+
+        Ok(REQWEST.post(&self.server_address)
+            .header("Content-Type", "application/json")
+            .header("x-country-iso-code", "us")
+            .header("Accept", "application/json")
+            .header("Content-Encoding", "gzip")
+            .header("User-Agent", format!("{} Carrier Settings/50.0.2", user_agent))
+            .header("Accept-Language", "en")
+            .header("Accept-Encoding", "gzip")
+            .header("x-protocol-version", self.protocol_version.as_ref().map(|i| i.as_str()).unwrap_or("2"))
+            .body(value)
+            .send().await?
+            .json().await?)
+    }
+}
+
+pub struct CarrierConfig {
+    pub gateway: String,
+    carrier: CarrierEntitlements,
+}
+
+pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, PushError> {
     let data = REQWEST.get(CARRIER_CONFIG)
         .send().await?;
     
@@ -482,11 +524,130 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<String, PushError> 
         let mut out = vec![];
         archive.by_name(&carrier.to_string()).unwrap().read_to_end(&mut out)?;
 
+        info!("here {:?}", plist::from_bytes::<Value>(&out)?);
+
         let parsed_file: Carrier = plist::from_bytes(&out)?;
-        return Ok(parsed_file.phone_number_registration_gateway_address.vec().choose(&mut thread_rng()).ok_or(PushError::CarrierNotFound)?.clone())
+        return Ok(CarrierConfig {
+            gateway: parsed_file.phone_number_registration_gateway_address.vec().choose(&mut thread_rng()).ok_or(PushError::CarrierNotFound)?.clone(),
+            carrier: parsed_file.carrier_entitlements,
+        })
     }
 
     Err(PushError::CarrierNotFound)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct EntitlementAuthState {
+    device_account_identifier: String,
+    unique_id: String,
+    token: Option<String>,
+    subscriber: String,
+    mccmnc: String,
+}
+
+fn find_entitlement_result<T: DeserializeOwned>(entitlements: &[serde_json::Value], id: u64) -> Result<T, PushError> {
+    let entitlement = entitlements.iter().find(|i| {
+        let serde_json::Value::Object(o) = i else { return false };
+        let Some(serde_json::Value::Number(n)) = o.get("response-id") else { return false };
+        n.as_u64().expect("not u64") == id
+    }).expect("Entitlement response not found!");
+    Ok(serde_json::from_value(entitlement.clone())?)
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct PhoneNumberResponse {
+    pub phone_number: String,
+    pub signature: String,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct EntitlementsResponse {
+    pub phone: PhoneNumberResponse,
+    pub host: String,
+}
+
+impl EntitlementAuthState {
+
+    pub fn new(subscriber: String, mccmnc: String, imei: String) -> Self {
+        Self {
+            device_account_identifier: Uuid::new_v4().to_string().to_uppercase(),
+            unique_id: imei,
+            subscriber,
+            mccmnc,
+            token: None,
+        }
+    }
+
+    pub async fn get_entitlements<Fut: Future<Output = Result<String, PushError>>>(&mut self, config: &dyn OSConfig, aps: &APSConnection, process_challenge: impl FnOnce(String) -> Fut) -> Result<EntitlementsResponse, PushError> {
+        let entitlements = get_gateways_for_mccmnc(&self.mccmnc).await?.carrier;
+
+        let mut starting_id = rand::thread_rng().gen_range(3..5);
+
+        let auth_challenge = if let Some(token) = &self.token {
+            json!({
+                "device-account-identifier": &self.device_account_identifier,
+                "auth-type": "EAP-AKA",
+                "action-name": "getAuthentication",
+                "subscriber-id": base64_encode(&[b"\x02\x00\x00;\x01", self.subscriber.as_bytes()].concat()),
+                "request-id": starting_id,
+                "unique-id": &self.unique_id,
+                "token": token,
+            })
+        } else {
+            let challenge = entitlements.invoke(&[
+                json!({
+                    "device-account-identifier": &self.device_account_identifier,
+                    "auth-type": "EAP-AKA",
+                    "action-name": "getAuthentication",
+                    "subscriber-id": base64_encode(&[b"\x02\x00\x00;\x01", self.subscriber.as_bytes()].concat()),
+                    "request-id": starting_id,
+                    "unique-id": &self.unique_id
+                })
+            ], config).await?;
+
+            #[derive(Deserialize)]
+            struct ChallengeResponse {
+                challenge: String,
+            }
+            let result: ChallengeResponse = find_entitlement_result(&challenge, starting_id)?;
+
+            let response = process_challenge(result.challenge).await?;
+
+            starting_id = rand::thread_rng().gen_range(10..13);
+
+            json!({
+                "payload": response,
+                "action-name": "postChallenge",
+                "request-id": starting_id,
+            })
+        };
+
+        let response = entitlements.invoke(&[
+            auth_challenge,
+            json!({
+                "client-nonce": base64_encode(&aps.get_token().await),
+                "action-name": "getPhoneNumber",
+                "request-id": starting_id + 1,
+            })
+        ], config).await?;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct AuthResponse {
+            token: String,
+        }
+
+        let auth: AuthResponse = find_entitlement_result(&response, starting_id)?;
+        self.token = Some(auth.token);
+
+        let phone: PhoneNumberResponse = find_entitlement_result(&response, starting_id + 1)?;
+
+        Ok(EntitlementsResponse {
+            phone,
+            host: entitlements.server_address.clone()
+        })
+    }
 }
 
 

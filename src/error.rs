@@ -187,4 +187,6 @@ pub enum PushError {
     MasterKeyNotFound,
     #[error("Resource Stalled!")]
     ResourceStalled,
+    #[error("ICC Auth failed!")]
+    ICCAuthFailed,
 }
