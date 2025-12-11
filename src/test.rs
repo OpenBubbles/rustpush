@@ -501,6 +501,16 @@ async fn main() {
                             client.identity.certify_delivery("com.apple.madrid", &context, false).await.unwrap();
                         }
                     }
+                    //automatically keep audio messages
+                    if let Message::Message(normal_message) = &msg.message {
+                        if normal_message.voice {
+                            if let Some(conversation_data) = msg.conversation.clone() {
+                                let mut keep_msg = MessageInst::new(conversation_data, &handle, Message::Keep);
+                                keep_msg.id = msg.id.clone();
+                                client.send(&mut keep_msg).await.unwrap();
+                            }
+                        }
+                    }
                 }
             },
             input = &mut read_task => {
