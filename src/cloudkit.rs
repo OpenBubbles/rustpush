@@ -866,7 +866,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             Err(PushError::CloudKitError(cloudkit_proto::response_operation::Result { 
                 error: Some(cloudkit_proto::response_operation::result::Error {
                     client_error: Some(cloudkit_proto::response_operation::result::error::Client {
-                        r#type: Some(48), // zone not found
+                        r#type: Some(48 | 59), // zone not found or user deleted data
                     }),
                     ..
                 }),
