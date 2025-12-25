@@ -4,7 +4,7 @@ use aes_gcm::{aead::AeadMutInPlace, AeadCore, Aes256Gcm, Nonce};
 use aes_gcm::aead::Aead;
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use omnisette::AnisetteProvider;
 use openssl::{hash::MessageDigest, pkey::{Private, Public}, sha::{sha1, sha256}, sign::Verifier};
 use plist::{Data, Dictionary, Value};
@@ -12,11 +12,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use statuskitp::{AllocatedChannel, ChannelAllocateRequest, ChannelAllocateResponse, ChannelAuth, ChannelPublishMessage, ChannelPublishRequest, ChannelPublishResponse, PublishedStatus, SharedKey, SharedKeys, SharedMessage};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use uuid::Uuid;
 use rand::{rngs::OsRng, RngCore};
 
-use crate::{aps::{get_message, APSChannel, APSChannelIdentifier, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, Raw}, user::QueryOptions, CompactECKey, IDSRecvMessage}, util::{base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}, APSConnection, APSMessage, IdentityManager, OSConfig, PushError};
+use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{CompactECKey, IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
 use crate::util::{ec_serialize, ec_serialize_priv, bin_serialize, bin_deserialize, proto_serialize, proto_deserialize, ec_deserialize_priv_compact, ec_deserialize_compact, proto_serialize_vec, proto_deserialize_vec};
 use aes_gcm::KeyInit;
 
@@ -173,23 +173,14 @@ impl StatusKitStatus {
     }
 }
 
-pub struct ChannelInterestToken<T: AnisetteProvider + Send + Sync + 'static> {
+pub struct ChannelInterestToken {
     topics: Vec<APSChannelIdentifier>,
-    client: Arc<StatusKitClient<T>>,
+    topics_channel: mpsc::Sender<(Vec<APSChannelIdentifier>, bool)>,
 }
 
-impl<T: AnisetteProvider + Send + Sync + 'static> Drop for ChannelInterestToken<T> {
+impl Drop for ChannelInterestToken {
     fn drop(&mut self) {
-        // we don't care if it succeeds or not; we want to decrement no matter what
-        let status_kit_ref = self.client.clone();
-        let topics = self.topics.clone();
-        tokio::spawn(async move {
-            let mut topic_lock = status_kit_ref.active_channels.lock().await;
-            for topic in &topics {
-                *topic_lock.entry(topic.clone()).or_default() -= 1;
-            }
-            let _ = status_kit_ref.update_channels(&mut *topic_lock).await; // not much we can do
-        });
+        self.topics_channel.try_send((self.topics.clone(), false)).expect("Channel backed up??");
     }
 }
 
@@ -332,23 +323,26 @@ pub struct StatusKitClient<T: AnisetteProvider> {
     config: Arc<dyn OSConfig>,
     pub state: RwLock<StatusKitState>,
     update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>,
-    active_channels: Mutex<HashMap<APSChannelIdentifier, u64>>, // *wanted* channels (with interest token)
+    active_channels: Mutex<HashSet<APSChannelIdentifier>>, // *wanted* channels (with interest token)
+    topics: mpsc::Sender<(Vec<APSChannelIdentifier>, bool)>,
     published_channels: RwLock<HashSet<APSChannelIdentifier>>, // currently subscribed channels, from the POV of APNs
-    account: Arc<Mutex<AppleAccount<T>>>,
+    token_provider: Arc<TokenProvider<T>>,
 }
 
 impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
-    pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, account: Arc<Mutex<AppleAccount<T>>>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<Self> {
+    pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, account: Arc<TokenProvider<T>>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<Self> {
+        let (topics_sender, mut topics_receiver) = mpsc::channel(32);
         let skclient = Arc::new(Self {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await.0,
+            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await,
             conn: conn.clone(),
             identity,
             config,
             state: RwLock::new(state),
             update_state,
-            active_channels: Mutex::new(HashMap::new()),
+            active_channels: Mutex::new(HashSet::new()),
+            topics: topics_sender,
             published_channels: RwLock::new(HashSet::new()),
-            account
+            token_provider: account
         });
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -364,6 +358,38 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
                     },
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        let topic_manager = Arc::downgrade(&skclient);
+        tokio::spawn(async move {
+            let mut topics: HashMap<APSChannelIdentifier, usize> = HashMap::new();
+            loop {
+                let Some((subject_topics, add)) = topics_receiver.recv().await else { break };
+                info!("Got order for topics {:?} {add}", subject_topics);
+                for topic in subject_topics {
+                    let entry = topics.entry(topic.clone()).or_default();
+                    if add {
+                        *entry += 1;
+                    } else {
+                        *entry -= 1;
+                    }
+
+                    if *entry == 0 {
+                        topics.remove(&topic);
+                    }
+                }
+
+                if topics_receiver.is_empty() {
+                    let Some(upgrade) = topic_manager.upgrade() else { break };
+
+                    let current_topics = topics.keys().cloned().collect::<HashSet<_>>();
+                    // helpfully, this will also block if we are currently initalizing topics from cache.
+                    *upgrade.active_channels.lock().await = current_topics.clone();
+                    
+                    // if this fails we'll refilter current topics on regen
+                    let _ = tokio::time::timeout(Duration::from_secs(10), upgrade.update_channels(&current_topics)).await;
                 }
             }
         });
@@ -456,7 +482,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         }
         drop(state);
 
-        let Some(token) = self.account.lock().await.get_token("com.apple.gs.sharedchannels.auth").await else {
+        let Some(token) = self.token_provider.get_gsa_token("com.apple.gs.sharedchannels.auth").await else {
             return Err(PushError::StatusKitAuthMissing)
         };
 
@@ -493,10 +519,8 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         Ok(())
     }
 
-    pub async fn update_channels(&self, new_channels: &mut HashMap<APSChannelIdentifier, u64>) -> Result<(), PushError> {
-        new_channels.retain(|_k, v| *v > 0);
-        
-        let mut wanted_channels: HashSet<APSChannelIdentifier> = new_channels.keys().cloned().collect();
+    pub async fn update_channels(&self, new_channels: &HashSet<APSChannelIdentifier>) -> Result<(), PushError> {
+        let mut wanted_channels: HashSet<APSChannelIdentifier> = new_channels.clone();
         debug!("Statuskit wants {} channels", wanted_channels.len());
         let state = self.state.read().await;
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -552,7 +576,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         }
 
         let mut existing = self.published_channels.write().await;
-        *existing = new_channels.keys().cloned().collect();
+        *existing = wanted_channels;
         
         Ok(())
     }
@@ -606,7 +630,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
     pub async fn share_status(&self, status: &StatusKitStatus) -> Result<(), PushError> {
         self.ensure_channel().await?;
 
-        let Some(token) = self.account.lock().await.get_token("com.apple.gs.sharedchannels.auth").await else {
+        let Some(token) = self.token_provider.get_gsa_token("com.apple.gs.sharedchannels.auth").await else {
             return Err(PushError::StatusKitAuthMissing)
         };
 
@@ -675,7 +699,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         Ok(())
     }
 
-    pub async fn request_handles(self: &Arc<Self>, handles: &[String]) -> (ChannelInterestToken<T>, Option<PushError>) {
+    pub async fn request_handles(self: &Arc<Self>, handles: &[String]) -> ChannelInterestToken {
         let state_lock = self.state.read().await;
         let topics = state_lock.keys.iter().filter(|(c, d)| handles.contains(&d.from)).map(|(c, _)| APSChannelIdentifier {
             topic: "com.apple.icloud.presence.mode.status".to_string(),
@@ -686,12 +710,9 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
         self.request_channels(topics).await
     }
 
-    pub async fn request_channels(self: &Arc<Self>, topics: Vec<APSChannelIdentifier>) -> (ChannelInterestToken<T>, Option<PushError>) {
-        let mut channel_lock = self.active_channels.lock().await;
-        for topic in &topics {
-            *channel_lock.entry(topic.clone()).or_default() += 1;
-        }
-        (ChannelInterestToken { topics, client: self.clone() }, self.update_channels(&mut *channel_lock).await.err())
+    pub async fn request_channels(self: &Arc<Self>, topics: Vec<APSChannelIdentifier>) -> ChannelInterestToken {
+        self.topics.send((topics.clone(), true)).await.expect("Channel closed!!d");
+        ChannelInterestToken { topics, topics_channel: self.topics.clone() }
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<StatusKitMessage>, PushError> {

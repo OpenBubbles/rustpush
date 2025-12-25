@@ -3,6 +3,7 @@ use std::future::Future;
 use std::io::Cursor;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, Range};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,7 @@ use base64::engine::general_purpose;
 use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::hmac::Hmac;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
-use log::{debug, info};
+use log::{debug, info, warn};
 use openssl::derive::Deriver;
 use openssl::ec::EcKey;
 use openssl::nid::Nid;
@@ -32,6 +33,7 @@ use thiserror::Error;
 use tokio::select;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::error::Elapsed;
 use tokio_rustls::client;
 use uuid::Uuid;
 use std::io::{Write, Read};
@@ -80,7 +82,7 @@ fn build_proxy() -> Client {
 
     reqwest::Client::builder()
         .use_rustls_tls()
-        .proxy(Proxy::https("https://192.168.99.87:8080").unwrap())
+        .proxy(Proxy::https("https://192.168.99.71:8080").unwrap())
         .default_headers(headers)
         .http1_title_case_headers()
         .danger_accept_invalid_certs(true)
@@ -108,6 +110,18 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     }
 
     builder.build().unwrap()
+});
+
+pub static CARRIER_REQWEST: LazyLock<Client> = LazyLock::new(|| {
+    let mut headers = HeaderMap::new();
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+
+    reqwest::Client::builder()
+        // we need native TLS because carriers suck at providing modern TLS ciphers (with PFS)
+        .use_native_tls()
+        .default_headers(headers.clone())
+        .http1_title_case_headers()
+        .build().unwrap()
 });
 
 pub fn get_nested_value<'s>(val: &'s Value, path: &[&str]) -> Option<&'s Value> {
@@ -455,7 +469,7 @@ impl CarrierAddress {
 #[serde(rename_all = "PascalCase")]
 struct Carrier {
     phone_number_registration_gateway_address: CarrierAddress,
-    carrier_entitlements: CarrierEntitlements,
+    carrier_entitlements: Option<CarrierEntitlements>,
 }
 
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
@@ -479,7 +493,7 @@ impl CarrierEntitlements {
 
         let value = gzip_normal(&serde_json::to_vec(requests)?)?;
 
-        Ok(REQWEST.post(&self.server_address)
+        Ok(CARRIER_REQWEST.post(&self.server_address)
             .header("Content-Type", "application/json")
             .header("x-country-iso-code", "us")
             .header("Accept", "application/json")
@@ -496,7 +510,7 @@ impl CarrierEntitlements {
 
 pub struct CarrierConfig {
     pub gateway: String,
-    carrier: CarrierEntitlements,
+    carrier: Option<CarrierEntitlements>,
 }
 
 pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, PushError> {
@@ -580,7 +594,7 @@ impl EntitlementAuthState {
     }
 
     pub async fn get_entitlements<Fut: Future<Output = Result<String, PushError>>>(&mut self, config: &dyn OSConfig, aps: &APSConnection, process_challenge: impl FnOnce(String) -> Fut) -> Result<EntitlementsResponse, PushError> {
-        let entitlements = get_gateways_for_mccmnc(&self.mccmnc).await?.carrier;
+        let entitlements = get_gateways_for_mccmnc(&self.mccmnc).await?.carrier.ok_or(PushError::ICCAuthUnsupported)?;
 
         let mut starting_id = rand::thread_rng().gen_range(3..5);
 
@@ -686,7 +700,7 @@ pub struct ResourceManager<T: Resource> {
     request_retries: broadcast::Sender<Result<(), ResourceFailure>>,
     retry_signal: mpsc::Sender<()>,
     retry_now_signal: mpsc::Sender<()>,
-    death_signal: Option<mpsc::Sender<()>>,
+    death_signal: mpsc::Sender<()>,
     pub generated_signal: broadcast::Sender<()>,
     pub resource_state: watch::Sender<ResourceState>,
 }
@@ -701,8 +715,8 @@ impl<T: Resource> Deref for ResourceManager<T> {
 
 impl<T: Resource> Drop for ResourceManager<T> {
     fn drop(&mut self) {
-        let my_ref = self.death_signal.take().expect("Death empty; already dropped?");
-        let _ = my_ref.try_send(());
+        debug!("Resource {} dropped!", self.name);
+        let _ = self.death_signal.try_send(());
     }
 }
 
@@ -724,7 +738,8 @@ impl Display for ResourceFailure {
 pub enum ResourceState {
     Generated,
     Generating,
-    Failed (ResourceFailure)
+    Failed (ResourceFailure),
+    Closed,
 }
 
 impl<T: Resource + 'static> ResourceManager<T> {
@@ -742,14 +757,17 @@ impl<T: Resource + 'static> ResourceManager<T> {
             request_retries: retry_send.clone(),
             retry_signal: sig_send,
             retry_now_signal: retry_now_send,
-            death_signal: Some(death_send),
+            death_signal: death_send,
             generated_signal: generated_send.clone(),
             resource_state: watch::channel(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }).0,
         });
 
         let mut current_resource = running_resource.unwrap_or_else(|| tokio::spawn(async {}));
 
-        let loop_manager = manager.clone();
+        let resource_name = manager.name;
+        let resource_state = manager.resource_state.clone();
+        let resource_ref = manager.resource.clone();
+        let loop_manager = Arc::downgrade(&manager);
         tokio::spawn(async move {
             let resolve_items = move |result: Result<(), ResourceFailure>, sig_recv: &mut mpsc::Receiver<()>, sig_recv_now: &mut mpsc::Receiver<()>| {
                 while let Ok(_) = sig_recv.try_recv() { }
@@ -758,26 +776,30 @@ impl<T: Resource + 'static> ResourceManager<T> {
             };
 
             'stop: loop {
-                debug!("Resource {}: waiting for retry reason", loop_manager.name);
+                debug!("Resource {}: waiting for retry reason", resource_name);
                 select! {
                     _ = &mut current_resource => {},
-                    _ = sig_recv.recv() => {},
-                    _ = retry_now_recv.recv() => {},
+                    res = sig_recv.recv() => if res.is_none() { break },
+                    res = retry_now_recv.recv() => if res.is_none() { break },
                     _ = death_recv.recv() => {
                         break // no retries
                     },
                 }
-                debug!("Resource {}: preparing", loop_manager.name);
+                debug!("Resource {}: preparing", resource_name);
                 current_resource.abort();
                 let mut backoff = backoff.build();
-                loop_manager.resource_state.send_replace(ResourceState::Generating);
-                debug!("Resource {}: generating", loop_manager.name);
-                let mut result = tokio::time::timeout(generate_timeout, 
-                loop_manager.resource.generate_unwind_safe()).await
-                    .map_err(|e| PushError::ResourceGenTimeout(e)).and_then(|e| e);
-                debug!("Resource {}: finished_generate", loop_manager.name);
+                resource_state.send_replace(ResourceState::Generating);
+                debug!("Resource {}: generating", resource_name);
+                let mut result = select! {
+                    resource = resource_ref.generate_unwind_safe() => resource,
+                    _ = tokio::time::sleep(generate_timeout) => Err(PushError::ResourceGenTimeout),
+                    _ = death_recv.recv() => {
+                        break // we're dead; we don't matter anymore.
+                    },
+                };
+                debug!("Resource {}: finished_generate", resource_name);
                 while let Err(e) = result {
-                    debug!("Resource {} {e}", loop_manager.name);
+                    debug!("Resource {} {e}", resource_name);
                     let shared_err = Arc::new(e);
                     let retry_in = backoff.next().unwrap();
 
@@ -788,49 +810,70 @@ impl<T: Resource + 'static> ResourceManager<T> {
                         error: shared_err
                     };
                     resolve_items(Err(failure.clone()), &mut sig_recv, &mut retry_now_recv);
-                    debug!("Resource {}: resource marking", loop_manager.name);
-                    loop_manager.resource_state.send_replace(ResourceState::Failed(failure));
+                    debug!("Resource {}: resource marking", resource_name);
+                    resource_state.send_replace(ResourceState::Failed(failure));
                     if is_final {
-                        debug!("Resource {}: final error; shutting down", loop_manager.name);
+                        debug!("Resource {}: final error; shutting down", resource_name);
                         break 'stop;
                     }
-                    debug!("Resource {}: task closed", loop_manager.name);
+                    debug!("Resource {}: task closed", resource_name);
                     select! {
                         _ = tokio::time::sleep(retry_in) => {},
-                        _ = retry_now_recv.recv() => {},
+                        res = retry_now_recv.recv() => if res.is_none() { break 'stop; },
                         _ = death_recv.recv() => {
                             break 'stop;
                         }
                     };
-                    debug!("Resource {}: retry generating lock", loop_manager.name);
-                    loop_manager.resource_state.send_replace(ResourceState::Generating);
-                    debug!("Resource {}: retry generating", loop_manager.name);
-                    result = loop_manager.resource.generate_unwind_safe().await;
+                    debug!("Resource {}: retry generating lock", resource_name);
+                    resource_state.send_replace(ResourceState::Generating);
+                    debug!("Resource {}: retry generating", resource_name);
+                    result = select! {
+                        resource = resource_ref.generate_unwind_safe() => resource,
+                        _ = tokio::time::sleep(generate_timeout) => Err(PushError::ResourceGenTimeout),
+                        _ = death_recv.recv() => {
+                            break 'stop; // we're dead; we don't matter anymore.
+                        },
+                    };
                 }
-                debug!("Resource {}: generated", loop_manager.name);
+                debug!("Resource {}: generated", resource_name);
                 current_resource = result.unwrap();
-                debug!("Resource {}: refreshed", loop_manager.name);
-                *loop_manager.refreshed_at.lock().await = SystemTime::now();
-                debug!("Resource {}: generated", loop_manager.name);
-                loop_manager.resource_state.send_replace(ResourceState::Generated);
-                debug!("Resource {}: done", loop_manager.name);
+                debug!("Resource {}: refreshed", resource_name);
+                if let Some(upgraded) = loop_manager.upgrade() {
+                    *upgraded.refreshed_at.lock().await = SystemTime::now();
+                } else {
+                    warn!("Broke on an edge??");
+                    break; // we're dead too.
+                }
+                debug!("Resource {}: generated", resource_name);
+                resource_state.send_replace(ResourceState::Generated);
+                debug!("Resource {}: done", resource_name);
                 let _ = generated_send.send(());
                 resolve_items(Ok(()), &mut sig_recv, &mut retry_now_recv);
             }
-            debug!("Resource {}: task closed", loop_manager.name);
+            resource_state.send_replace(ResourceState::Closed);
+            current_resource.abort();
+            debug!("Resource {}: task closed", resource_name);
         });
 
         manager
     }
 
-    pub async fn ensure_not_failed(&self) -> Result<(), PushError> {
-        if let ResourceState::Failed(error) = &*self.resource_state.borrow() {
-            return Err(error.clone().into())
+    pub async fn ensure_ready(&self) -> Result<(), PushError> {
+        // wait for any generation to finish
+        self.resource_state.subscribe().wait_for(|i| !matches!(i, ResourceState::Generating)).await.map_err(|_| PushError::ResourceClosed)?;
+        match &*self.resource_state.borrow() {
+            ResourceState::Failed(error) => Err(error.clone().into()),
+            ResourceState::Closed => Err(PushError::ResourceClosed),
+            _ => Ok(())
         }
-        Ok(())
+    }
+
+    pub fn close(&self) {
+        let _ = self.death_signal.try_send(());
     }
 
     pub async fn request_update(&self) {
+        info!("Requesting Update {}", self.name);
         let _ = self.retry_signal.try_send(());
     }
 
@@ -852,6 +895,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             return Ok(())
         }
         let mut subscribe = self.request_retries.subscribe();
+        info!("Retrying {now} {}", self.name);
         if now {
             let _ = self.retry_now_signal.try_send(());
         } else {

@@ -317,21 +317,13 @@ pub struct APSState {
 
 pub struct APSInterestToken {
     topics: Vec<&'static str>,
-    aps: APSConnection,
+    topics_channel: mpsc::Sender<(Vec<&'static str>, bool)>,
 }
 
 impl Drop for APSInterestToken {
     fn drop(&mut self) {
         // we don't care if it succeeds or not; we want to decrement no matter what
-        let aps_ref = self.aps.clone();
-        let topics = self.topics.clone();
-        tokio::spawn(async move {
-            let mut topic_lock = aps_ref.topics.lock().await;
-            for topic in &topics {
-                *topic_lock.entry(*topic).or_default() -= 1;
-            }
-            let _ = aps_ref.update_topics(&mut *topic_lock).await; // not much we can do
-        });
+        self.topics_channel.try_send((self.topics.clone(), false)).expect("APS backed up??");
     }
 }
 
@@ -343,7 +335,8 @@ pub struct APSConnectionResource {
     pub messages_cont: broadcast::Sender<APSMessage>,
     reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
-    topics: Mutex<HashMap<&'static str, u64>>,
+    topics: mpsc::Sender<(Vec<&'static str>, bool)>,
+    current_topics: Mutex<Vec<&'static str>>,
     sub_counter: AtomicU32,
 }
 
@@ -432,6 +425,7 @@ impl APSConnectionResource {
 
     pub async fn new(config: Arc<dyn OSConfig>, state: Option<APSState>) -> (APSConnection, Option<PushError>) {
         let (messages_cont, _) = broadcast::channel(9999);
+        let (topics_sender, mut topics_receiver) = mpsc::channel(32);
         let connection = Arc::new(APSConnectionResource {
             os_config: config,
             state: RwLock::new(state.unwrap_or_default()),
@@ -440,8 +434,9 @@ impl APSConnectionResource {
             messages_cont,
             reader: Mutex::new(None),
             manager: Mutex::new(None),
-            topics: Mutex::new(HashMap::new()),
+            topics: topics_sender,
             sub_counter: AtomicU32::new(1),
+            current_topics: Mutex::new(vec![]),
         });
         
         let result = connection.generate().await;
@@ -464,13 +459,14 @@ impl APSConnectionResource {
         *resource.manager.lock().await = Some(Arc::downgrade(&resource));
 
         // auto ack notifications
-        let ack_ref = resource.clone();
+        let ack_ref = Arc::downgrade(&resource);
         let mut ack_receiver = resource.messages_cont.subscribe();
         tokio::spawn(async move {
             loop {
                 match ack_receiver.recv().await {
                     Ok(APSMessage::Notification { id, topic: _, token: _, payload: _, channel: _ }) => {
-                        let _ = ack_ref.send(APSMessage::Ack { token: Some(ack_ref.get_token().await), for_id: id, status: 0 }).await;
+                        let Some(upgrade) = ack_ref.upgrade() else { break };
+                        let _ = upgrade.send(APSMessage::Ack { token: Some(upgrade.get_token().await), for_id: id, status: 0 }).await;
                     }
                     Err(RecvError::Closed) => break,
                     _ => continue,
@@ -479,16 +475,50 @@ impl APSConnectionResource {
         });
 
         // auto ping
-        let keep_alive_ref = resource.clone();
+        let keep_alive_ref = Arc::downgrade(&resource);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                let waiter = keep_alive_ref.subscribe().await;
-                if let Ok(_) = keep_alive_ref.send(APSMessage::Ping).await {
-                    let _ = keep_alive_ref.wait_for_timeout(waiter, |msg| {
+
+                let Some(upgrade) = keep_alive_ref.upgrade() else { break };
+                let waiter = upgrade.subscribe().await;
+                if let Ok(_) = upgrade.send(APSMessage::Ping).await {
+                    let _ = upgrade.wait_for_timeout(waiter, |msg| {
                         if let APSMessage::Pong = msg { Some(()) } else { None }
                     }).await;
+                }
+            }
+        });
+
+        let topic_manager = Arc::downgrade(&resource);
+        tokio::spawn(async move {
+            let mut topics: HashMap<&'static str, usize> = HashMap::new();
+            loop {
+                let Some((subject_topics, add)) = topics_receiver.recv().await else { break };
+                info!("Got order for topics {:?} {add}", subject_topics);
+                for topic in subject_topics {
+                    let entry = topics.entry(topic).or_default();
+                    if add {
+                        *entry += 1;
+                    } else {
+                        *entry -= 1;
+                    }
+
+                    if *entry == 0 {
+                        topics.remove(&topic);
+                    }
+                }
+
+                if topics_receiver.is_empty() {
+                    let Some(upgrade) = topic_manager.upgrade() else { break };
+
+                    let current_topics = topics.keys().map(|k| *k).collect::<Vec<_>>();
+                    // helpfully, this will also block if we are currently initalizing topics from cache.
+                    *upgrade.current_topics.lock().await = current_topics.clone();
+                    
+                    // if this fails we'll refilter current topics on regen
+                    let _ = tokio::time::timeout(Duration::from_secs(10), upgrade.filter(&current_topics, &[], &[], &[])).await;
                 }
             }
         });
@@ -500,18 +530,9 @@ impl APSConnectionResource {
         self.state.read().await.token.unwrap()
     }
 
-    async fn update_topics(&self, topic_lock: &mut HashMap<&'static str, u64>) -> Result<(), PushError> {
-        topic_lock.retain(|_k, v| *v > 0);
-        self.filter(&topic_lock.keys().map(|k| *k).collect::<Vec<_>>(), &[], &[], &[]).await?;
-        Ok(())
-    }
-
-    pub async fn request_topics(&self, topics: Vec<&'static str>) -> (APSInterestToken, Option<PushError>) {
-        let mut topic_lock = self.topics.lock().await;
-        for topic in &topics {
-            *topic_lock.entry(*topic).or_default() += 1;
-        }
-        (APSInterestToken { topics, aps: self.get_manager().await }, self.update_topics(&mut *topic_lock).await.err())
+    pub async fn request_topics(&self, topics: Vec<&'static str>) -> APSInterestToken {
+        self.topics.send((topics.clone(), true)).await.expect("Other end hung up topics??");
+        APSInterestToken { topics, topics_channel: self.topics.clone() }
     }
 
     async fn do_connect(self: &Arc<Self>) -> Result<(), PushError> {
@@ -557,7 +578,7 @@ impl APSConnectionResource {
         info!("Sending");
         self.send(APSMessage::SetState { state: 1 }).await?;
         info!("Updating topics");
-        self.update_topics(&mut *self.topics.lock().await).await?; // not much we can do
+        self.filter(&*self.current_topics.lock().await, &[], &[], &[]).await?; // not much we can do
         info!("Updated");
 
         Ok(())

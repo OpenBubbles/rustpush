@@ -125,8 +125,8 @@ pub enum PushError {
     NoHandle,
     #[error("NoParticipantTokenIndex")]
     NoParticipantTokenIndex,
-    #[error("Resource generate timeout {0}")]
-    ResourceGenTimeout(Elapsed),
+    #[error("Resource generate timeout")]
+    ResourceGenTimeout,
     #[error("Delegate {0} login failed status {1} error {2}")]
     DelegateLoginFailed(String, i64, String),
     #[error("Cloudkit error {0:?}")]
@@ -189,4 +189,8 @@ pub enum PushError {
     ResourceStalled,
     #[error("ICC Auth failed!")]
     ICCAuthFailed,
+    #[error("Carrier does not support ICC auth!")]
+    ICCAuthUnsupported,
+    #[error("Resource has been closed!")]
+    ResourceClosed,
 }

@@ -146,6 +146,10 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         self.account.lock().await.get_token(token).await
     }
 
+    pub async fn get_gsa_email(&self) -> Option<String> {
+        self.account.lock().await.username.clone()
+    }
+
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
         let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
@@ -1204,7 +1208,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 impl IdmsAuthListener {
     pub async fn new(conn: APSConnection) -> Self {
         Self {
-            _interest_token: conn.request_topics(vec!["com.apple.idmsauth"]).await.0,
+            _interest_token: conn.request_topics(vec!["com.apple.idmsauth"]).await,
         }
     }
 

@@ -48,12 +48,12 @@ pub struct FindMyState {
 }
 
 impl FindMyState {
-    pub fn new(dsid: String) -> Option<FindMyState> {
-        Some(FindMyState {
+    pub fn new(dsid: String) -> FindMyState {
+        FindMyState {
             dsid,
             state_token: None,
             accessories: Default::default(),
-        })
+        }
     }
 }
 
@@ -383,7 +383,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
         let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
         Ok(FindMyClient {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"]).await.0,
+            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd"]).await,
             conn,
             identity,
             daemon: Mutex::new(daemon),

@@ -585,9 +585,12 @@ struct LookupReq {
 }
 
 #[derive(Deserialize)]
-struct ResultHandle {
-    uri: String
+pub struct ResultHandle {
+    pub uri: String,
+    #[serde(default)]
+    pub aliases: HashMap<String, HandleProvisionAttributes>,
 }
+
 #[derive(Deserialize)]
 struct HandleResult {
     handles: Option<Vec<ResultHandle>>,
@@ -704,6 +707,17 @@ pub struct ReportMessage {
     pub time_of_message: f64,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandleProvisionAttributes {
+    #[serde(default)]
+    pub allowed_services: HashMap<String, Vec<Value>>,
+    #[serde(default, rename = "expiry-epoch-seconds")]
+    pub expiry_epoch_seconds: f64,
+    #[serde(default)]
+    pub feature_id: String,
+}
+
 
 impl IDSUser {
 
@@ -725,29 +739,20 @@ impl IDSUser {
             feature: &'static str,
             operation: &'static str,
             expiry_seconds: f64) -> Result<(), PushError> {
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ProvisionAttributes {
-            allowed_services: HashMap<&'static str, Vec<&'static str>>,
-            #[serde(rename = "expiry-epoch-seconds")]
-            expiry_epoch_seconds: f64,
-            feature_id: &'static str,
-        }
         
         #[derive(Serialize)]
         struct ProvisionRequest {
             alias: Option<String>,
-            attributes: ProvisionAttributes,
+            attributes: HandleProvisionAttributes,
             operation: &'static str
         }
 
         let body = ProvisionRequest {
             alias: alias.clone(),
-            attributes: ProvisionAttributes {
-                allowed_services: services.clone(),
+            attributes: HandleProvisionAttributes {
+                allowed_services: services.iter().map(|(a, b)| (a.to_string(), b.iter().map(|a| Value::String(a.to_string())).collect())).collect(),
                 expiry_epoch_seconds: expiry_seconds,
-                feature_id: feature,
+                feature_id: feature.to_owned(),
             },
             operation,
         };
@@ -771,6 +776,8 @@ impl IDSUser {
             .send(&REQWEST).await?
             .bytes().await?;
 
+        info!("Got alias response {}", str::from_utf8(&bytes).expect("Bytes to urtf8"));
+
         #[derive(Deserialize)]
         struct AliasResult {
             alias: String,
@@ -787,8 +794,8 @@ impl IDSUser {
 
         Ok(())
     }
-
-    pub async fn get_possible_handles(&self, aps: &APSState) -> Result<Vec<String>, PushError> {
+    
+    pub async fn get_handle_data(&self, aps: &APSState) -> Result<Vec<ResultHandle>, PushError> {
         let request = self.base_request(aps, "id-get-handles")?
             .send(&REQWEST).await?
             .bytes().await?;
@@ -797,8 +804,14 @@ impl IDSUser {
         let Some(handles) = parsed.handles else {
             return Err(PushError::AuthInvalid(parsed.status))
         };
+        
+        Ok(handles)
+    }
 
-        Ok(handles.into_iter().map(|h| h.uri).collect())
+    pub async fn get_possible_handles(&self, aps: &APSState) -> Result<Vec<String>, PushError> {
+        let handle_data = self.get_handle_data(aps).await?;
+
+        Ok(handle_data.into_iter().map(|h| h.uri).collect())
     }
 
     pub async fn get_dependent_registrations(&self, aps: &APSState) -> Result<Vec<PrivateDeviceInfo>, PushError> {

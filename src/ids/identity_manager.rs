@@ -203,20 +203,23 @@ impl KeyCache {
             for main_service in services {
                 let Some(reg) = user.registration.get(main_service.name) else { continue };
                 for service in std::iter::once(main_service.name).chain(main_service.sub_services.iter().copied()) {
+                    let cache_entry = self.cache.entry(service.to_string()).or_default();
                     for handle in &reg.handles {
-                        self.cache.entry(service.to_string()).or_default().entry(handle.clone()).or_default().verity(conn, user, &main_service.name).await;
+                        cache_entry.entry(handle.clone()).or_default().verity(conn, user, &main_service.name).await;
                     }
-                    let hashes = self.cache.entry(service.to_string()).or_default().into_iter().map(|(a, b)| (a.clone(), b.env_hash)).collect::<HashMap<_, _>>();
-                    self.cache.entry(service.to_string()).or_default().retain(|_key, value| {
+                    let hashes = cache_entry.into_iter().map(|(a, b)| (a.clone(), b.env_hash)).collect::<HashMap<_, _>>();
+                    cache_entry.retain(|_key, value| {
                         let Some(real) = &value.real_handle else { return true };
 
                         // prune expired pseudonyms
                         if let Some(expiry) = value.expiry {
                             if secs_now > expiry {
+                                info!("Pruning expired!");
                                 return false;
                             }
                         }
 
+                        info!("handling pseudoynm {}", hashes.get(real) == Some(&value.env_hash));
                         hashes.get(real) == Some(&value.env_hash) // our real hash must match our created hash
                     });
                 }
@@ -391,7 +394,7 @@ impl IdentityResource {
             users: RwLock::new(users),
             config,
             identity,
-            interest_token: conn.request_topics(vec!["com.apple.private.ids"]).await.0,
+            interest_token: conn.request_topics(vec!["com.apple.private.ids"]).await,
             aps: conn,
             query_lock: Mutex::new(()),
             manager: Mutex::new(None),
@@ -432,7 +435,25 @@ impl IdentityResource {
         let state = self.aps.state.read().await;
         let mut possible_handles = HashSet::new();
         for user in &*users_locked {
-            possible_handles.extend(user.get_possible_handles(&*state).await?);
+            let data = user.get_handle_data(&*state).await?;
+
+            let mut cache_lock = self.cache.lock().await;
+            for handle in data {
+                for (alias, attributes) in handle.aliases {
+                    for (service, _) in attributes.allowed_services {
+                        let Some(service) = cache_lock.cache.get_mut(&service) else { continue };
+                        let Some(existing_uri) = service.get(&handle.uri) else { continue };
+                        let real_hash = existing_uri.env_hash;
+
+                        let entry = service.entry(alias.clone()).or_default();
+                        entry.real_handle = Some(handle.uri.to_string());
+                        entry.expiry = Some(attributes.expiry_epoch_seconds);
+                        entry.env_hash = real_hash;
+                    }
+                }
+
+                possible_handles.insert(handle.uri);
+            }
         }
         Ok(possible_handles)
     }
@@ -511,7 +532,11 @@ impl IdentityResource {
     pub async fn validate_pseudonym(&self, service: &'static str, handle: &str, pseud: &str) -> Result<bool, PushError> {
         let cache_lock = self.cache.lock().await;
         let Some(service) = cache_lock.cache.get(service) else { panic!("No service {service}!") };
-        let Some(pseud) = service.get(pseud) else { return Ok(false) };
+        let Some(pseud) = service.get(pseud) else { 
+            warn!("Pseudonym not found {pseud}!");
+            return Ok(false)
+         };
+        info!("Validating pseudonym {:?} {}", pseud.real_handle, handle);
         Ok(pseud.real_handle == Some(handle.to_string()))
     }
 
@@ -531,11 +556,12 @@ impl IdentityResource {
         Ok(new_alias)
     }
     
-    pub async fn delete_pseudonym(&self, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, pseud: String, expiry_seconds: f64) -> Result<(), PushError> {
+    pub async fn delete_pseudonym(&self, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>, pseud: String) -> Result<(), PushError> {
         let a_service = services.keys().next().unwrap();
         let cache_lock = self.cache.lock().await;
         let Some(cache_handle) = cache_lock.cache[*a_service].get(&pseud) else { return Ok(()) /* handle doesn't exist; probably already deleted */ };
         let handle = cache_handle.real_handle.as_ref().expect("Not a pseud?").clone();
+        let expiry_seconds = cache_handle.expiry.expect("not a pseud?");
         drop(cache_lock);
         
         let users = self.users.read().await;
@@ -552,6 +578,21 @@ impl IdentityResource {
         }
         cache_lock.save();
 
+        Ok(())
+    }
+
+    pub async fn clear_pseudonyms(&self, feature: &'static str, services: HashMap<&'static str, Vec<&'static str>>) -> Result<(), PushError> {
+        self.get_possible_handles().await?;
+        
+        for service in &services {
+            let cache_lock = self.cache.lock().await;
+            let handles = cache_lock.cache[*service.0].iter().filter(|(_, a)| a.real_handle.is_some()).map(|(a, _)| a.clone()).collect::<Vec<_>>();
+            drop(cache_lock);
+            for handle in handles {
+                // if already deleted; skip
+                let _ = self.delete_pseudonym(feature, services.clone(), handle).await;
+            }
+        }
         Ok(())
     }
 
@@ -613,7 +654,7 @@ impl IdentityResource {
         // only one IDS query can happen at the a time. period.
        let id_lock = self.query_lock.lock().await;
 
-       self.manager().await.ensure_not_failed().await?;
+       self.manager().await.ensure_ready().await?;
        // find participants whose keys need to be fetched
        debug!("Getting keys for {:?}", participants);
        let key_cache = self.cache.lock().await;

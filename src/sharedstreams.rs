@@ -587,7 +587,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
     pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, token_provider: Arc<TokenProvider<P>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
         SharedStreamClient {
-            _interest_token: aps.request_topics(vec!["com.apple.sharedstreams"]).await.0,
+            _interest_token: aps.request_topics(vec!["com.apple.sharedstreams"]).await,
             state: RwLock::new(state),
             update_state,
             anisette,

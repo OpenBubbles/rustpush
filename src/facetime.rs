@@ -377,7 +377,7 @@ pub struct FTClient {
 
 impl FTClient {
     pub async fn new(state: FTState, update_state: Box<dyn Fn(&FTState) + Send + Sync>, conn: APSConnection, identity: IdentityManager, config: Arc<dyn OSConfig>) -> Self {
-        let token = conn.request_topics(vec!["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await.0;
+        let token = conn.request_topics(vec!["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video", "com.apple.private.alloy.quickrelay"]).await;
 
         Self {
             _interest_token: token,
@@ -464,19 +464,19 @@ impl FTClient {
     }
 
     // warning: Doesn't save the link
-    async fn new_link(&self, handle: &str, usage: Option<String>) -> Result<FTLink, PushError> {
+    async fn new_link(&self, handle: &str, usage: Option<String>, supported_for: Duration) -> Result<FTLink, PushError> {
         let since_the_epoch = duration_since_epoch();
         
-        let in_a_year = since_the_epoch + Duration::from_secs(31536000);
+        let expiry = since_the_epoch + supported_for;
         
         let new_alias = self.identity.create_pseudonym(handle, "Gondola", 
-        [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect(), in_a_year.as_secs_f64()).await?;
+        [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect(), expiry.as_secs_f64()).await?;
 
         info!("Creating new link using pseud {new_alias} for handle {handle} with usage {usage:?}");
 
         let key = CompactECKey::new()?;
 
-        Ok(FTLink { key, pseud: new_alias.clone(), handle: handle.to_string(), session_link: None, creation_time: since_the_epoch.as_secs_f64(), expiry_time: in_a_year.as_secs_f64(), usage })
+        Ok(FTLink { key, pseud: new_alias.clone(), handle: handle.to_string(), session_link: None, creation_time: since_the_epoch.as_secs_f64(), expiry_time: expiry.as_secs_f64(), usage })
     }
 
     pub async fn use_link_for(&self, old_usage: &str, usage: &str) -> Result<(), PushError> {
@@ -512,8 +512,16 @@ impl FTClient {
                 warn!("Failed to validate pseudonym! {}", link.pseud);
             }
         }
+
+        // disassociate any bad links, so we don't pull from them and we only have one link with this usage
+        // we don't delete because that is too error prone, we can just let them expire instead.
+        // after all, the point of this function is to get a link that works, not do pruning. (there may be many (hundreds) due past bug)
+        for (_, link) in &mut state.links {
+            if link.usage != Some(usage.to_string()) { continue }
+            link.usage = None;
+        }
         
-        let link_obj = self.new_link(handle, Some(usage.to_string())).await?;
+        let link_obj = self.new_link(handle, Some(usage.to_string()), Duration::from_secs(31536000) /* one year */).await?;
         let link = link_obj.get_link()?;
 
         state.links.insert(link_obj.pseud.clone(), link_obj);
@@ -522,13 +530,18 @@ impl FTClient {
         Ok(link)
     }
 
-    pub async fn delete_link(&self, pseud: &str) -> Result<(), PushError> {
-        let state = self.state.read().await;
-        let expiry_time = state.links[pseud].expiry_time;
-        drop(state);
+    pub async fn clear_links(&self) -> Result<(), PushError> {
+        self.identity.clear_pseudonyms("Gondola", [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect()).await?;
 
+        let mut state = self.state.write().await;
+        state.links.clear();
+        (self.update_state)(&*state);
+        Ok(())
+    }
+
+    pub async fn delete_link(&self, pseud: &str) -> Result<(), PushError> {
         self.identity.delete_pseudonym("Gondola", 
-            [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect(), pseud.to_string(), expiry_time).await?;
+            [("com.apple.private.alloy.facetime.multi", vec![])].into_iter().collect(), pseud.to_string()).await?;
         
         let mut state = self.state.write().await;
         state.links.remove(pseud);
@@ -546,7 +559,7 @@ impl FTClient {
             return Ok(format!("https://facetime.apple.com/join#v=1&p={}&k={}", &link.pseudonym[6..], encoded))
         }
 
-        let mut link_obj = self.new_link(&my_handle, None).await?;
+        let mut link_obj = self.new_link(&my_handle, None, Duration::from_secs(31536000) /* year */).await?;
         link_obj.session_link = Some(session.group_id.clone());
         let conversation_link = ConversationLink {
             pseudonym: link_obj.pseud.clone(),

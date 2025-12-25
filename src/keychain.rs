@@ -25,7 +25,7 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{cloudkit::{record_identifier, should_reset, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation}, pcs::PCSKey};
+use crate::{TokenProvider, cloudkit::{SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, pcs::PCSKey};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
@@ -624,7 +624,7 @@ const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
 
 pub struct KeychainClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
-    pub account: Arc<Mutex<AppleAccount<P>>>,
+    pub token_provider: Arc<TokenProvider<P>>,
     pub state: RwLock<KeychainClientState>,
     pub config: Arc<dyn OSConfig>,
     pub update_state: Box<dyn Fn(&KeychainClientState) + Send + Sync>,
@@ -1900,10 +1900,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     async fn invoke_escrow<T: DeserializeOwned>(&self, request: EscrowRequest) -> Result<T, PushError> {
-        let mut account = self.account.lock().await;
-        let auth = account.get_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
-        let email = account.username.clone().expect("No email!");
-        drop(account);
+        let auth = self.token_provider.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
+        let email = self.token_provider.get_gsa_email().await.expect("no email!");
 
         let state = self.state.read().await;
         let resp = REQWEST.post(format!("{}/escrowproxy/api/{}", state.host, request.command.get_url()))
