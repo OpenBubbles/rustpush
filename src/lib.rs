@@ -3,20 +3,22 @@ mod activation;
 mod aps;
 mod util;
 mod imessage;
-mod mmcs;
 mod error;
 mod auth;
 mod ids;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
-pub mod pcs;
-pub mod cloudkit;
+pub mod icloud;
 pub mod statuskit;
-pub mod keychain;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
+
+pub use icloud::cloudkit;
+pub use icloud::keychain;
+pub use icloud::mmcs;
+pub use icloud::pcs;
 
 #[cfg(feature = "macos-validation-data")]
 pub mod macos;
