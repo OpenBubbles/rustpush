@@ -18,9 +18,7 @@ use super::identity_manager::KeyCache;
 use rand::{Rng, RngCore};
 use tokio::sync::Mutex;
 
-use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError};
-
-use super::CompactECKey;
+use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError};
 
 
 #[repr(C)]
