@@ -20,6 +20,8 @@ pub use icloud::keychain;
 pub use icloud::mmcs;
 pub use icloud::pcs;
 
+pub use util::CompactECKey;
+
 #[cfg(feature = "macos-validation-data")]
 pub mod macos;
 

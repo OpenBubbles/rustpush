@@ -16,7 +16,7 @@ use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
 
-use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{user::IDSIdentity, MessageBody}, register, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip, Resource, ResourceManager}, APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError};
+use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSIdentity, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, IDSUserType, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
 
@@ -36,7 +36,7 @@ pub enum MessageTarget {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct CachedKeys {
-    keys: Vec<IDSDeliveryData>,
+    keys: IDSLookupUser,
     at_ms: u64
 }
 
@@ -49,10 +49,10 @@ impl CachedKeys {
 
     fn is_valid(&self) -> bool {
         let stale_time = self.get_stale_time();
-        if self.keys.is_empty() {
+        if self.keys.identities.is_empty() {
             stale_time < EMPTY_REFRESH
         } else {
-            self.keys.iter().all(|key| stale_time.as_secs() < key.session_token_expires_seconds)
+            self.keys.identities.iter().all(|key| stale_time.as_secs() < key.session_token_expires_seconds)
         }
     }
 
@@ -62,10 +62,10 @@ impl CachedKeys {
         if refresh {
             return stale_time >= REFRESH_MIN;
         }
-        if self.keys.is_empty() {
+        if self.keys.identities.is_empty() {
             return stale_time >= EMPTY_REFRESH;
         }
-        self.keys.iter().any(|key| stale_time.as_secs() >= key.session_token_refresh_seconds)
+        self.keys.identities.iter().any(|key| stale_time.as_secs() >= key.session_token_refresh_seconds)
     }
 }
 
@@ -295,8 +295,18 @@ impl KeyCache {
             // expired
             vec![]
         } else {
-            cached.keys.iter().collect()
+            cached.keys.identities.iter().collect()
         }
+    }
+
+    pub fn get_correlation_id(&self, service: &str, handle: &str, r#for: &str) -> Option<String> {
+        let Some(handle_cache) = self.cache.get(service).and_then(|a| a.get(handle)) else {
+            return None
+        };
+        let Some(cached) = handle_cache.keys.get(r#for) else {
+            return None
+        };
+        Some(cached.keys.sender_correlation_identifier.clone())
     }
 
     pub fn does_not_need_refresh(&self, service: &str, handle: &str, keys_for: &str, refresh: bool) -> bool {
@@ -309,7 +319,7 @@ impl KeyCache {
         return !cached.is_dirty(refresh);
     }
 
-    pub fn put_keys(&mut self, service: &str, handle: &str, keys_for: &str, keys: Vec<IDSDeliveryData>) {
+    pub fn put_keys(&mut self, service: &str, handle: &str, keys_for: &str, keys: IDSLookupUser) {
         let Some(handle_cache) = self.cache.get_mut(service).and_then(|a| a.get_mut(handle)) else {
             panic!("No handle cache for service {service} handle {handle}!");
         };
@@ -686,7 +696,7 @@ impl IdentityResource {
                warn!("warn IDS returned zero keys for query {:?}", chunk);
            }
            for (id, results) in results {
-               if results.len() == 0 {
+               if results.identities.len() == 0 {
                    warn!("IDS returned zero keys for participant {}", id);
                }
                key_cache.put_keys(&topic, handle, &id, results);

@@ -164,6 +164,7 @@ impl UploadAssetOperation {
     }
 }
 
+#[derive(Clone)]
 pub struct SaveRecordOperation(pub cloudkit_proto::RecordSaveRequest);
 impl CloudKitOp for SaveRecordOperation {
     type Response = ();

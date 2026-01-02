@@ -193,4 +193,6 @@ pub enum PushError {
     ICCAuthUnsupported,
     #[error("Resource has been closed!")]
     ResourceClosed,
+    #[error("Circle {0} not found!")]
+    CircleNotFound(String),
 }

@@ -1545,6 +1545,22 @@ impl CompactECKey<Private> {
         
         output
     }
+
+    pub fn compress_private_small(&self) -> [u8; 32] {
+        self.0.private_key().to_vec_padded(32).unwrap().try_into().unwrap()
+    }
+
+    pub fn decompress_private_small(key: [u8; 32]) -> Self {
+        let private_number = BigNum::from_slice(&key).unwrap();
+
+        let mut ctx = BigNumContext::new().unwrap();
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let mut pub_point = EcPoint::new(&group).unwrap();
+        pub_point.mul_generator(&group, &private_number, &mut ctx).expect("mul generator failed");
+
+        Self(EcKey::from_private_components(&group, &private_number, &pub_point).unwrap())
+    } 
 }
 
 impl CompactECKey<Public> {
@@ -1605,7 +1621,6 @@ fn compact_test() -> Result<(), PushError> {
     
     Ok(())
 }
-
 
 pub fn kdf_ctr_hmac(key: &[u8], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
     use hkdf::hmac::Mac;

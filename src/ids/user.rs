@@ -619,7 +619,14 @@ pub struct PrivateDeviceInfo {
 #[derive(Serialize, Deserialize, Clone)]
 struct IDSLookupResp {
     status: u64,
-    results: Option<HashMap<String, Value>>
+    results: Option<HashMap<String, IDSLookupUser>>
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+pub struct IDSLookupUser {
+    pub identities: Vec<IDSDeliveryData>,
+    pub sender_correlation_identifier: String,
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]
@@ -932,7 +939,7 @@ impl IDSUser {
     }
 
     #[async_recursion]
-    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, topic: &'static str, main_topic: &str, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, Vec<IDSDeliveryData>>, PushError> {
+    pub async fn query(&self, config: &dyn OSConfig, aps: &APSConnectionResource, topic: &'static str, main_topic: &str, handle: &str, query: &[String], options: &QueryOptions) -> Result<HashMap<String, IDSLookupUser>, PushError> {
         let body = plist_to_buf(&LookupReq { uris: query.to_vec() })?;
 
         let mut request = options.add_headers(SignedRequest::new("id-query", Method::GET /* unused */))
@@ -965,11 +972,7 @@ impl IDSUser {
             return Err(PushError::LookupFailed(loaded.status))
         }
 
-        let mut output = HashMap::new();
-        for (handle, data) in loaded.results.unwrap() {
-            output.insert(handle, plist::from_value(&data.as_dictionary().unwrap()["identities"])?);
-        }
-        Ok(output)
+        Ok(loaded.results.unwrap())
     }
 }
 
