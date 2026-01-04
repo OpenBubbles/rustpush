@@ -626,7 +626,7 @@ struct IDSLookupResp {
 #[serde(rename_all = "kebab-case")]
 pub struct IDSLookupUser {
     pub identities: Vec<IDSDeliveryData>,
-    pub sender_correlation_identifier: String,
+    pub sender_correlation_identifier: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, Serialize)]

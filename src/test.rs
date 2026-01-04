@@ -860,7 +860,7 @@ async fn main() {
     print!(">> ");
     std::io::stdout().flush().unwrap();
 
-    // let mut received_msgs = vec![];
+    let mut received_msgs = vec![];
     let mut last_ft_guid = "AE271F00-2F67-42C4-8EF2-74600055A2B7".to_string();
     
     let mut circle_session: Option<CircleServerSession<DefaultAnisetteProvider>> = None;
@@ -932,46 +932,46 @@ async fn main() {
                 //         }
                 //     }
                 // }
-            //     let msg = client.handle(msg).await;
-            //     if msg.is_err() {
-            //         error!("Failed to receive {}", msg.err().unwrap());
-            //         continue;
-            //     }
-            //     if let Ok(Some(msg)) = msg {
-            //         if msg.has_payload() && !received_msgs.contains(&msg.id) {
-            //             received_msgs.push(msg.id.clone());
-            //             if let Message::ShareProfile(message) = &msg.message {
-            //                 if let Err(e) = name_photo_client.get_record(&message).await {
-            //                     error!("{e}");
-            //                 }
-            //             }
-            //             if let Message::UpdateProfile(UpdateProfileMessage { profile: Some(profile), .. }) = &msg.message {
-            //                 if let Ok(record) = name_photo_client.get_record(&profile).await {
-            //                     // handle_record(record, &client, &name_photo_client, &profile).await;
-            //                 }
-            //             }
-            //             if let Message::UpdateProfile(UpdateProfileMessage { profile: Some(profile), .. }) = &msg.message {
-            //                 if let Ok(record) = name_photo_client.get_record(&profile).await {
-            //                     // handle_record(record, &client, &name_photo_client, &profile).await;
-            //                 }
-            //             }
-            //             if let Message::SetTranscriptBackground(msg) = &msg.message {
-            //                 if let Some(mmcs) = msg.to_mmcs() {
-            //                     let mut output = vec![];
-            //                     let file = Cursor::new(&mut output);
-            //                     mmcs.get_attachment(&*connection, file, |a, b| { }).await.unwrap();
-            //                     SimplifiedTranscriptPoster::parse_payload(&output).unwrap();
-            //                 }
-            //             }
-            //             println!("{}", msg);
-            //             print!(">> ");
-            //             std::io::stdout().flush().unwrap();
-            //             if let Some(context) = msg.certified_context {
-            //                 println!("sending delivered {}", msg.send_delivered);
-            //                 client.identity.certify_delivery("com.apple.madrid", &context, false).await.unwrap();
-            //             }
-            //         }
-            //     }
+                let msg = client.handle(msg).await;
+                if msg.is_err() {
+                    error!("Failed to receive {}", msg.err().unwrap());
+                    continue;
+                }
+                if let Ok(Some(msg)) = msg {
+                    if msg.has_payload() && !received_msgs.contains(&msg.id) {
+                        received_msgs.push(msg.id.clone());
+                        // if let Message::ShareProfile(message) = &msg.message {
+                        //     if let Err(e) = name_photo_client.get_record(&message).await {
+                        //         error!("{e}");
+                        //     }
+                        // }
+                        // if let Message::UpdateProfile(UpdateProfileMessage { profile: Some(profile), .. }) = &msg.message {
+                        //     if let Ok(record) = name_photo_client.get_record(&profile).await {
+                        //         // handle_record(record, &client, &name_photo_client, &profile).await;
+                        //     }
+                        // }
+                        // if let Message::UpdateProfile(UpdateProfileMessage { profile: Some(profile), .. }) = &msg.message {
+                        //     if let Ok(record) = name_photo_client.get_record(&profile).await {
+                        //         // handle_record(record, &client, &name_photo_client, &profile).await;
+                        //     }
+                        // }
+                        // if let Message::SetTranscriptBackground(msg) = &msg.message {
+                        //     if let Some(mmcs) = msg.to_mmcs() {
+                        //         let mut output = vec![];
+                        //         let file = Cursor::new(&mut output);
+                        //         mmcs.get_attachment(&*connection, file, |a, b| { }).await.unwrap();
+                        //         SimplifiedTranscriptPoster::parse_payload(&output).unwrap();
+                        //     }
+                        // }
+                        println!("{}", msg);
+                        print!(">> ");
+                        std::io::stdout().flush().unwrap();
+                        if let Some(context) = msg.certified_context {
+                            println!("sending delivered {}", msg.send_delivered);
+                            client.identity.certify_delivery("com.apple.madrid", &context, false).await.unwrap();
+                        }
+                    }
+                }
             // },
             // input = &mut read_task => {
             //     let Ok(input) = input else {

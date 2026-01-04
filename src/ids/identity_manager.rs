@@ -180,16 +180,26 @@ pub struct KeyCache {
 
 impl KeyCache {
     pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) -> KeyCache {
+        let mut message_counter = HashMap::new();
         if let Ok(data) = fs::read(&path) {
             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
                 loaded.cache_location = path;
                 loaded.verity(conn, users, services).await;
                 return loaded
+            } else {
+                #[derive(Deserialize)]
+                struct RecoveryKeyCache {
+                    message_counter: HashMap<String, u32>,
+                }
+                // Stop bad updates from WIPING MESSAGE COUNTERS
+                if let Ok(recovery) = plist::from_reader_xml::<_, RecoveryKeyCache>(Cursor::new(&data)) {
+                    message_counter = recovery.message_counter;
+                }
             }
         }
         let mut cache = KeyCache {
             cache: HashMap::new(),
-            message_counter: HashMap::new(),
+            message_counter,
             cache_location: path,
         };
         cache.verity(conn, users, services).await;
@@ -306,7 +316,7 @@ impl KeyCache {
         let Some(cached) = handle_cache.keys.get(r#for) else {
             return None
         };
-        Some(cached.keys.sender_correlation_identifier.clone())
+        cached.keys.sender_correlation_identifier.clone()
     }
 
     pub fn does_not_need_refresh(&self, service: &str, handle: &str, keys_for: &str, refresh: bool) -> bool {
