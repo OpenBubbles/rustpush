@@ -7,6 +7,7 @@ edition = "2021"
 remote-anisette-v3 = ["omnisette/remote-anisette-v3", "icloud_auth/remote-anisette-v3"]
 remote-clearadi = ["omnisette/remote-clearadi", "icloud_auth/remote-clearadi"]
 macos-validation-data = ["dep:open-absinthe"]
+default = ["macos-validation-data"]
 
 [dependencies]
 plist = "1.7.0"
@@ -31,10 +32,10 @@ log = "0.4.20"
 pretty_env_logger = "0.5.0"
 async-trait = "0.1.73"
 flume = "0.11.0"
-icloud_auth = { path = "./apple-private-apis/icloud-auth" }
+icloud_auth = { path = "./apple-private-apis/icloud-auth", default-features = false, features = ["remote-clearadi"] }
 srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
-omnisette = { path = "./apple-private-apis/omnisette" }
-open-absinthe = { path = "./open-absinthe", optional = true }
+omnisette = { path = "./apple-private-apis/omnisette", features = ["remote-clearadi"] }
+open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
 deku = "0.16.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
