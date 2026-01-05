@@ -1624,6 +1624,7 @@ pub enum Message {
     ShareProfile(ShareProfileMessage),
     NotifyAnyways,
     SetTranscriptBackground(SetTranscriptBackgroundMessage),
+    Keep,
 }
 
 
@@ -1678,6 +1679,7 @@ impl Message {
             Self::ShareProfile(_) => 131,
             Self::NotifyAnyways => 113,
             Self::SetTranscriptBackground(_) => 138,
+            Self::Keep => 106,
         }
     }
 
@@ -1752,6 +1754,7 @@ impl Message {
             Self::UpdateProfileSharing(_) => Some(true),
             Self::NotifyAnyways => Some(true),
             Self::SetTranscriptBackground(_) => Some(true),
+            Self::Keep => Some(true),
             _ => None
         }
     }
@@ -1837,7 +1840,10 @@ impl fmt::Display for Message {
             },
             Message::SetTranscriptBackground(_) => {
                 write!(f, "Changed the transcript background")
-            }
+            },
+            Message::Keep => {
+                write!(f, "kept a message")
+            },
         }
     }
 }
@@ -1943,6 +1949,7 @@ impl MessageInst {
             Message::PeerCacheInvalidate => false,
             Message::Unschedule => false,
             Message::NotifyAnyways => false,
+            Message::Keep => false,
             _ => true
         }
     }
@@ -2379,6 +2386,7 @@ impl MessageInst {
             },
             Message::Delivered => panic!("no enc body!"),
             Message::Read => panic!("no enc body!"),
+            Message::Keep => panic!("no enc body!"),
             Message::MessageReadOnDevice => panic!("no enc body!"),
             Message::PeerCacheInvalidate => panic!("no enc body!"),
             Message::Error(_) => panic!("no enc body!"),
