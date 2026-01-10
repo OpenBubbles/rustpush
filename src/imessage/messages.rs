@@ -1519,7 +1519,7 @@ pub enum SetTranscriptBackgroundMessage {
         #[serde(rename = "traba")]
         aid: u32,
         #[serde(rename = "tbid")]
-        bid: u32, // sequence number
+        bid: u64, // sequence number
         #[serde(rename = "cid")]
         chat_id: Option<String>,
 
@@ -1530,7 +1530,7 @@ pub enum SetTranscriptBackgroundMessage {
         #[serde(rename = "traba")]
         aid: u32,
         #[serde(rename = "tbid")]
-        bid: u32, // sequence number
+        bid: u64, // sequence number
         #[serde(rename = "cid")]
         chat_id: Option<String>,
         
@@ -1565,7 +1565,7 @@ impl SetTranscriptBackgroundMessage {
         }
     }
 
-    pub fn from_mmcs(file: Option<MMCSFile>, version: u32, chat_id: Option<String>) -> Self {
+    pub fn from_mmcs(file: Option<MMCSFile>, version: u64, chat_id: Option<String>) -> Self {
         match file {
             None => Self::Remove {
                 aid: 1, 

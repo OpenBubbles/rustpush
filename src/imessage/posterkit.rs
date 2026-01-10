@@ -172,7 +172,7 @@ pub struct PRPosterTitleStyleConfiguration {
     pub preferred_title_alignment: u32,
     pub preferred_title_layout: u32,
     pub time_font_configuration: PRPosterSystemTimeFontConfiguration,
-    #[serde(serialize_with = "vec_serialize", deserialize_with = "vec_deserialize")]
+    #[serde(default, serialize_with = "vec_serialize", deserialize_with = "vec_deserialize")]
     pub time_numbering_system: Option<Vec<u8>>,
     pub title_color: PRPosterColor,
     #[serde(default, serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
