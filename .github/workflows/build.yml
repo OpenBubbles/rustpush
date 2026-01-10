@@ -42,8 +42,8 @@ jobs:
           )
 
           for name in "${cert_names[@]}"; do
-              touch certs/fairplay/$name.pem
-              touch certs/fairplay/$name.crt
+              cp certs/legacy-fairplay/fairplay.pem certs/fairplay/$name.pem
+              cp certs/legacy-fairplay/fairplay.crt certs/fairplay/$name.crt
           done
 
       - uses: actions-rs/toolchain@v1
