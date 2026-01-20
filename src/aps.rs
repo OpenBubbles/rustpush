@@ -3,6 +3,7 @@ use std::{borrow::BorrowMut, cmp::min, collections::HashMap, fmt::Debug, hash::{
 
 use backon::ExponentialBuilder;
 use deku::prelude::*;
+use keystore::RsaKey;
 use log::{debug, error, info};
 use openssl::{hash::MessageDigest, pkey::PKey, rsa::Padding, sha::sha1, sign::Signer};
 use plist::Value;
@@ -14,7 +15,7 @@ use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{activation::activate, auth::{do_signature, generate_nonce, NonceType}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{base64_encode, bin_deserialize_opt, bin_serialize, bin_deserialize, bin_serialize_opt, get_bag, KeyPair, Resource, ResourceManager, APNS_BAG}, OSConfig, PushError};
+use crate::{OSConfig, PushError, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, get_bag}};
 
 #[derive(DekuRead, DekuWrite, Clone, Debug)]
 #[deku(endian = "big")]
@@ -312,7 +313,7 @@ impl APSMessage {
 pub struct APSState {
     #[serde(serialize_with = "bin_serialize_opt", deserialize_with = "bin_deserialize_opt")]
     pub token: Option<[u8; 32]>,
-    pub keypair: Option<KeyPair>,
+    pub keypair: Option<KeyPairNew<RsaKey>>,
 }
 
 pub struct APSInterestToken {
@@ -527,7 +528,7 @@ impl APSConnectionResource {
     }
 
     pub async fn get_token(&self) -> [u8; 32] {
-        self.state.read().await.token.unwrap()
+        self.state.read().await.token.expect("Token not found!")
     }
 
     pub async fn request_topics(&self, topics: Vec<&'static str>) -> APSInterestToken {
@@ -547,7 +548,7 @@ impl APSConnectionResource {
         let pair = state.keypair.as_ref().unwrap();
 
         let nonce = generate_nonce(NonceType::APNS);
-        let signature = do_signature(&PKey::private_key_from_der(&pair.private).unwrap(), &nonce)?;
+        let signature = do_ids_signature(&pair.private, &nonce)?;
 
         info!("Subscribing APS");
         let recv = self.subscribe().await;

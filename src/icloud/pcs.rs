@@ -114,7 +114,7 @@ pub async fn get_boundary_key(service: &PCSService<'_>, keychain: &KeychainClien
     let existing = state.items.get(service.zone).and_then(|items| items.keys.values().find(|v|
         v.get("acct") == Some(&Value::String("PCSBoundaryKey".to_string())) && v.get("srvr") == Some(&Value::String(state.dsid.clone()))));
     if let Some(existing) = existing {
-        Ok(existing["v_Data"].as_data().unwrap().to_vec())
+        Ok(state.get_data(existing)?.unwrap())
     } else {
         let key: [u8; 32] = rand::random();
 
@@ -314,7 +314,7 @@ impl PCSPrivateKey {
     }
 
     pub fn from_dict(dict: &Dictionary, keychain: &KeychainClientState) -> Self {
-        let key = dict.get("v_Data").expect("No dat?").as_data().expect("Not data");
+        let key = keychain.get_data(dict).expect("Failed to get data").expect("No dataa");
 
         let decoded: PCSPrivateKey = rasn::der::decode(&key).expect("Failed to decode private key!");
 
@@ -366,7 +366,7 @@ impl PCSPrivateKey {
             let account = Value::Data(signature.keyid.to_vec());
             let item = keychain.items["ProtectedCloudStorage"].keys.values().find(|x| x.get("atyp") == Some(&account))
                 .ok_or(PushError::MasterKeyNotFound)?;
-            let key = item.get("v_Data").expect("No dat?").as_data().expect("Not data");
+            let key = keychain.get_data(item).expect("Failed to get data").expect("No dataa");
 
             let decoded: PCSPrivateKey = rasn::der::decode(&key).unwrap();
 

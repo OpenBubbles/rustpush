@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, ops::Deref, sync::Arc, time::Duration};
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
@@ -6,6 +6,7 @@ use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, F
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
+use keystore::{AesKeystoreKey, EcCurve, EcKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreDeriveKey, KeystoreDigest, KeystoreKey, KeystorePadding, KeystorePublicKey, KeystoreSignKey, keystore};
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
 use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, encrypt::Encrypter, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private, Public}, rsa::Padding, sha::{sha1, sha256}, sign::{Signer, Verifier}, stack::Stack, symm::{decrypt, encrypt, Cipher}, x509::{store::{X509Store, X509StoreBuilder}, X509StoreContext, X509}};
 use plist::{Data, Date, Dictionary, Value};
@@ -25,7 +26,7 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{TokenProvider, cloudkit::{SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, pcs::PCSKey};
+use crate::{TokenProvider, cloudkit::{SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
@@ -34,6 +35,7 @@ use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, cloudkit::{Cl
 
 use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
 use backon::Retryable;
+use keystore::KeystoreEncryptKey;
 
 // ansi_x963_kdf (use crate later, current dependencies are broken)
 #[inline]
@@ -180,7 +182,7 @@ impl CuttlefishEncItem {
     }
 
     // TODO not secure for raw passwords length, padding is lazy. Only cryptographic keys for now
-    fn encrypt(&mut self, uuid: &str, key: &CloudKey, data: Dictionary) -> Result<(), PushError> {
+    fn encrypt(&mut self, uuid: &str, key: &SivKey, data: Dictionary) -> Result<(), PushError> {
         let record_key: [u8; 64] = rand::random();
         self.wrappedkey = base64_encode(&key.encrypt(&record_key));
 
@@ -203,9 +205,9 @@ impl CuttlefishEncItem {
         Ok(())
     }
 
-    fn decrypt(&self, uuid: &str, record: &Record, keystore: &KeychainKeyStore) -> Result<Dictionary, PushError> {
+    fn decrypt(&self, uuid: &str, record: &Record, keystore: &KeychainKeyStore, keystore_key: &SivKey) -> Result<Dictionary, PushError> {
         let item = keystore.get_key_id(self.parent_key_id()).ok_or(PushError::DecryptionKeyNotFound(self.parent_key_id().to_string()))?;
-        let result = item.decrypt(&base64_decode(&self.wrappedkey));
+        let result = item.decrypt(&keystore_key, &base64_decode(&self.wrappedkey));
 
         let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
 
@@ -319,20 +321,8 @@ impl IESCiphertext {
         })
     }
 
-    pub fn decrypt(&self, key: &EcKey<Private>) -> Result<Vec<u8>, PushError> {
-        let group = key.group();
-
-        let mut num_context_ref = BigNumContext::new()?;
-        
-        let point = EcPoint::from_bytes(group, &*self.ephermeral_sender, &mut num_context_ref)?;
-        let pub_key = EcKey::from_public_key(group, &point)?;
-
-        let key = PKey::from_ec_key(key.clone())?;
-        let pub_key = PKey::from_ec_key(pub_key)?;
-
-        let mut deriver = Deriver::new(&key)?;
-        deriver.set_peer(&pub_key)?;
-        let secret = deriver.derive_to_vec()?;
+    pub fn decrypt(&self, key: &impl KeystoreDeriveKey) -> Result<Vec<u8>, PushError> {
+        let secret = key.derive(&self.ephermeral_sender)?;
         
         let mut data = [0u8; 32 + 16];
         derive_key_into::<Sha256>(&secret, &*self.ephermeral_sender, &mut data);
@@ -351,21 +341,75 @@ impl IESCiphertext {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CloudKey(#[serde(serialize_with = "proto_serialize", deserialize_with = "proto_deserialize")] pub CuttlefishSerializedKey);
+pub struct SivKey(pub Vec<u8>);
 
-impl CloudKey {
+impl SivKey {
     pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
-        let mut cipher = CmacSiv::<Aes256>::new_from_slice(self.0.key()).unwrap();
+        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&self.0).unwrap();
 
         cipher.decrypt::<&[&[u8]; 0], &&[u8]>(&[], payload).unwrap()
     }
 
     pub fn encrypt(&self, payload: &[u8]) -> Vec<u8> {
-        let mut cipher = CmacSiv::<Aes256>::new_from_slice(self.0.key()).unwrap();
+        let mut cipher = CmacSiv::<Aes256>::new_from_slice(&self.0).unwrap();
 
         cipher.encrypt::<&[&[u8]; 0], &&[u8]>(&[], payload).unwrap()
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EncryptedCloudKey (#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>);
+impl EncryptedCloudKey {
+    fn new(cloud: &SivKey, access: &SivKey) -> Self {
+        Self(access.encrypt(&cloud.0))
+    }
+    fn decode(&self, access: &SivKey) -> SivKey {
+        SivKey(access.decrypt(&self.0))
+    }
+
+    pub fn decrypt(&self, access: &SivKey, payload: &[u8]) -> Vec<u8> {
+        self.decode(access).decrypt(payload)
+    }
+
+    pub fn encrypt(&self, access: &SivKey, payload: &[u8]) -> Vec<u8> {
+        self.decode(access).encrypt(payload)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CloudKey {
+    uuid: String,
+    zone_name: String,
+    keyclass: String,
+    key: EncryptedCloudKey,
+}
+
+impl Deref for CloudKey {
+    type Target = EncryptedCloudKey;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.key
+    }
+}
+
+impl CloudKey {
+    pub fn serialize(&self, access: &SivKey) -> CuttlefishSerializedKey {
+        CuttlefishSerializedKey {
+            uuid: Some(self.uuid.clone()),
+            zone_name: Some(self.zone_name.clone()),
+            keyclass: Some(self.keyclass.clone()),
+            key: Some(self.key.decode(access).0),
+        }
+    }
+
+    pub fn from_serialized_key(key: CuttlefishSerializedKey, access: &SivKey) -> Self {
+        Self {
+            uuid: key.uuid.unwrap_or_default(),
+            zone_name: key.zone_name.unwrap_or_default(),
+            keyclass: key.keyclass.unwrap_or_default(),
+            key: EncryptedCloudKey::new(&SivKey(key.key.unwrap_or_default()), access),
+        }
+    }    
 }
 
 fn msg_from_bin(bin: &[u8], header_len: usize, section_count: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
@@ -712,30 +756,109 @@ impl EncodedPeer {
     }
 }
 
+fn digest_to_md(digest: KeystoreDigest) -> MessageDigest {
+    match digest {
+        KeystoreDigest::Sha256 => MessageDigest::sha256(),
+        KeystoreDigest::Sha1 => MessageDigest::sha1(),
+        KeystoreDigest::Sha384 => MessageDigest::sha384(),
+    }
+}
+pub struct SoftEcKey(pub EcKey<Private>);
+impl KeystoreKey for SoftEcKey {
+    fn alias(&self) -> &str {
+        panic!("No alias for software EC Key!")
+    }
+}
+impl KeystorePublicKey for SoftEcKey {
+    fn get_public_key(&self) -> Result<Vec<u8>, keystore::KeystoreError> {
+        Ok(self.0.public_key_to_der()?)
+    }
+}
+impl KeystoreSignKey for SoftEcKey {
+    fn sign(&self, digest: KeystoreDigest, _: KeystorePadding, data: &[u8]) -> Result<Vec<u8>, keystore::KeystoreError> {
+        let pkey = PKey::from_ec_key(self.0.clone())?;
+        let mut my_signer = Signer::new(digest_to_md(digest), &pkey)?;
+        let data = my_signer.sign_oneshot_to_vec(data)?;
+        Ok(data)
+    }
+    fn verify(&self, digest: KeystoreDigest, _: KeystorePadding, data: &[u8], sig: &[u8]) -> Result<bool, keystore::KeystoreError> {
+        let pkey = PKey::from_ec_key(self.0.clone())?;
+        let mut my_verifier = Verifier::new(digest_to_md(digest), &pkey)?;
+        let data = my_verifier.verify_oneshot(sig, data)?;
+        Ok(data)
+    }
+}
+impl KeystoreDeriveKey for SoftEcKey {
+    fn derive(&self, peer: &[u8]) -> Result<Vec<u8>, keystore::KeystoreError> {
+        let group = self.0.group();
+        let mut num_context_ref = BigNumContext::new()?;
+        let point = EcPoint::from_bytes(group, peer, &mut num_context_ref)?;
+        let pub_key = EcKey::from_public_key(group, &point)?;
+
+        let pkey = PKey::from_ec_key(self.0.clone())?;
+        let pkey_pub = PKey::from_ec_key(pub_key)?;
+        let mut deriver = Deriver::new(&pkey)?;
+        deriver.set_peer(&pkey_pub)?;
+
+        Ok(deriver.derive_to_vec()?)
+    }
+}
+
+pub fn encrypt_entry(key: &mut Dictionary, access: &SivKey) {
+    if let Some(Value::Data(d)) = key.remove("v_Data") {
+        key.insert("v_Data_Encrypted".to_string(), Value::Data(access.encrypt(&d)));
+    }
+}
+
+pub fn decrypt_entry(key: &Dictionary, access: &SivKey) -> Dictionary {
+    let mut key = key.clone();
+    if let Some(Value::Data(d)) = key.remove("v_Data_Encrypted") {
+        key.insert("v_Data".to_string(), Value::Data(access.decrypt(&d)));
+    }
+    key
+}
+
+pub struct PrivateUserIdentity {
+    encryption: EcKey<Private>,
+    signing: EcKey<Private>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct KeychainUserIdentity {
+pub struct KeychainUserIdentity<Keys> {
     pub identifier: String,
     #[serde(serialize_with = "proto_serialize", deserialize_with = "proto_deserialize")]
     pub info: SignedInfo,
-    #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv")]
-    signing_key: EcKey<Private>,
-    #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv")]
-    encryption_key: EcKey<Private>,
+    signing_key: Keys,
+    encryption_key: Keys,
     #[serde(serialize_with = "proto_serialize", deserialize_with = "proto_deserialize")]
     current_state: PeerDynamicInfo,
 }
 
-impl KeychainUserIdentity {
-    fn new(mid: &str, model: &str) -> Result<Self, PushError> {
+impl KeychainUserIdentity<EcKeystoreKey> {
+    fn new(mid: &str, model: &str) -> Result<(Self, PrivateUserIdentity), PushError> {
         let curve = EcGroup::from_curve_name(Nid::SECP384R1)?;
-        let signing_key = EcKey::generate(&curve)?;
-        let encryption_key = EcKey::generate(&curve)?;
+        let signing_key_soft = EcKey::generate(&curve)?;
+        let encryption_key_soft = EcKey::generate(&curve)?;
+
+        let keystore_signing_details = KeystoreAccessRules {
+            digests: vec![KeystoreDigest::Sha384, KeystoreDigest::Sha256],
+            ..Default::default()
+        };
+        keystore().destroy_key(&format!("keychain:signing:{mid}"))?;
+        keystore().destroy_key(&format!("keychain:encryption:{mid}"))?;
+        let signing_key = EcKeystoreKey::import(&format!("keychain:signing:{mid}"), EcCurve::P384, &signing_key_soft.private_key_to_der()?, KeystoreAccessRules {
+            can_sign: true,
+            ..keystore_signing_details.clone()
+        })?;
+        let encryption_key = EcKeystoreKey::import(&format!("keychain:encryption:{mid}"), EcCurve::P384, &encryption_key_soft.private_key_to_der()?, KeystoreAccessRules {
+            can_agree: true,
+            ..keystore_signing_details
+        })?;
 
         let info = PeerPermanentInfo {
             epoch: Some(1),
-            signing_key: Some(signing_key.public_key_to_der()?),
-            encryption_key: Some(encryption_key.public_key_to_der()?),
+            signing_key: Some(signing_key.get_public_key()?),
+            encryption_key: Some(encryption_key.get_public_key()?),
             machine_id: Some(mid.to_string()),
             model_id: Some(model.to_string()),
             creation_time: Some(duration_since_epoch().as_millis() as u64),
@@ -755,17 +878,22 @@ impl KeychainUserIdentity {
         item.info = item.sign_payload(info, "TPPB.PeerPermanentInfo")?;
         item.identifier = format!("SHA256:{}", base64_encode(&sha256(&[item.info.info(), item.info.signature()].concat())));
 
-        Ok(item)
+        Ok((item, PrivateUserIdentity {
+            encryption: encryption_key_soft,
+            signing: signing_key_soft,
+        }))
     }
+}
 
-    fn sign_bytes_dig(&self, dig: MessageDigest, bytes: &[u8]) -> Result<Vec<u8>, PushError> {
-        let mut signer = Signer::new(dig, PKey::from_ec_key(self.signing_key.clone())?.as_ref())?;
-        signer.update(bytes)?;
-        Ok(signer.sign_to_vec()?)
+impl<Keys: KeystoreSignKey> KeychainUserIdentity<Keys> {
+
+    fn sign_bytes_dig(&self, dig: KeystoreDigest, bytes: &[u8]) -> Result<Vec<u8>, PushError> {
+        let key = self.signing_key.sign(dig, KeystorePadding::None, bytes)?;
+        Ok(key)
     }
 
     fn sign_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>, PushError> {
-        self.sign_bytes_dig(MessageDigest::sha384(), bytes)
+        self.sign_bytes_dig(KeystoreDigest::Sha384, bytes)
     }
 
     pub fn sign_payload<T: prost::Message>(&self, message: T, r#type: &str) -> Result<SignedInfo, PushError> {
@@ -790,12 +918,11 @@ impl KeychainUserIdentity {
         }, "TPPB.Voucher")
     }
 
-    fn share_tlks<T: HasPublic>(&self, keys: &[CloudKey], peer: &str, peer_key: &EcKey<T>) -> Result<Vec<TlkShare>, PushError> {
+    fn share_tlks<T: HasPublic>(&self, keys: &[CuttlefishSerializedKey], peer: &str, peer_key: &EcKey<T>) -> Result<Vec<TlkShare>, PushError> {
         let mut bnref = BigNumContext::new()?;
 
         let mut shares: Vec<TlkShare> = vec![];
         for share in keys {
-            let share = &share.0;
             // encrypt it with our key
             let ciphertext = IESCiphertext::new(peer_key, &share.encode_to_vec())?;
             let raw: HashMap<String, Value> = plist::from_value(&plist::to_value(&ciphertext)?)?;
@@ -814,7 +941,7 @@ impl KeychainUserIdentity {
                 wrapped_key: Some(base64_encode(&wrapped_key))
             };
 
-            share.signature = Some(base64_encode(&self.sign_bytes_dig(MessageDigest::sha256(), &[
+            share.signature = Some(base64_encode(&self.sign_bytes_dig(KeystoreDigest::Sha256, &[
                 &0u64.to_le_bytes()[..], // version
                 share.receiver.as_ref().unwrap().as_bytes(),
                 share.sender.as_ref().unwrap().as_bytes(),
@@ -854,16 +981,16 @@ pub struct SerializableRecord(#[serde(serialize_with = "proto_serialize", deseri
 struct KeychainKeyStore(Vec<CloudKey>);
 impl KeychainKeyStore {
     fn store_key(&mut self, key: CloudKey) {
-        self.0.retain(|t| t.0.keyclass() != key.0.keyclass() || t.0.zone_name() != key.0.zone_name());
+        self.0.retain(|t| t.keyclass != key.keyclass || t.zone_name != key.zone_name);
         self.0.push(key);
     }
 
     pub fn get_key(&self, zone: &str, class: &str) -> Option<&CloudKey> {
-        self.0.iter().find(|k| k.0.zone_name() == zone && k.0.keyclass() == class)
+        self.0.iter().find(|k| k.zone_name == zone && k.keyclass == class)
     }
 
     pub fn get_key_id(&self, uuid: &str) -> Option<&CloudKey> {
-        self.0.iter().find(|k| k.0.uuid() == uuid)
+        self.0.iter().find(|k| k.uuid == uuid)
     }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -882,8 +1009,27 @@ impl SavedKeychainZone {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CurrentBottle {
     bottle_id: String,
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     escrowed_signing_key: Vec<u8>,
     bottle: EscrowBottle,
+}
+
+impl CurrentBottle {
+    pub fn save(&self, dsid: &str) -> Result<Vec<u8>, PushError> {
+        let key = AesKeystoreKey::ensure(&format!("keychain:escrow-backup-key:{}", dsid), 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?;
+
+        Ok(key.encrypt(&plist_to_bin(self)?, &mut EncryptMode::Gcm)?)
+    }
+
+    pub fn restore(data: &[u8], dsid: &str) -> Result<Self, PushError> {
+        let result = AesKeystoreKey(format!("keychain:escrow-backup-key:{}", dsid)).decrypt(data, &EncryptMode::Gcm)?;
+        Ok(plist::from_bytes(&result)?)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -893,8 +1039,9 @@ pub struct KeychainClientState {
     host: String,
     state_token: Option<String>,
     state: HashMap<String, EncodedPeer>,
-    pub user_identity: Option<KeychainUserIdentity>,
-    current_bottle: Option<CurrentBottle>,
+    pub user_identity: Option<KeychainUserIdentity<EcKeystoreKey>>,
+    #[serde(serialize_with = "bin_serialize_opt_vec", deserialize_with = "bin_deserialize_opt_vec", default)]
+    current_bottle: Option<Vec<u8>>,
     keystore: KeychainKeyStore,
     pub items: HashMap<String, SavedKeychainZone>,
 }
@@ -917,6 +1064,24 @@ impl KeychainClientState {
     // filter out custodian recovery keys
     pub fn peers(&self) -> impl Iterator<Item = &EncodedPeer> {
         self.state.values().filter(|v| v.0.dynamic_info.is_some())
+    }
+
+    // note - each call talks to keystore and may talk to a HSM
+    pub fn get_cloudkey_access_key(&self) -> Result<SivKey, PushError> {
+        Ok(SivKey(keystore().ensure_secret(&format!("keychain:cloudkey-access-key:{}", self.dsid), 64)?))
+    }
+
+    // note - each call talks to keystore and may talk to a HSM
+    pub fn get_keychain_access_key(&self) -> Result<SivKey, PushError> {
+        Ok(SivKey(keystore().ensure_secret(&format!("keychain:access-key:{}", self.dsid), 64)?))
+    }
+
+    pub fn get_data(&self, entry: &Dictionary) -> Result<Option<Vec<u8>>, PushError> {
+        Ok(if let Some(Value::Data(d)) = entry.get("v_Data") {
+            Some(d.clone())
+        } else if let Some(Value::Data(d)) = entry.get("v_Data_Encrypted") {
+            Some(self.get_keychain_access_key()?.decrypt(d))
+        } else { None })
     }
 }
 
@@ -1092,7 +1257,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(())
     }
     
-    pub async fn insert_keychain(&self, uuid: &str, zone: &str, class: &str, dict: Dictionary, pcs: Option<&PCSMeta>, associated_tag: Option<&str>) -> Result<(), PushError> {
+    pub async fn insert_keychain(&self, uuid: &str, zone: &str, class: &str, mut dict: Dictionary, pcs: Option<&PCSMeta>, associated_tag: Option<&str>) -> Result<(), PushError> {
         let security_container = self.get_security_container().await?;
 
         let mut state = self.state.write().await;
@@ -1114,12 +1279,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             encver: 2,
             parentkeyref: Reference {
                 r#type: Some(reference::Type::Validating as i32),
-                record_identifier: Some(record_identifier(record_zone.clone(), key.0.uuid())),
+                record_identifier: Some(record_identifier(record_zone.clone(), &key.uuid)),
             },
             ..Default::default()
         };
 
-        item.encrypt(&uuid, key, dict.clone())?;
+        item.encrypt(&uuid, &key.decode(&state.get_cloudkey_access_key()?), dict.clone())?;
 
         let mut ops = vec![SaveRecordOperation::new(
                 record_identifier(record_zone.clone(), &uuid), item, None, false)];
@@ -1134,11 +1299,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         }
         
         security_container.perform_operations_checked(&CloudKitSession::new(), &ops, IsolationLevel::Zone).await?;
+        
 
+        encrypt_entry(&mut dict, &state.get_keychain_access_key()?);
+        
         let zone = state.items.entry(zone.to_string()).or_default();
         if let Some(tag) = associated_tag {
             zone.current_keys.insert(tag.to_string(), uuid.to_string());
         }
+
         zone.keys.insert(uuid.to_string(), dict);
 
         (self.update_state)(&state);
@@ -1155,7 +1324,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         if state.keystore.0.is_empty() {
             let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
             drop(state);
-            self.store_keys(&shares).await;
+            self.store_keys(&shares).await?;
         } else {
             drop(state);
         }
@@ -1173,23 +1342,27 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let item = result?;
 
         let state = &mut *state;
+        let cloudkey_access = state.get_cloudkey_access_key()?;
+        let keychain_access = state.get_keychain_access_key()?;
 
         for (zone, (_, changes, change)) in zones.iter().zip(item.into_iter()) {
             let saved_keychain_zone = state.items.entry(zone.to_string()).or_default();
             saved_keychain_zone.change_tag = change.clone().map(|i| i.into());
             for change in changes {
+                let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
                 let Some(record) = change.record else {
-                    warn!("record missing change {:?}", change);
+                    saved_keychain_zone.keys.remove(&identifier);
+                    saved_keychain_zone.current_keys.remove(&identifier);
                     continue
                 };
-                let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
                 if record.r#type.as_ref().unwrap().name() == CuttlefishEncItem::record_type() {
                     let item = CuttlefishEncItem::from_record(&record.record_field);
-                    let Ok(decoded) = item.decrypt(&identifier, &record, &state.keystore) else {
+                    let Ok(mut decoded) = item.decrypt(&identifier, &record, &state.keystore, &cloudkey_access) else {
                         warn!("Missing decryption key for {}", identifier);
                         continue;
                     };
 
+                    encrypt_entry(&mut decoded, &keychain_access);
                     saved_keychain_zone.keys.insert(identifier, decoded);
                 } else if record.r#type.as_ref().unwrap().name() == CuttlefishCurrentItem::record_type() {
                     let item = CuttlefishCurrentItem::from_record(&record.record_field);
@@ -1216,6 +1389,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     pub async fn reset_clique(&self, device_password: &[u8]) -> Result<(), PushError> {
+
         let response: CuttlefishFetchViableBottleResponse = self.invoke_cuttlefish("fetchViableBottles", CuttlefishFetchViableBottleRequest {
             filter: Some(1),
             metrics: Some(vec![])
@@ -1226,29 +1400,21 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             self.delete(bottle.id()).await?;
         }
 
-        let mut state = self.state.write().await;
-        state.current_bottle = None;
-        state.state = HashMap::new();
-        state.state_token = None;
-        state.user_identity = None;
-        state.keystore.0.clear();
-        state.items.clear();
-        (self.update_state)(&state);
-
-        drop(state);
-
-        self.ensure_user_identity().await?;
+        let private = self.new_user_identity().await?;
 
         let data = self.config.get_register_meta().os_version;
         let mut item = data.split(",");
         let meta = format!("{} {} ({})", item.next().unwrap(), item.next().unwrap(), item.next().unwrap());
 
-        let mut shares: Vec<CloudKey> = vec![];
+        let mut shares: Vec<CuttlefishSerializedKey> = vec![];
         let mut viewkeys: Vec<ViewKeys> = vec![];
         let mut delete_ops = vec![];
 
         let security = self.get_security_container().await?;        
         let mut state = self.state.write().await;
+
+        let access_key = state.get_cloudkey_access_key()?;
+
         for zone in KEYCHAIN_ZONES {
             let tlk_id = Uuid::new_v4().to_string().to_uppercase();
             let class_a_id = Uuid::new_v4().to_string().to_uppercase();
@@ -1256,12 +1422,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             let tlk: [u8; 64] = rand::random();
             let class_a: [u8; 64] = rand::random();
             let class_c: [u8; 64] = rand::random();
-            let tlk_key = CloudKey(CuttlefishSerializedKey {
-                uuid: Some(tlk_id.clone()),
-                zone_name: Some(zone.to_string()),
-                keyclass: Some("tlk".to_string()),
-                key: Some(tlk.to_vec()),
-            });
+            let tlk_key = SivKey(tlk.to_vec());
 
             viewkeys.push(ViewKeys {
                 service: Some(zone.to_string()), 
@@ -1289,21 +1450,31 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 old_top_level_key: None
             });
 
-            state.keystore.0.push(tlk_key.clone());
-            state.keystore.0.push(CloudKey(CuttlefishSerializedKey {
-                uuid: Some(class_a_id.clone()),
-                zone_name: Some(zone.to_string()),
-                keyclass: Some("classA".to_string()),
-                key: Some(class_a.to_vec()),
-            }));
-            state.keystore.0.push(CloudKey(CuttlefishSerializedKey {
-                uuid: Some(class_c_id.clone()),
-                zone_name: Some(zone.to_string()),
-                keyclass: Some("classC".to_string()),
-                key: Some(class_c.to_vec()),
-            }));
+            state.keystore.0.push(CloudKey {
+                uuid: tlk_id.clone(),
+                zone_name: zone.to_string(),
+                keyclass: "tlk".to_string(),
+                key: EncryptedCloudKey::new(&tlk_key, &access_key),
+            });
+            state.keystore.0.push(CloudKey {
+                uuid: class_a_id.clone(),
+                zone_name: zone.to_string(),
+                keyclass: "classA".to_string(),
+                key: EncryptedCloudKey::new(&SivKey(class_a.to_vec()), &access_key),
+            });
+            state.keystore.0.push(CloudKey {
+                uuid: class_c_id.clone(),
+                zone_name: zone.to_string(),
+                keyclass: "classC".to_string(),
+                key: EncryptedCloudKey::new(&SivKey(class_c.to_vec()), &access_key),
+            });
 
-            shares.push(tlk_key);
+            shares.push(CuttlefishSerializedKey {
+                uuid: Some(tlk_id.clone()),
+                zone_name: Some(zone.to_string()),
+                keyclass: Some("tlk".to_string()),
+                key: Some(tlk_key.0),
+            });
             delete_ops.push(ZoneDeleteOperation::new(security.private_zone(zone.to_string())));
         }
 
@@ -1323,7 +1494,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 reason: Some(3),
             }).await?;
 
-            self.join_clique(device_password, None, &shares, viewkeys.clone()).await?;
+            self.join_clique(device_password, &private, None, &shares, viewkeys.clone()).await?;
             Ok(())
         })
             .retry(&ConstantBuilder::default()
@@ -1470,7 +1641,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     // returns the keychain identity for the recovered peer
-    pub async fn recover_bottle(&self, bottle: &EscrowData, password: &[u8]) -> Result<KeychainUserIdentity, PushError> {
+    pub async fn recover_bottle(&self, bottle: &EscrowData, password: &[u8]) -> Result<KeychainUserIdentity<SoftEcKey>, PushError> {
         // Sync changes
         self.sync_changes().await?;
 
@@ -1518,37 +1689,33 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(KeychainUserIdentity {
             identifier: outer_bottle.peer_id().to_string(),
             info: peer.0.permanent_info.clone().unwrap(),
-            signing_key: ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap()),
-            encryption_key: ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap()),
+            signing_key: SoftEcKey(ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap())),
+            encryption_key: SoftEcKey(ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap())),
             current_state: peer.get_dynamic_info()?,
         })
     }
 
-    pub async fn ensure_user_identity(&self) -> Result<(), PushError> {
-        let state = self.state.read().await;
-        if state.user_identity.is_some() {
-            return Ok(())
-        }
-        drop(state);
+    pub async fn new_user_identity(&self) -> Result<PrivateUserIdentity, PushError> {
+        let mut state = self.state.write().await;
 
         let mut anisette_lock = self.anisette.lock().await;
         let machine_id = anisette_lock.get_headers().await?.get("X-Apple-I-MD-M").unwrap().clone();
         drop(anisette_lock);
 
-        let mut state = self.state.write().await;
-        // create our user identity
-        if state.user_identity.is_none() {
-            state.user_identity = Some(KeychainUserIdentity::new(&machine_id, &self.config.get_register_meta().hardware_version)?);
-        }
-        Ok(())
+        let (identity, private) = KeychainUserIdentity::new(&machine_id, &self.config.get_register_meta().hardware_version)?;
+        
+        state.current_bottle = None;
+        state.state = HashMap::new();
+        state.state_token = None;
+        state.user_identity = Some(identity);
+        state.keystore.0.clear();
+        state.items.clear();
+        (self.update_state)(&state);
+        Ok(private)
     }
 
     async fn derive_trust_from_included_peer(&self, peer_id: &str) -> Result<(), PushError> {
         self.sync_changes().await?;
-
-        info!("Synced changes!");
-        self.ensure_user_identity().await?;
-        info!("Got user identity!");
 
         let mut state = self.state.write().await;
         let Some(included_peer) = state.state.get(peer_id) else { return Err(PushError::PeerNotFound) };
@@ -1575,7 +1742,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         (self.update_state)(&state);
     }
 
-    pub async fn fetch_shares_for(&self, user: &KeychainUserIdentity) -> Result<Vec<CloudKey>, PushError> {
+    pub async fn fetch_shares_for(&self, user: &KeychainUserIdentity<impl KeystoreDeriveKey>) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
         let response: CuttlefishFetchRecoverableTlkSharesResponse = self.invoke_cuttlefish("fetchRecoverableTLKShares", CuttlefishFetchRecoverableTlkSharesRequest {
             for_peer: Some(user.identifier.clone()),
         }).await?;
@@ -1598,7 +1765,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             let wrapped: IESCiphertext = plist::from_value(&plist::to_value(&decoded)?)?;
             let decrypted = wrapped.decrypt(&user.encryption_key)?;
 
-            let result = CloudKey(CuttlefishSerializedKey::decode(Cursor::new(&decrypted))?);
+            let result = CuttlefishSerializedKey::decode(Cursor::new(&decrypted))?;
+            let result_key = SivKey(result.key().to_vec());
 
             let Some(viewkeys) = &share.viewkeys else {
                 keys.push(result);
@@ -1609,13 +1777,13 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             for key in items {
                 let Some(key) = key else { continue };
                 let key2 = CuttlefishSyncKey::from_record(&key.inner.as_ref().unwrap().record_field);
-                let rawkey = result.decrypt(&base64_decode(&key2.wrappedkey));
-                keys.push(CloudKey(CuttlefishSerializedKey {
+                let rawkey = result_key.decrypt(&base64_decode(&key2.wrappedkey));
+                keys.push(CuttlefishSerializedKey {
                     uuid: Some(key.inner.as_ref().unwrap().record_identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string()), 
-                    zone_name: result.0.zone_name.clone(),
+                    zone_name: result.zone_name.clone(),
                     keyclass: Some(key2.class), 
                     key: Some(rawkey),
-                }));
+                });
             }
 
             
@@ -1625,17 +1793,25 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(keys)
     }
 
-    pub async fn get_tlks(&self) -> Vec<CloudKey> {
+    pub async fn get_share_tlks(&self) -> Result<Vec<CuttlefishSerializedKey>, PushError> {
         let state = self.state.read().await;
-        state.keystore.0.iter().filter(|k| k.0.keyclass == Some("tlk".to_string())).cloned().collect()
+        let state_key = state.get_cloudkey_access_key()?;
+        let mut results = vec![];
+        for k in &state.keystore.0 {
+            if k.keyclass != "tlk".to_string() { continue }
+            results.push(k.serialize(&state_key));
+        }
+        Ok(results)
     }
 
-    pub async fn store_keys(&self, keys: &[CloudKey]) {
+    pub async fn store_keys(&self, keys: &[CuttlefishSerializedKey]) -> Result<(), PushError> {
         let mut state = self.state.write().await;
+        let access_key = state.get_cloudkey_access_key()?;
         for key in keys {
-            state.keystore.store_key(key.clone());
+            state.keystore.store_key(CloudKey::from_serialized_key(key.clone(), &access_key));
         }
         (self.update_state)(&state);
+        Ok(())
     }
 
     pub fn generate_stable_info(&self, state: &KeychainClientState) -> PeerStableInfo {
@@ -1659,7 +1835,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         }
     }
 
-    pub async fn share_tlks_to_peer(&self, peer: &EncodedPeer, tlks: &[CloudKey]) -> Result<(), PushError> {
+    pub async fn share_tlks_to_peer(&self, peer: &EncodedPeer, tlks: &[CuttlefishSerializedKey]) -> Result<(), PushError> {
         let mut state = self.state.write().await;
         let user_identity_ref = state.user_identity.as_ref().unwrap();
 
@@ -1680,7 +1856,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn join_clique_from_escrow(&self, bottle: &EscrowData, password: &[u8], device_password: &[u8]) -> Result<(), PushError> {
         let other_identity = self.recover_bottle(bottle, password).await?;
 
-        self.ensure_user_identity().await?;
+        let new_identity = self.new_user_identity().await?;
         let state = self.state.read().await;
         let my_identity = state.user_identity.as_ref().unwrap();
 
@@ -1689,11 +1865,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         drop(state);
 
         let shares = self.fetch_shares_for(&other_identity).await?;
-        self.join_clique(device_password, Some(voucher), &shares, vec![]).await?;
+        self.join_clique(device_password, &new_identity, Some(voucher), &shares, vec![]).await?;
         Ok(())
     }
 
-    pub async fn join_clique(&self, device_password: &[u8], voucher: Option<SignedInfo>, with_tlk_shares: &[CloudKey], viewkeys: Vec<ViewKeys>) -> Result<(), PushError> {
+    pub async fn join_clique(&self, device_password: &[u8], private_identity: &PrivateUserIdentity, voucher: Option<SignedInfo>, with_tlk_shares: &[CuttlefishSerializedKey], viewkeys: Vec<ViewKeys>) -> Result<(), PushError> {
         if let Some(voucher) = &voucher {
             self.derive_trust_from_included_peer(Voucher::decode(Cursor::new(voucher.info()))?.sponsor.as_ref().unwrap()).await?;
         } else {
@@ -1724,12 +1900,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         drop(state);
 
-        let my_bottle = self.create_bottle(device_password).await?;
+        let my_bottle = self.create_bottle(device_password, private_identity).await?;
 
         let mut state = self.state.write().await;
         let user_identity_ref = state.user_identity.as_ref().unwrap();
 
-        let shares = user_identity_ref.share_tlks(with_tlk_shares, peer.hash(), &user_identity_ref.encryption_key)?;
+        let shares = user_identity_ref.share_tlks(with_tlk_shares, peer.hash(), &EcKey::public_key_from_der(&user_identity_ref.encryption_key.get_public_key()?)?)?;
         if using_voucher {
             if let CuttlefishJoinWithVoucherResponse { changes: Some(changes) } = self.invoke_cuttlefish("joinWithVoucher", CuttlefishJoinWithVoucherRequest {
                 restore_point: state.state_token.clone(),
@@ -1759,10 +1935,10 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             // fetch tlk shares
             let shares = self.fetch_shares_for(state.user_identity.as_ref().unwrap()).await?;
             drop(state);
-            self.store_keys(&shares).await;
+            self.store_keys(&shares).await?;
         } else {
             drop(state);
-            self.store_keys(with_tlk_shares).await;
+            self.store_keys(with_tlk_shares).await?;
         }
 
         info!("Joined clique!");
@@ -1770,7 +1946,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         Ok(())
     }
 
-    async fn create_bottle(&self, password: &[u8]) -> Result<Bottle, PushError> {
+    async fn create_bottle(&self, password: &[u8], private_identity: &PrivateUserIdentity) -> Result<Bottle, PushError> {
         let escrow_bottle = EscrowBottle::new();
 
         let mut state = self.state.write().await;
@@ -1785,11 +1961,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let internal = OtInternalBottle {
             signing_key: Some(OtPrivateKey {
                 key_type: Some(1),
-                key_data: Some(ec_key_to_apple(&user_identity_ref.signing_key)),
+                key_data: Some(ec_key_to_apple(&private_identity.signing)),
             }),
             encryption_key: Some(OtPrivateKey {
                 key_type: Some(1),
-                key_data: Some(ec_key_to_apple(&user_identity_ref.encryption_key)),
+                key_data: Some(ec_key_to_apple(&private_identity.encryption)),
             }),
         };
         
@@ -1804,8 +1980,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             bottle_id: Some(bottle_id.clone()),
             escrowed_encryption_key: Some(encryption.public_key_to_der()?),
             escrowed_signing_key: Some(signing.public_key_to_der()?),
-            peer_encryption_key: Some(user_identity_ref.encryption_key.public_key_to_der()?),
-            peer_signing_key: Some(user_identity_ref.signing_key.public_key_to_der()?),
+            peer_encryption_key: Some(user_identity_ref.encryption_key.get_public_key()?),
+            peer_signing_key: Some(user_identity_ref.signing_key.get_public_key()?),
             ciphertext: Some(OtAuthenticatedCiphertext {
                 ciphertext: Some(result[..result.len() - 16].to_vec()),
                 authentication_code: Some(result[result.len() - 16..].to_vec()),
@@ -1815,10 +1991,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let data = ot_bottle.encode_to_vec();
 
-        let key = PKey::from_ec_key(user_identity_ref.signing_key.clone())?;
-        let mut signer = Signer::new(MessageDigest::sha384(), &key)?;
-        signer.update(&data)?;
-        let peer_signature = signer.sign_to_vec()?;
+        let peer_signature = user_identity_ref.signing_key.sign(KeystoreDigest::Sha384, KeystorePadding::None, &data)?;
 
         let key = PKey::from_ec_key(signing.clone())?;
         let mut signer = Signer::new(MessageDigest::sha384(), &key)?;
@@ -1841,7 +2014,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             bottle_id: bottle_id.clone(), 
             escrowed_signing_key: escrowed_signing_key.clone(), 
             bottle: escrow_bottle.clone(),
-        });
+        }.save(&state.dsid)?);
 
         drop(state);
 
@@ -1864,6 +2037,8 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn change_escrow_password(&self, new_password: &[u8]) -> Result<(), PushError> {
         let state = self.state.read().await;
         let Some(escrow_bottle) = state.current_bottle.clone() else { return Ok(()) };
+
+        let escrow_bottle = CurrentBottle::restore(&escrow_bottle, &state.dsid)?;
 
         let user_identity_ref = state.user_identity.as_ref().unwrap();
         let bottle_label = format!("com.apple.icdp.record.{}", user_identity_ref.identifier.clone());

@@ -1597,6 +1597,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "keystore"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "openssl",
+ "plist",
+ "rand 0.8.5",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "konst"
 version = "0.3.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2808,6 +2821,7 @@ dependencies = [
  "hkdf",
  "html-escape",
  "icloud_auth",
+ "keystore",
  "libflate",
  "log",
  "notify",
@@ -2833,6 +2847,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "uuid",
+ "x509-cert",
  "xml-rs",
  "zip",
 ]

@@ -5,6 +5,7 @@ use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, Oct
 use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, CircleSendMessage, LoginState};
+use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
 use openssl::{ec::EcKey, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sha::sha1, sign::Signer, x509::{X509Name, X509Req}};
@@ -19,8 +20,9 @@ use uuid::Uuid;
 use rand::Rng;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
 use deku::{DekuContainerWrite, DekuUpdate};
+use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
 
-use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient}, util::{IDS_BAG, KeyPair, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -278,19 +280,45 @@ struct AuthCertResponse {
     cert: Data,
 }
 
-fn generate_auth_csr(user_id: &str) -> Result<(PKey<Private>, Vec<u8>), PushError> {
-    let key = PKey::from_rsa(Rsa::generate(2048)?)?;
-    
-    let mut name = X509Name::builder()?;
-    name.append_entry_by_nid(Nid::COMMONNAME, &encode_hex(&sha1(user_id.as_bytes())).to_uppercase())?;
+fn generate_auth_csr(user_id: &str) -> Result<(RsaKey, Vec<u8>), PushError> {
+    use x509_cert::der::{Decode as X509Decode, Encode as X509Encode};
+    let key = RsaKey::overwrite(&format!("ids:{user_id}"), 2048, KeystoreAccessRules {
+        signature_padding: vec![KeystorePadding::PKCS1],
+        digests: vec![KeystoreDigest::Sha1],
+        can_sign: true,
+        ..Default::default()
+    })?;
 
-    let mut csr = X509Req::builder()?;
-    csr.set_version(0)?;
-    csr.set_pubkey(&key)?;
-    csr.set_subject_name(&name.build())?;
-    csr.sign(&key, MessageDigest::sha1())?;
+    let public_key = SubjectPublicKeyInfo::from_der(&key.get_public_key()?).unwrap();
+    let common_name = encode_hex(&sha1(user_id.as_bytes())).to_uppercase();
+    let request = CertReqInfo {
+        version: x509_cert::request::Version::V1,
+        subject: RdnSequence(vec![
+            RelativeDistinguishedName(SetOfVec::from_iter([
+                AttributeTypeAndValue {
+                    oid: ObjectIdentifier::new("2.5.4.3").unwrap(), // commonname
+                    value: Utf8StringRef::new(&common_name).unwrap().into(),
+                }
+            ]).unwrap())
+        ]),
+        public_key,
+        attributes: SetOfVec::new(),
+    };
 
-    Ok((key, csr.build().to_der()?))
+    let req_info = request.to_der().unwrap();
+
+    let sign = key.sign(KeystoreDigest::Sha1, KeystorePadding::PKCS1, &req_info)?;
+
+    let result = CertReq {
+        info: request,
+        algorithm: AlgorithmIdentifier {
+            oid: ObjectIdentifier::new("1.2.840.113549.1.1.5").unwrap(),
+            parameters: Some(Null.into()),
+        },
+        signature: BitString::from_bytes(&sign).unwrap(),
+    };
+
+    Ok((key, result.to_der().unwrap()))
 }
 
 async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, user_type: IDSUserType) -> Result<IDSUser, PushError> {
@@ -317,7 +345,7 @@ async fn authenticate(os_config: &dyn OSConfig, user_id: &str, request: Value, u
         return Err(PushError::CertError(plist::from_bytes(&resp)?))
     }
 
-    let keypair = KeyPair { cert: parsed.cert.into(), private: key.private_key_to_der()? };
+    let keypair = KeyPairNew { cert: parsed.cert.into(), private: key };
     
     Ok(IDSUser {
         auth_keypair: keypair,
@@ -436,7 +464,7 @@ pub async fn authenticate_smsless(auth: &PhoneNumberResponse, host: &str, os_con
         return Err(PushError::CertError(plist::from_bytes(&resp)?))
     }
 
-    let keypair = KeyPair { cert: response.cert.into(), private: key.private_key_to_der()? };
+    let keypair = KeyPairNew { cert: response.cert.into(), private: key };
     
     Ok(IDSUser {
         auth_keypair: keypair,
@@ -477,11 +505,10 @@ pub fn build_payload(nonce: &[u8], fields: &[&[u8]]) -> Vec<u8> {
     items.concat()
 }
 
-pub fn do_signature(key: &PKey<Private>, payload: &[u8]) -> Result<Vec<u8>, PushError> {
-    let mut signer = Signer::new(MessageDigest::sha1(), key)?;
-    signer.set_rsa_padding(Padding::PKCS1)?;
+pub fn do_ids_signature(key: &RsaKey, payload: &[u8]) -> Result<Vec<u8>, PushError> {
+    let signer = key.sign(KeystoreDigest::Sha1, KeystorePadding::PKCS1, &payload)?;
 
-    Ok([vec![1, 1], signer.sign_oneshot_to_vec(payload)?].concat())
+    Ok([vec![1, 1], signer].concat())
 }
 
 pub enum KeyType {
@@ -539,8 +566,7 @@ impl<S: RequestState> SignedRequest<S> {
         self
     }
 
-    pub fn sign(mut self, pair: &KeyPair, key_type: KeyType, aps: &APSState, item: Option<usize>) -> Result<SignedRequest<Signed>, PushError> {
-        let key = PKey::private_key_from_der(&pair.private)?;
+    pub fn sign(mut self, pair: &KeyPairNew<RsaKey>, key_type: KeyType, aps: &APSState, item: Option<usize>) -> Result<SignedRequest<Signed>, PushError> {
         let name = key_type.name();
         let nonce = generate_nonce(NonceType::HTTP);
         let postfix = item.map(|i| format!("-{i}")).unwrap_or_default();
@@ -552,7 +578,7 @@ impl<S: RequestState> SignedRequest<S> {
             &self.body,
             aps.token.as_ref().unwrap(),
         ]);   
-        self.headers.append::<HeaderName>(format!("x-{name}-sig{postfix}").try_into().unwrap(), base64_encode(&do_signature(&key, &payload)?).parse().unwrap());
+        self.headers.append::<HeaderName>(format!("x-{name}-sig{postfix}").try_into().unwrap(), base64_encode(&do_ids_signature(&pair.private, &payload)?).parse().unwrap());
         self.headers.append::<HeaderName>(format!("x-{name}-cert{postfix}").try_into().unwrap(), base64_encode(&pair.cert).parse().unwrap());
         Ok(SignedRequest {
             headers: self.headers,
@@ -797,6 +823,7 @@ pub struct CircleClientSession<P: AnisetteProvider> {
     saved_device_password: Option<Vec<u8>>,
     pub session_id: Option<String>,
     atxid: String,
+    private_identity: Option<PrivateUserIdentity>,
 }
 
 impl<P: AnisetteProvider> CircleClientSession<P> {
@@ -838,7 +865,8 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
             channel: None,
             saved_device_password: None,
             session_id: response.sid,
-            atxid
+            atxid,
+            private_identity: None,
         })
     }
 
@@ -936,7 +964,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
                     info: message.step5.as_ref().unwrap().voucher.clone(),
                     signature: message.step5.as_ref().unwrap().voucher_sig.clone(),
                 };
-                self.trusted_peers.as_ref().unwrap().join_clique(self.saved_device_password.as_ref().unwrap(), Some(info), &[], vec![]).await?;
+                self.trusted_peers.as_ref().unwrap().join_clique(self.saved_device_password.as_ref().unwrap(), self.private_identity.as_ref().expect("no private identity??"), Some(info), &[], vec![]).await?;
                 return Ok(Some(LoginState::LoggedIn))
             }
             _circlestep => {
@@ -947,7 +975,7 @@ impl<P: AnisetteProvider> CircleClientSession<P> {
     }
 
     pub async fn setup_trusted_peers(&mut self, peers: Arc<KeychainClient<P>>, device_password: &[u8]) -> Result<(), PushError> {
-        peers.ensure_user_identity().await?;
+        self.private_identity = Some(peers.new_user_identity().await?);
 
         let Some(request) = &self.saved_step else { return Ok(()) };
         if request.step != 4 {
@@ -1170,7 +1198,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 
 
                 let peers = self.trusted_peers.as_ref().unwrap();
-                let tlks = peers.get_tlks().await;
+                let tlks = peers.get_share_tlks().await?;
                 peers.share_tlks_to_peer(&cuttlefish_peer, &tlks).await?;
 
                 let voucher = peers.state.read().await.user_identity.as_ref().unwrap().vouch_for(cuttlefish_peer.0.hash().to_string())?;

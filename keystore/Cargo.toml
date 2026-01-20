@@ -1,0 +1,13 @@
+[package]
+name = "keystore"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+plist = "1.7.0"
+thiserror = "1.0.47"
+openssl = { version = "0.10.56", features = ["vendored"] }
+rand = { version = "0.8.5", features = ["min_const_gen"] }
+aes-gcm = "0.10.3"
+sha2 = "0.10.8"

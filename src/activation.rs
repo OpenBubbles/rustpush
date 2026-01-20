@@ -1,11 +1,14 @@
-use openssl::{hash::MessageDigest, nid::Nid, pkey::PKey, rsa::{Padding, Rsa}, sign::Signer, x509::{X509Name, X509Req, X509}};
+use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
+use openssl::{hash::MessageDigest, nid::Nid, pkey::{PKey, Params}, rsa::{Padding, Rsa}, sign::Signer, x509::{X509, X509Name, X509Req}};
 use plist::{Data, Value};
 use rand::{seq::SliceRandom, thread_rng};
+use rasn::types::Oid;
 use regex::Regex;
 use reqwest::Version;
 use serde::Serialize;
+use x509_cert::{attr::AttributeTypeAndValue, der::{Decode, Encode, EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
 
-use crate::{util::{get_nested_value, REQWEST, plist_to_buf, plist_to_string, KeyPair}, OSConfig, PushError};
+use crate::{OSConfig, PushError, util::{KeyPair, KeyPairNew, REQWEST, get_nested_value, plist_to_buf, plist_to_string}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -61,21 +64,45 @@ fn fairplay_sign(data: &[u8]) -> Result<(&'static [u8], Vec<u8>), PushError> {
     Ok((*cert, signer.sign_oneshot_to_vec(data)?))
 }
 
-pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
-    let key = PKey::from_rsa(Rsa::generate(1024)?)?;
+pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPairNew<RsaKey>, PushError> {
+    let key = RsaKey::overwrite(&format!("activation:{}", os_config.get_serial_number()), 1024, KeystoreAccessRules {
+        signature_padding: vec![KeystorePadding::PKCS1],
+        digests: vec![KeystoreDigest::Sha1],
+        can_sign: true,
+        ..Default::default()
+    })?;
 
-    let mut name = X509Name::builder()?;
-    name.append_entry_by_nid(Nid::COMMONNAME, "Client Push Certificate")?;
+    let public_key = SubjectPublicKeyInfo::from_der(&key.get_public_key()?).unwrap();
+    let request = CertReqInfo {
+        version: x509_cert::request::Version::V1,
+        subject: RdnSequence(vec![
+            RelativeDistinguishedName(SetOfVec::from_iter([
+                AttributeTypeAndValue {
+                    oid: ObjectIdentifier::new("2.5.4.3").unwrap(),
+                    value: Utf8StringRef::new("Client Push Certificate").unwrap().into(),
+                }
+            ]).unwrap())
+        ]),
+        public_key,
+        attributes: SetOfVec::new(),
+    };
 
-    let mut csr = X509Req::builder()?;
-    csr.set_version(0)?;
-    csr.set_pubkey(&key)?;
-    csr.set_subject_name(&name.build())?;
-    csr.sign(&key, MessageDigest::sha1())?;
+    let req_info = request.to_der().unwrap();
 
-    let csr = csr.build().to_pem()?;
+    let sign = key.sign(KeystoreDigest::Sha1, KeystorePadding::PKCS1, &req_info)?;
 
-    let activation = os_config.build_activation_info(csr);
+    let result = CertReq {
+        info: request,
+        algorithm: AlgorithmIdentifier {
+            oid: ObjectIdentifier::new("1.2.840.113549.1.1.5").unwrap(),
+            parameters: Some(Null.into()),
+        },
+        signature: BitString::from_bytes(&sign).unwrap(),
+    };
+    
+    let csr = result.to_pem(LineEnding::LF).unwrap();
+
+    let activation = os_config.build_activation_info(csr.into_bytes());
     let activation_bytes = plist_to_buf(&activation)?;
 
     let (fair_play_cert_chain, fair_play_signature) = fairplay_sign(&activation_bytes)?;
@@ -107,9 +134,9 @@ pub async fn activate(os_config: &dyn OSConfig) -> Result<KeyPair, PushError> {
 
     let certificate = get_nested_value(&parsed, &["device-activation", "activation-record", "DeviceCertificate"]).and_then(|v| v.as_data()).ok_or(PushError::AlbertCertParseError)?;
 
-    Ok(KeyPair {
+    Ok(KeyPairNew {
         cert: X509::from_pem(certificate)?.to_der()?,
-        private: key.private_key_to_der()?,
+        private: key
     })
 }
 

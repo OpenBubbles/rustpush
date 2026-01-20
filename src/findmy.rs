@@ -6,6 +6,7 @@ use chrono::{DateTime, NaiveTime, Utc};
 use cloudkit_derive::CloudKitRecord;
 use deku::{DekuContainerRead, DekuRead};
 use hkdf::Hkdf;
+use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
 use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
 use sha2::Sha256;
 use tokio::sync::Mutex;
@@ -129,11 +130,50 @@ impl FindMyState {
             share_state: Default::default(),
         }
     }
+
+    pub fn encode(&self) -> Result<Vec<u8>, PushError> {
+        let findmy_key = AesKeystoreKey::ensure("findmy:state-key", 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?;
+        let result = findmy_key.encrypt(&plist_to_bin(self)?, &mut EncryptMode::Gcm)?;
+        Ok(result)
+    }
+
+    pub fn restore(data: &[u8]) -> Result<Self, PushError> {
+        let findmy_key = AesKeystoreKey::ensure("findmy:state-key", 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?;
+        Ok(plist::from_bytes(&findmy_key.decrypt(data, &EncryptMode::Gcm)?)?)
+    }
 }
 
 pub struct FindMyStateManager {
     pub state: Mutex<FindMyState>,
-    pub update: Box<dyn Fn(&FindMyState) + Send + Sync>,
+    pub update: Box<dyn Fn(Vec<u8>) + Send + Sync>,
+}
+
+impl FindMyStateManager {
+    
+
+    pub fn new(data: &[u8], update: Box<dyn Fn(Vec<u8>) + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(FindMyState::restore(data).expect("Failed to restore!")),
+            update
+        })
+    }
+
+    
+
+    pub fn save(&self, state: &FindMyState) -> Result<(), PushError> {
+        (self.update)(state.encode()?);
+        Ok(())
+    }
 }
 
 async fn get_find_my_headers<T: AnisetteProvider>(config: &dyn OSConfig, api_ver: &str, anisette: &mut AnisetteClient<T>, ua: &str) -> Result<HeaderMap, PushError> {
@@ -940,7 +980,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             item.attributes = beacon_attrs;
         }
 
-        (self.state.update)(&state);
+        self.state.save(&state)?;
 
         Ok(())
     }
@@ -1054,7 +1094,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         item.share_state.circles_member.insert(circle_id.to_string(), circle_modified);
 
-        (self.state.update)(&item);
+        self.state.save(&item)?;
 
         Ok(())
     }
@@ -1313,7 +1353,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             container.perform_operations_checked(&CloudKitSession::new(), &update_records, IsolationLevel::Operation).await?;
         }
 
-        (self.state.update)(&state);
+        self.state.save(&state)?;
 
         Ok(())
     }
@@ -1334,7 +1374,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
 
         container.perform(&CloudKitSession::new(), op).await?;
 
-        (self.state.update)(&state);
+        self.state.save(&state)?;
         Ok(())
     }
 
@@ -1388,7 +1428,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
         state.share_state.circles_member.remove(id);
         state.share_state.secrets.retain(|i, v| v.sharing_circle_identifier != id);
 
-        (self.state.update)(&state);
+        self.state.save(&state)?;
 
         Ok(())
     }
@@ -1556,7 +1596,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             }
             state.share_state.tags.insert(payload_data.beacon_identifier.clone(), circle_tag);
 
-            (self.state.update)(&state);
+            self.state.save(&state)?;
         }
 
         if is_modified {

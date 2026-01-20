@@ -1,6 +1,7 @@
 use std::{any::Any, io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
+use keystore::KeystoreError;
 use omnisette::AnisetteError;
 #[cfg(feature = "macos-validation-data")]
 use open_absinthe::AbsintheError;
@@ -195,4 +196,6 @@ pub enum PushError {
     ResourceClosed,
     #[error("Circle {0} not found!")]
     CircleNotFound(String),
+    #[error("Keystore error {0}!")]
+    KeystoreError(#[from] KeystoreError),
 }

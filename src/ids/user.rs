@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher
 
 use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
 use hkdf::Hkdf;
+use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey, RsaKey};
 use log::{debug, error, info, warn};
 use openssl::{asn1::Asn1Time, bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, encrypt::{Decrypter, Encrypter}, error::ErrorStack, hash::MessageDigest, md::Md, nid::Nid, pkey::{HasPublic, Id, PKey, Private, Public}, pkey_ctx::PkeyCtx, rsa::{self, Padding, Rsa}, sha::sha256, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}, x509::X509};
 use plist::{Data, Dictionary, Value};
@@ -18,7 +19,7 @@ use super::identity_manager::KeyCache;
 use rand::{Rng, RngCore};
 use tokio::sync::Mutex;
 
-use crate::{auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv, KeyPair, REQWEST}, APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError};
+use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 
 
 #[repr(C)]
@@ -65,7 +66,7 @@ impl IDSUserType {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSRegistration {
-    pub id_keypair: KeyPair,
+    pub id_keypair: KeyPairNew<RsaKey>,
     pub handles: Vec<String>, // usable handles
     #[serde(default)]
     pub registered_at_s: u64,
@@ -425,6 +426,28 @@ impl IDSNGMIdentity {
         })
     }
 
+    pub fn save(&self, tag: &str) -> Result<Vec<u8>, PushError> {
+        let key = AesKeystoreKey::ensure(&format!("ids:identity-storage-key:{tag}"), 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?;
+        let encoded = key.encrypt(&plist_to_bin(self)?, &mut EncryptMode::Gcm)?;
+        Ok(encoded)
+    }
+
+    pub fn restore(data: &[u8], tag: &str) -> Result<Self, PushError> {
+        let key = AesKeystoreKey::ensure(&format!("ids:identity-storage-key:{tag}"), 256, KeystoreAccessRules {
+            block_modes: vec![EncryptMode::Gcm],
+            can_encrypt: true,
+            can_decrypt: true,
+            ..Default::default()
+        })?;
+        let encoded = key.decrypt(data, &mut EncryptMode::Gcm)?;
+        Ok(plist::from_bytes(&encoded)?)
+    }
+
     fn build_prekey_data(&self) -> Result<Vec<u8>, PushError> {
         let timestamp = duration_since_epoch().as_secs() as f64;
 
@@ -597,7 +620,7 @@ struct HandleResult {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IDSUser {
-    pub auth_keypair: KeyPair,
+    pub auth_keypair: KeyPairNew<RsaKey>,
     pub user_id: String,
     #[serde(default)]
     pub registration: HashMap<String, IDSRegistration>,
@@ -1131,7 +1154,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let user_id = user_dict.get("user-id").unwrap().as_string().unwrap();
             let user = users.iter_mut().find(|u| u.user_id == user_id).unwrap();
             let registration = IDSRegistration {
-                id_keypair: KeyPair { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
+                id_keypair: KeyPairNew { cert: cert.to_vec(), private: user.auth_keypair.private.clone() },
                 handles: my_handles,
                 registered_at_s: duration_since_epoch().as_secs(),
                 heartbeat_interval_s: heartbeat_interval,

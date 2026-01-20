@@ -11,6 +11,7 @@ use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use base64::engine::general_purpose;
 use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::hmac::Hmac;
+use keystore::KeystorePublicKey;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
 use log::{debug, info, warn};
 use num_bigint::{BigInt, Sign};
@@ -324,6 +325,13 @@ pub struct KeyPair {
     pub cert: Vec<u8>,
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub private: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct KeyPairNew<Priv: KeystorePublicKey + Clone> {
+    #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
+    pub cert: Vec<u8>,
+    pub private: Priv,
 }
 
 pub fn base64_encode(data: &[u8]) -> String {

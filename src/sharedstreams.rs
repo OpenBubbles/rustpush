@@ -19,7 +19,7 @@ use notify::{event::{CreateKind, ModifyKind, RemoveKind}, Config, Event, EventKi
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SharedStreamsState {
-    dsid: String,
+    pub dsid: String,
     host: String,
     pub albums: Vec<SharedAlbum>,
 }

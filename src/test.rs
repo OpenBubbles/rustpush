@@ -7,6 +7,7 @@ use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::{CloudKitRecord, CloudKitValue, CuttlefishSerializedKey, ZoneRetrieveRequest, base64_encode};
 use hkdf::Hkdf;
 use icloud_auth::{AppleAccount, LoginState};
+use keystore::{init_keystore, software::{NoEncryptor, SoftwareEncryptor, SoftwareKeystore}};
 use log::{debug, error, info, warn};
 use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
@@ -231,6 +232,15 @@ async fn main() {
 
     // info!("here {}", get_gateways_for_mccmnc("310160").await.unwrap());
 
+    init_keystore(SoftwareKeystore {
+        state: plist::from_file("keystore.plist").unwrap_or_default(),
+        update_state: Box::new(|state| {
+            plist::to_file_xml("keystore.plist", state).unwrap();
+        }),
+        encryptor: NoEncryptor,
+    });
+
+
     let data: String = match fs::read_to_string("config.plist").await {
 		Ok(v) => v,
 		Err(e) => {
@@ -401,7 +411,7 @@ async fn main() {
         let findmy = FindMyState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string());
 
         let id_path = PathBuf::from_str("findmy.plist").unwrap();
-        std::fs::write(id_path, plist_to_string(&findmy).unwrap()).unwrap();
+        std::fs::write(id_path, findmy.encode().unwrap()).unwrap();
 
         let sharedstreams = SharedStreamsState::new(spd["DsPrsId"].as_unsigned_integer().unwrap().to_string(), &mobileme);
 
@@ -587,13 +597,12 @@ async fn main() {
     });
 
     let id_path = PathBuf::from_str("findmy.plist").unwrap();
-    let state: FindMyState = plist::from_file(&id_path).unwrap();
-    let findmy_client = FindMyClient::new(connection.clone(), cloudkit.clone(), keychain.clone(), config.clone(), Arc::new(FindMyStateManager {
-        state: tokio::sync::Mutex::new(state),
-        update: Box::new(move |state| {
-            plist::to_file_xml(&id_path, state).unwrap()
-        }),
-    }), token_provider.clone(), anisette_client.clone(), client.identity.clone()).await.unwrap();
+    let state = std::fs::read(&id_path).unwrap();
+    let findmy_client = FindMyClient::new(connection.clone(), cloudkit.clone(), keychain.clone(), config.clone(), 
+        FindMyStateManager::new(&state, Box::new(move |state| {
+            std::fs::write(&id_path, state).unwrap()
+        })), 
+    token_provider.clone(), anisette_client.clone(), client.identity.clone()).await.unwrap();
 
 
     if let Some(mut s) = session {
@@ -606,7 +615,7 @@ async fn main() {
                 let msg = subscription.recv().await.unwrap();
                 
                 if let Some(test) = listener.handle(msg.clone()).unwrap() {
-                    info!("here {test:?}");
+                    info!("watching {test:?}");
                     match test {
                         IdmsMessage::TeardownSignIn(_) => info!("Teardown sign in"),
                         IdmsMessage::RequestedSignIn(_) => info!("requested sign in code {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap()),
@@ -637,7 +646,6 @@ async fn main() {
         // // cloud_messages.get_msg().await.unwrap();
         // let storage_info = token_provider.get_storage_info().await.unwrap();
         // println!("{:#?}", storage_info);
-        // keychain.sync_keychain(&KEYCHAIN_ZONES).await.unwrap();
 
         // keychain.reset_clique(b"antifa").await.unwrap();
 
@@ -649,19 +657,22 @@ async fn main() {
         //     role_id: 10,
         // }).await.unwrap();
 
-        // let bottles = keychain.get_viable_bottles().await.unwrap().remove(`0);
+        // let bottles = keychain.get_viable_bottles().await.unwrap().remove(0);
+        // println!("import password for {}", bottles.1.serial);
         // let mut input = String::new();
         // std::io::stdin().read_line(&mut input).unwrap();
         // let item = input.trim().to_string();
-        // println!("import password for {}", bottles.1.serial);
-        // keychain.join_clique_from_escrow(&bottles.0, item.as_bytes(), b"antifa").await.unwrap();`
+        // keychain.join_clique_from_escrow(&bottles.0, item.as_bytes(), b"antifa").await.unwrap();
+
+        // keychain.sync_keychain(&KEYCHAIN_ZONES).await.unwrap();
+
 
         // findmy_client.accept_item_share("CA065844-8DA5-4F99-AE74-858DEABA34DE").await.unwrap();
         // findmy_client.sync_items(true).await.unwrap();
         // findmy_client.delete_shared_item("404B1239-49C2-4670-B9AA-E51313015540").await.unwrap();
 
 
-        findmy_client.sync_item_positions().await.unwrap();
+        // findmy_client.sync_item_positions().await.unwrap();
 
         // let state = findmy_client.state.state.lock().await;
         // let i = state.share_state.secrets.values().find_map(|i| i.circle_shared_secret()).unwrap();
@@ -871,9 +882,9 @@ async fn main() {
         tokio::select! {
             msg = subscription.recv() => {
                 let msg = msg.unwrap();
-                if let Err(e) = findmy_client.handle(msg.clone()).await {
-                    info!("err {e}");
-                }
+                // if let Err(e) = findmy_client.handle(msg.clone()).await {
+                //     info!("err {e}");
+                // }
                 // let _ = manager.handle(msg.clone()).await;
                 
                 // if let Some(test) = listener.handle(msg.clone()).unwrap() {
