@@ -91,10 +91,10 @@ impl BackupKeystoreState {
 
     pub fn update_master(&mut self, hardware: &impl Keystore, master_key: &PKey<Private>) -> Result<(), KeystoreError> {
         hardware.overwrite_new("keystore:recovery:master", KeyType::Rsa(2048), KeystoreAccessRules {
-            encryption_paddings: vec![KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha256 }],
+            encryption_paddings: vec![KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha1 }],
             digests: vec![KeystoreDigest::Sha256],
-            mgf1_digests: vec![KeystoreDigest::Sha256],
-            block_modes: vec![EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha256 })],
+            mgf1_digests: vec![KeystoreDigest::Sha1],
+            block_modes: vec![EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha1 })],
             require_user: true,
             can_decrypt: true,
             can_encrypt: true,
@@ -103,7 +103,7 @@ impl BackupKeystoreState {
 
         let key = master_key.private_key_to_der()?;
         let ciphertext = hardware.encrypt("keystore:recovery:master", &key, 
-            &mut EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha256 }))?;
+            &mut EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha1 }))?;
 
         self.master_key = master_key.public_key_to_der()?.into();
         self.encrypted_master_key = ciphertext.into();
@@ -148,7 +148,7 @@ impl<T: Keystore> LockableKeystore for BackupKeystore<T> {
         let state = self.state.read().expect("Failed to read!");
 
         let decrypt = self.hardware.decrypt("keystore:recovery:master", state.encrypted_master_key.as_ref(), 
-            &EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha256 }))?;
+            &EncryptMode::Rsa(crate::KeystorePadding::OAEP { md: KeystoreDigest::Sha256, mgf1: KeystoreDigest::Sha1 }))?;
         *self.unlocked_key.write().unwrap() = Some(PKey::from_ec_key(EcKey::private_key_from_der(&decrypt)?)?);
         Ok(())
     }
