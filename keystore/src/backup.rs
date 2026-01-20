@@ -130,12 +130,6 @@ impl<T: Keystore> BackupKeystore<T> {
     }
 
     fn save_priv_key(&self, alias: &str, key: SoftwareKeystoreKey) -> Result<(), KeystoreError> {
-        self.hardware.ensure_exists("keystore:recovery:master", KeyType::Ec(EcCurve::P256), KeystoreAccessRules {
-            require_user: true,
-            can_agree: true,
-            ..Default::default()
-        })?;
-
         let mut state = self.state.write().expect("Failed to read!");
 
         let backup = BackedUpData::new(state.master_key.as_ref(), &plist_to_bin(&key).unwrap())?;
