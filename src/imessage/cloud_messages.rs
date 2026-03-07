@@ -505,7 +505,17 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let zone = container.private_zone(zone.to_string());
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
         let (_assets, response) = container.perform(&CloudKitSession::new(),
-            FetchRecordChangesOperation::new(zone.clone(), continuation_token, &NO_ASSETS, Some(200), Some(true))).await?;
+            FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest {
+                sync_continuation_token: continuation_token,
+                zone_identifier: Some(zone.clone()),
+                requested_fields: None,
+                max_changes: Some(200),
+                requested_changes_types: Some(3),
+                assets_to_download: Some(NO_ASSETS.clone()),
+                newest_first: Some(true),
+                ignore_calling_device_changes: None,
+                include_mergeable_deltas: None,
+            })).await?;
 
         let mut results = HashMap::new();
 
@@ -652,12 +662,16 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let (token, mut results, status) = self.sync_records("messageManateeZone", continuation_token).await?;
 
         if let Some(cutoff) = cutoff_ns {
+            let before_count = results.len();
             results.retain(|_, v: &mut Option<CloudMessage>| {
                 match v {
                     Some(msg) => msg.time >= cutoff,
                     None => true, // keep deletions
                 }
             });
+            if results.len() < before_count {
+                return Ok((token, results, 3)); // past the sync window, stop
+            }
         }
 
         Ok((token, results, status))
