@@ -470,15 +470,15 @@ pub const NO_ASSETS: AssetsToDownload = AssetsToDownload {
 };
 
 impl FetchRecordChangesOperation {
-    pub fn new(zone: cloudkit_proto::RecordZoneIdentifier, continuation_token: Option<Vec<u8>>, assets: &cloudkit_proto::AssetsToDownload,) -> Self {
-        Self(cloudkit_proto::RetrieveChangesRequest { 
-            sync_continuation_token: continuation_token, 
-            zone_identifier: Some(zone), 
-            requested_fields: None, 
-            max_changes: Some(200),
+    pub fn new(zone: cloudkit_proto::RecordZoneIdentifier, continuation_token: Option<Vec<u8>>, assets: &cloudkit_proto::AssetsToDownload, max_changes: Option<i32>, newest_first: Option<bool>) -> Self {
+        Self(cloudkit_proto::RetrieveChangesRequest {
+            sync_continuation_token: continuation_token,
+            zone_identifier: Some(zone),
+            requested_fields: None,
+            max_changes,
             requested_changes_types: Some(3), // figure out
             assets_to_download: Some(assets.clone()),
-            newest_first: Some(true),
+            newest_first,
             ignore_calling_device_changes: None,
             include_mergeable_deltas: None,
         })
@@ -492,7 +492,7 @@ impl FetchRecordChangesOperation {
         while finished_zones.len() != zones.len() {
             let mut sync_zones_here = zones.iter().enumerate().filter(|(_, zone)| !finished_zones.contains(&zone.0)).collect::<Vec<_>>();
             let operations = container.perform_operations_checked(&CloudKitSession::new(), 
-                &sync_zones_here.iter().map(|(idx, zone)| FetchRecordChangesOperation::new(zone.0.clone(), responses[*idx].2.clone(), assets))
+                &sync_zones_here.iter().map(|(idx, zone)| FetchRecordChangesOperation::new(zone.0.clone(), responses[*idx].2.clone(), assets, None, None))
                                 .collect::<Vec<_>>(), IsolationLevel::Zone).await?;
             for (result, (zone_idx, zone)) in operations.into_iter().zip(sync_zones_here.iter_mut()) {
                 if result.1.status() == 3 {
