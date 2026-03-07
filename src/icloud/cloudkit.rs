@@ -470,14 +470,14 @@ pub const NO_ASSETS: AssetsToDownload = AssetsToDownload {
 };
 
 impl FetchRecordChangesOperation {
-    pub fn new(zone: cloudkit_proto::RecordZoneIdentifier, continuation_token: Option<Vec<u8>>, assets: &cloudkit_proto::AssetsToDownload) -> Self {
-        Self(cloudkit_proto::RetrieveChangesRequest {
-            sync_continuation_token: continuation_token,
-            zone_identifier: Some(zone),
-            requested_fields: None,
-            max_changes: None,
-            requested_changes_types: Some(3), // figure out
-            assets_to_download: Some(assets.clone()),
+    pub fn new(zone: cloudkit_proto::RecordZoneIdentifier, continuation_token: Option<Vec<u8>>, assets: &cloudkit_proto::AssetsToDownload,) -> Self {
+        Self(cloudkit_proto::RetrieveChangesRequest { 
+            sync_continuation_token: continuation_token, 
+            zone_identifier: Some(zone), 
+            requested_fields: None, 
+            max_changes: None, 
+            requested_changes_types: Some(3), // figure out 
+            assets_to_download: Some(assets.clone()), 
             newest_first: Some(false),
             ignore_calling_device_changes: None,
             include_mergeable_deltas: None,

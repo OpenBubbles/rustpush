@@ -662,14 +662,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let (token, mut results, status) = self.sync_records("messageManateeZone", continuation_token).await?;
 
         if let Some(cutoff) = cutoff_ns {
-            let before_count = results.len();
-            results.retain(|_, v: &mut Option<CloudMessage>| {
-                match v {
-                    Some(msg) => msg.time >= cutoff,
-                    None => true, // keep deletions
-                }
-            });
-            if results.len() < before_count {
+            let has_old = results.values().any(|v| matches!(v, Some(msg) if msg.time < cutoff));
+            if has_old {
                 return Ok((token, results, 3)); // past the sync window, stop
             }
         }
