@@ -648,8 +648,24 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         self.delete_records("chatManateeZone", chats).await
     }
 
-    pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
-        self.sync_records("messageManateeZone", continuation_token).await
+    pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>, cutoff_ns: Option<i64>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
+        let (token, mut results, status) = self.sync_records("messageManateeZone", continuation_token).await?;
+
+        if let Some(cutoff) = cutoff_ns {
+            let before_count = results.len();
+            results.retain(|_, v: &mut Option<CloudMessage>| {
+                match v {
+                    Some(msg) => msg.time >= cutoff,
+                    None => true, // keep deletions
+                }
+            });
+            let filtered_count = before_count - results.len();
+            if filtered_count > 0 {
+                return Ok((token, results, 3)); // 3 = done
+            }
+        }
+
+        Ok((token, results, status))
     }
 
     pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {

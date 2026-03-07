@@ -475,10 +475,10 @@ impl FetchRecordChangesOperation {
             sync_continuation_token: continuation_token, 
             zone_identifier: Some(zone), 
             requested_fields: None, 
-            max_changes: None, 
-            requested_changes_types: Some(3), // figure out 
-            assets_to_download: Some(assets.clone()), 
-            newest_first: Some(false),
+            max_changes: Some(200),
+            requested_changes_types: Some(3), // figure out
+            assets_to_download: Some(assets.clone()),
+            newest_first: Some(true),
             ignore_calling_device_changes: None,
             include_mergeable_deltas: None,
         })
