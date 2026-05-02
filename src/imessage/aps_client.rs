@@ -213,13 +213,14 @@ impl IMClient {
         let command = payload.command;
         // delivered/read
         if let IDSRecvMessage {
-            command: 101 | 102 | 113,
+            command: 101 | 102 | 113 | 106,
             ..
         } = &payload {
             return Ok(payload.to_message(None, match command {
                 101 => Message::Delivered,
                 102 => Message::Read,
                 113 => Message::NotifyAnyways,
+                106 => Message::Keep,
                 _ => panic!("no")
             }).ok())
         }
