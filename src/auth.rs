@@ -205,7 +205,7 @@ pub struct IDSDelegateResponse {
 #[derive(Deserialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(alias = "com.apple.mobileme", default)]
     pub config: Dictionary,
 }
 
