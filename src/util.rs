@@ -1588,7 +1588,7 @@ pub fn rfc6637_wrap_key<T: HasPublic>(public_key: &CompactECKey<T>, key: &[u8], 
         *i = padding_count as u8;
     }
 
-    let mut c = Crypter::new(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), Mode::Encrypt, &aes_key[..16], None)?;
+    let mut c = Crypter::new(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), Mode::Encrypt, &aes_key[..16], Some(&[0xA6 as u8; 8]))?;
     let mut out = vec![0u8; message.len() + 16];
 
     let mut count = c.update(&message, &mut out)?;
@@ -1618,7 +1618,7 @@ pub fn rfc6637_unwrap_key(private_key: &CompactECKey<Private>, wrapped_key: &[u8
     // RFC6637 KDF
     let hash = rfc6637_kdf(fingerprint, &secret);
 
-    let unwrapped = decrypt(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), &hash[..16], None, &unpacked.wrapped)?;
+    let unwrapped = decrypt(Cipher::from_nid(Nid::ID_AES128_WRAP).unwrap(), &hash[..16], Some(&[0xA6 as u8; 8]), &unpacked.wrapped)?;
 
     let padding_len = *unwrapped.last().unwrap() as usize;
     for i in 0..padding_len {
