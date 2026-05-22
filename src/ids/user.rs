@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, hash::{DefaultHasher, Hash, Hasher}, io::Cursor, ops::Deref, sync::{atomic::{AtomicU32, AtomicU64}, LazyLock}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use deku::{DekuContainerRead, DekuRead, DekuWrite, DekuContainerWrite, DekuUpdate};
+use deku::prelude::*;
 use hkdf::Hkdf;
 use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey, RsaKey};
 use log::{debug, error, info, warn};
@@ -404,7 +404,7 @@ fn derive_hkdf_key_iv(secret: &[u8]) -> Result<([u8; 32], [u8; 16]), PushError> 
 pub struct IDSNGMIdentity {
     legacy: IDSUserIdentity,
     #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
-    device_key: CompactECKey<Private>,
+    pub device_key: CompactECKey<Private>,
     #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
     pre_key: CompactECKey<Private>,
 }

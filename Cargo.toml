@@ -36,7 +36,7 @@ icloud_auth = { path = "./apple-private-apis/icloud-auth", default-features = fa
 srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
 omnisette = { path = "./apple-private-apis/omnisette" }
 open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
-deku = "0.16.0"
+deku = "0.19.1"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
 backon = "0.4.4"
@@ -56,6 +56,19 @@ aes-siv = "0.7.0"
 chrono = "0.4.41"
 bitflags = "2.9.1"
 x509-cert = "0.2.5"
+rustls_psk = { package = "rustls", path = "../../rustls/rustls" }
+quinn = { path = "../../quinn/quinn" }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.4.0"
+rtc-stun = { path = "../../rtc/rtc-stun" }
+rtc-shared = { path = "../../rtc/rtc-shared" }
+rtc-rtp = { path = "../../rtc/rtc-rtp" }
+rtc-srtp = { path = "../../rtc/rtc-srtp" }
+rtc-media = { path = "../../rtc/rtc-media" }
+
+[patch.crates-io]
+quinn = { path = "../../quinn/quinn" }
 
 [build-dependencies]
 prost-build = { version = "0.12.0" }
@@ -64,7 +77,6 @@ prost-build = { version = "0.12.0" }
 name = "rustpush-test"
 required-features = ["macos-validation-data"]
 path = "src/test.rs"
-
 [lib]
 name = "rustpush"
 path = "src/lib.rs"

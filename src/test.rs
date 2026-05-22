@@ -1,5 +1,5 @@
 
-use std::{fs::File, io::{Cursor, Read}, num::ParseIntError, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
+use std::{collections::HashMap, fs::File, io::{Cursor, Read}, num::ParseIntError, path::PathBuf, process::Stdio, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
 
 use aes_siv::{Aes256SivAead, Nonce};
 use base64::{alphabet::STANDARD, engine::general_purpose};
@@ -13,9 +13,9 @@ use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
 use openssl::sha::sha256;
 use plist::{Data, Dictionary, Value};
-use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
+use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{ChannelFrame, FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
-use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
+use tokio::{fs, io::{self, AsyncBufReadExt, AsyncReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -197,6 +197,482 @@ async fn read_input() -> String {
     username
 }
 
+fn is_annex_b(data: &[u8]) -> bool {
+    data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
+}
+
+fn read_be_u16(data: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(data.get(offset..offset + 2)?.try_into().ok()?))
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
+}
+
+fn hevc_nal_type(data: &[u8]) -> Option<u8> {
+    Some((data.first()? >> 1) & 0x3f)
+}
+
+fn hevc_annex_b_nal_type(data: &[u8]) -> Option<u8> {
+    let offset = if data.starts_with(&[0, 0, 0, 1]) {
+        4
+    } else if data.starts_with(&[0, 0, 1]) {
+        3
+    } else {
+        0
+    };
+    hevc_nal_type(data.get(offset..)?)
+}
+
+fn annex_b_start_code_len(data: &[u8], offset: usize) -> Option<usize> {
+    if data.get(offset..offset + 4) == Some(&[0, 0, 0, 1]) {
+        Some(4)
+    } else if data.get(offset..offset + 3) == Some(&[0, 0, 1]) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn hevc_annex_b_nal_types(data: &[u8]) -> Vec<u8> {
+    if !is_annex_b(data) {
+        return hevc_nal_type(data).into_iter().collect();
+    }
+
+    let mut types = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        if let Some(start_code_len) = annex_b_start_code_len(data, offset) {
+            let nal_start = offset + start_code_len;
+            if let Some(nal_type) = hevc_nal_type(data.get(nal_start..).unwrap_or_default()) {
+                types.push(nal_type);
+            }
+            offset = nal_start;
+        } else {
+            offset += 1;
+        }
+    }
+    types
+}
+
+fn hevc_nal_kind(nal_type: u8) -> &'static str {
+    match nal_type {
+        16..=18 => "irap",
+        19 => "idr_w_radl",
+        20 => "idr_n_lp",
+        21 => "cra",
+        32 => "vps",
+        33 => "sps",
+        34 => "pps",
+        39 => "prefix_sei",
+        40 => "suffix_sei",
+        _ => "slice",
+    }
+}
+
+fn format_hevc_nal_types(nal_types: &[u8]) -> String {
+    let mut out = String::new();
+    for (index, nal_type) in nal_types.iter().enumerate() {
+        if index != 0 {
+            out.push_str(",");
+        }
+        let _ = write!(&mut out, "{}:{}", nal_type, hevc_nal_kind(*nal_type));
+    }
+    out
+}
+
+fn hex_prefix(data: &[u8], len: usize) -> String {
+    let mut out = String::new();
+    for byte in data.iter().take(len) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn hex_suffix(data: &[u8], len: usize) -> String {
+    let mut out = String::new();
+    let start = data.len().saturating_sub(len);
+    for byte in &data[start..] {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn hevc_annex_b_nal_layout(data: &[u8]) -> String {
+    if !is_annex_b(data) {
+        let nal_type = hevc_nal_type(data)
+            .map(|nal_type| format!("{}:{}", nal_type, hevc_nal_kind(nal_type)))
+            .unwrap_or_else(|| "unknown".to_string());
+        return format!(
+            "raw offset=0 type={} len={} first16={} last16={}",
+            nal_type,
+            data.len(),
+            hex_prefix(data, 16),
+            hex_suffix(data, 16),
+        );
+    }
+
+    let mut starts = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        if let Some(start_code_len) = annex_b_start_code_len(data, offset) {
+            starts.push((offset, start_code_len));
+            offset += start_code_len;
+        } else {
+            offset += 1;
+        }
+    }
+
+    let mut parts = Vec::new();
+    for (index, (start_offset, start_code_len)) in starts.iter().enumerate() {
+        let nal_start = start_offset + start_code_len;
+        let nal_end = starts
+            .get(index + 1)
+            .map(|(next_offset, _)| *next_offset)
+            .unwrap_or(data.len());
+        let nal = data.get(nal_start..nal_end).unwrap_or_default();
+        let nal_type = hevc_nal_type(nal)
+            .map(|nal_type| format!("{}:{}", nal_type, hevc_nal_kind(nal_type)))
+            .unwrap_or_else(|| "unknown".to_string());
+        parts.push(format!(
+            "#{} start={} sc={} type={} nal_len={} first16={} last16={}",
+            index,
+            start_offset,
+            start_code_len,
+            nal_type,
+            nal.len(),
+            hex_prefix(nal, 16),
+            hex_suffix(nal, 16),
+        ));
+    }
+
+    parts.join(" | ")
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_offset: 0 }
+    }
+
+    fn read_bit(&mut self) -> Option<bool> {
+        let byte = *self.data.get(self.bit_offset / 8)?;
+        let bit = 7 - (self.bit_offset % 8);
+        self.bit_offset += 1;
+        Some(((byte >> bit) & 1) != 0)
+    }
+
+    fn read_bits(&mut self, bits: usize) -> Option<u32> {
+        let mut value = 0;
+        for _ in 0..bits {
+            value = (value << 1) | self.read_bit()? as u32;
+        }
+        Some(value)
+    }
+
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeroes = 0;
+        while !self.read_bit()? {
+            leading_zeroes += 1;
+            if leading_zeroes > 31 {
+                return None;
+            }
+        }
+        if leading_zeroes == 0 {
+            return Some(0);
+        }
+        Some((1 << leading_zeroes) - 1 + self.read_bits(leading_zeroes)?)
+    }
+
+    fn skip_bits(&mut self, bits: usize) -> Option<()> {
+        self.bit_offset += bits;
+        if self.bit_offset <= self.data.len() * 8 {
+            Some(())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HevcSpsInfo {
+    id: u32,
+    log2_max_pic_order_cnt_lsb: usize,
+    separate_colour_plane: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HevcPpsInfo {
+    id: u32,
+    sps_id: u32,
+    dependent_slice_segments_enabled: bool,
+    output_flag_present: bool,
+    num_extra_slice_header_bits: usize,
+}
+
+#[derive(Default)]
+struct HevcPocTracker {
+    sps: HashMap<u32, HevcSpsInfo>,
+    pps: HashMap<u32, HevcPpsInfo>,
+    prev_poc_msb: i32,
+    prev_poc_lsb: i32,
+}
+
+fn rbsp_from_nal(nal: &[u8]) -> Vec<u8> {
+    let mut rbsp = Vec::with_capacity(nal.len());
+    let mut zero_count = 0;
+    for &byte in nal {
+        if zero_count >= 2 && byte == 0x03 {
+            zero_count = 0;
+            continue;
+        }
+        rbsp.push(byte);
+        if byte == 0 {
+            zero_count += 1;
+        } else {
+            zero_count = 0;
+        }
+    }
+    rbsp
+}
+
+fn skip_hevc_profile_tier_level(br: &mut BitReader<'_>, max_sub_layers_minus1: usize) -> Option<()> {
+    br.skip_bits(96)?;
+    let mut sub_layer_profile_present = [false; 8];
+    let mut sub_layer_level_present = [false; 8];
+    for i in 0..max_sub_layers_minus1 {
+        sub_layer_profile_present[i] = br.read_bit()?;
+        sub_layer_level_present[i] = br.read_bit()?;
+    }
+    if max_sub_layers_minus1 > 0 {
+        br.skip_bits(2 * (8 - max_sub_layers_minus1))?;
+    }
+    for i in 0..max_sub_layers_minus1 {
+        if sub_layer_profile_present[i] {
+            br.skip_bits(88)?;
+        }
+        if sub_layer_level_present[i] {
+            br.skip_bits(8)?;
+        }
+    }
+    Some(())
+}
+
+fn parse_hevc_sps(nal: &[u8]) -> Option<HevcSpsInfo> {
+    let rbsp = rbsp_from_nal(nal.get(2..)?);
+    let mut br = BitReader::new(&rbsp);
+    br.read_bits(4)?;
+    let max_sub_layers_minus1 = br.read_bits(3)? as usize;
+    br.read_bit()?;
+    skip_hevc_profile_tier_level(&mut br, max_sub_layers_minus1)?;
+    let id = br.read_ue()?;
+    let chroma_format_idc = br.read_ue()?;
+    let separate_colour_plane = chroma_format_idc == 3 && br.read_bit()?;
+    br.read_ue()?;
+    br.read_ue()?;
+    if br.read_bit()? {
+        br.read_ue()?;
+        br.read_ue()?;
+        br.read_ue()?;
+        br.read_ue()?;
+    }
+    br.read_ue()?;
+    br.read_ue()?;
+    let log2_max_pic_order_cnt_lsb = br.read_ue()? as usize + 4;
+    Some(HevcSpsInfo { id, log2_max_pic_order_cnt_lsb, separate_colour_plane })
+}
+
+fn parse_hevc_pps(nal: &[u8]) -> Option<HevcPpsInfo> {
+    let rbsp = rbsp_from_nal(nal.get(2..)?);
+    let mut br = BitReader::new(&rbsp);
+    let id = br.read_ue()?;
+    let sps_id = br.read_ue()?;
+    let dependent_slice_segments_enabled = br.read_bit()?;
+    let output_flag_present = br.read_bit()?;
+    let num_extra_slice_header_bits = br.read_bits(3)? as usize;
+    Some(HevcPpsInfo {
+        id,
+        sps_id,
+        dependent_slice_segments_enabled,
+        output_flag_present,
+        num_extra_slice_header_bits,
+    })
+}
+
+fn first_hevc_nal(data: &[u8]) -> Option<&[u8]> {
+    if !is_annex_b(data) {
+        return Some(data);
+    }
+
+    let mut offset = 0;
+    while offset < data.len() {
+        if let Some(start_code_len) = annex_b_start_code_len(data, offset) {
+            let nal_start = offset + start_code_len;
+            let mut nal_end = nal_start;
+            while nal_end < data.len() && annex_b_start_code_len(data, nal_end).is_none() {
+                nal_end += 1;
+            }
+            return data.get(nal_start..nal_end);
+        }
+        offset += 1;
+    }
+    None
+}
+
+impl HevcPocTracker {
+    fn add_parameter_set(&mut self, nal: &[u8]) {
+        match hevc_nal_type(nal) {
+            Some(33) => {
+                if let Some(sps) = parse_hevc_sps(nal) {
+                    warn!("parsed HEVC SPS id={} log2_max_pic_order_cnt_lsb={}", sps.id, sps.log2_max_pic_order_cnt_lsb);
+                    self.sps.insert(sps.id, sps);
+                }
+            },
+            Some(34) => {
+                if let Some(pps) = parse_hevc_pps(nal) {
+                    warn!("parsed HEVC PPS id={} sps_id={}", pps.id, pps.sps_id);
+                    self.pps.insert(pps.id, pps);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    fn poc_for_sample(&mut self, data: &[u8]) -> Option<i32> {
+        let nal = first_hevc_nal(data)?;
+        let nal_type = hevc_nal_type(nal)?;
+        if nal_type == 19 || nal_type == 20 {
+            self.prev_poc_msb = 0;
+            self.prev_poc_lsb = 0;
+            return Some(0);
+        }
+
+        if nal_type > 31 {
+            return None;
+        }
+
+        let rbsp = rbsp_from_nal(nal.get(2..)?);
+        let mut br = BitReader::new(&rbsp);
+        let first_slice_segment_in_pic = br.read_bit()?;
+        if (16..=23).contains(&nal_type) {
+            br.read_bit()?;
+        }
+        let pps_id = br.read_ue()?;
+        let pps = *self.pps.get(&pps_id)?;
+        let sps = *self.sps.get(&pps.sps_id)?;
+
+        if !first_slice_segment_in_pic {
+            if pps.dependent_slice_segments_enabled && br.read_bit()? {
+                return None;
+            }
+            return None;
+        }
+
+        br.skip_bits(pps.num_extra_slice_header_bits)?;
+        br.read_ue()?;
+        if pps.output_flag_present {
+            br.read_bit()?;
+        }
+        if sps.separate_colour_plane {
+            br.read_bits(2)?;
+        }
+
+        let poc_lsb = br.read_bits(sps.log2_max_pic_order_cnt_lsb)? as i32;
+        let max_poc_lsb = 1_i32 << sps.log2_max_pic_order_cnt_lsb;
+        let prev_poc_lsb = self.prev_poc_lsb;
+        let prev_poc_msb = self.prev_poc_msb;
+        let poc_msb = if poc_lsb < prev_poc_lsb && (prev_poc_lsb - poc_lsb) >= max_poc_lsb / 2 {
+            prev_poc_msb + max_poc_lsb
+        } else if poc_lsb > prev_poc_lsb && (poc_lsb - prev_poc_lsb) > max_poc_lsb / 2 {
+            prev_poc_msb - max_poc_lsb
+        } else {
+            prev_poc_msb
+        };
+        let poc = poc_msb + poc_lsb;
+        self.prev_poc_msb = poc_msb;
+        self.prev_poc_lsb = poc_lsb;
+        Some(poc)
+    }
+}
+
+fn extract_hevc_parameter_sets(desc: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let hvc_c_type = desc
+        .windows(4)
+        .position(|window| window == b"hvcC")
+        .ok_or_else(|| "ImageDescription did not contain an hvcC box".to_string())?;
+    if hvc_c_type < 4 {
+        return Err("hvcC box did not have a size prefix".to_string());
+    }
+
+    let box_start = hvc_c_type - 4;
+    let box_size = read_be_u32(desc, box_start).ok_or_else(|| "hvcC box size was truncated".to_string())? as usize;
+    let payload_start = hvc_c_type + 4;
+    let payload_end = if box_size >= 8 && box_start + box_size <= desc.len() {
+        box_start + box_size
+    } else {
+        desc.len()
+    };
+    let hvc_c = desc
+        .get(payload_start..payload_end)
+        .ok_or_else(|| "hvcC payload was truncated".to_string())?;
+
+    // HEVCDecoderConfigurationRecord fixed header is 22 bytes before the arrays.
+    if hvc_c.len() < 23 {
+        return Err("hvcC payload was too short".to_string());
+    }
+
+    let num_arrays = hvc_c[22] as usize;
+    let mut offset = 23;
+    let mut parameter_sets = Vec::new();
+    for _ in 0..num_arrays {
+        let array_header = *hvc_c.get(offset).ok_or_else(|| "hvcC array header was truncated".to_string())?;
+        let nal_type = array_header & 0x3f;
+        let num_nalus = read_be_u16(hvc_c, offset + 1).ok_or_else(|| "hvcC NAL count was truncated".to_string())? as usize;
+        offset += 3;
+
+        for _ in 0..num_nalus {
+            let nal_len = read_be_u16(hvc_c, offset).ok_or_else(|| "hvcC NAL length was truncated".to_string())? as usize;
+            offset += 2;
+            let nal = hvc_c
+                .get(offset..offset + nal_len)
+                .ok_or_else(|| "hvcC NAL bytes were truncated".to_string())?;
+            offset += nal_len;
+
+            if matches!(nal_type, 32 | 33 | 34) {
+                parameter_sets.push(nal.to_vec());
+            }
+        }
+    }
+
+    if parameter_sets.is_empty() {
+        return Err("hvcC did not contain VPS/SPS/PPS parameter sets".to_string());
+    }
+
+    Ok(parameter_sets)
+}
+
+#[test]
+fn parses_hevc_parameter_sets_from_image_description() {
+    let desc = decode_hex("000000d668766331000000000000ffff0000000000000000000002000000020007800438004800000048000000000000000104484556430000000000000000000000000000000000000000000000000000000018ffff0000007c68766343010160000000b0000000000078f000fcfdf8f800000b03a00001001840010c01ffff016000000300b00000030000030078194090a10001002f420101016000000300b00000030000030078a003c0801107cb88196e45232e7f13f0bfa1bf529a81010101fc201040a2000100074401c072f05b6400000000").unwrap();
+    let parameter_sets = extract_hevc_parameter_sets(&desc).unwrap();
+
+    let nal_types = parameter_sets
+        .iter()
+        .map(|parameter_set| hevc_nal_type(parameter_set).unwrap())
+        .collect::<Vec<_>>();
+    let nal_lengths = parameter_sets
+        .iter()
+        .map(|parameter_set| parameter_set.len())
+        .collect::<Vec<_>>();
+
+    assert_eq!(nal_types, vec![32, 33, 34]);
+    assert_eq!(nal_lengths, vec![24, 47, 7]);
+}
+
 pub fn encode_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
@@ -212,8 +688,10 @@ pub fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
         .collect()
 }
 
-#[tokio::main(worker_threads = 1)]
+#[tokio::main(worker_threads = 12)]
 async fn main() {
+    rustls_psk::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
     if let Err(_) = std::env::var("RUST_LOG") {
         std::env::set_var("RUST_LOG", "debug");
     }
@@ -525,14 +1003,6 @@ async fn main() {
     error!("2fa code: {}", anisette_client.lock().await.provider.get_2fa_code().await.unwrap());
     // plist::to_file_xml(&id_path, &state).unwrap();
 
-    // let state: StatusKitState = plist::from_file("statuskit.plist").unwrap_or_default();
-    // let statuskit_client = StatusKitClient::new(state, Box::new(|state| {
-    //     plist::to_file_xml("statuskit.plist", state).unwrap();
-    // }), , connection.clone(), config.clone(), client.identity.clone()).await;
-
-    // statuskit_client.invite_to_channel("mailto:sandboxalt@gmail.com", &["mailto:jerrylandgreen@copper.jjtech.dev".to_string()]).await.unwrap();
-    // statuskit_client.share_status(&StatusKitStatus::new_active()).await.unwrap();
-
 
     // let (token, _) = statuskit_client.request_handles(&["mailto:jerrylandgreen@copper.jjtech.dev".to_string(), "mailto:cooper@copper.jjtech.dev".to_string()]).await;
 
@@ -575,10 +1045,11 @@ async fn main() {
     // let album = shared_streams.state.read().await.albums[0].albumguid.clone();
     // shared_streams.get_album_summary(&album).await.unwrap();
 
-    // let state: FTState = plist::from_file(&PathBuf::from_str("facetime.plist").unwrap()).unwrap_or_default();
-    // let facetime = FTClient::new(state, Box::new(|state| {
-    //     plist::to_file_xml(&PathBuf::from_str("facetime.plist").unwrap(), state).expect("Failed to serialize plist!");
-    // }), connection.clone(), client.identity.clone(), config.clone()).await;
+    let state: FTState = plist::from_file(&PathBuf::from_str("facetime.plist").unwrap()).unwrap_or_default();
+    let facetime = FTClient::new(state, Box::new(|state| {
+        plist::to_file_xml(&PathBuf::from_str("facetime.plist").unwrap(), state).expect("Failed to serialize plist!");
+    }), connection.clone(), client.identity.clone(), config.clone()).await;
+
 
     let id_path = PathBuf::from_str("trustedpeers.plist").unwrap();
     let state: KeychainClientState = plist::from_file(&id_path).unwrap();
@@ -595,6 +1066,19 @@ async fn main() {
         security_container: tokio::sync::Mutex::new(None),
         client: cloudkit.clone(),
     });
+
+    let state: StatusKitState = plist::from_file("statuskit.plist").unwrap_or_default();
+    let statuskit_client = StatusKitClient::new(state, Box::new(|state| {
+        plist::to_file_xml("statuskit.plist", state).unwrap();
+    }), token_provider.clone() , connection.clone(), config.clone(), client.identity.clone(), cloudkit.clone(), keychain.clone()).await;
+
+    statuskit_client.sync_invitations().await.unwrap();
+    // panic!();
+
+    // statuskit_client.invite_to_channel("mailto:sandboxalt@gmail.com", &["mailto:jerrylandgreen@copper.jjtech.dev".to_string()]).await.unwrap();
+    // statuskit_client.share_status(&StatusKitStatus::new_active()).await.unwrap();
+
+
 
     let id_path = PathBuf::from_str("findmy.plist").unwrap();
     let state = std::fs::read(&id_path).unwrap();
@@ -813,9 +1297,204 @@ async fn main() {
     // info!("Facetime link {}", link);
 
 
+    let mut last_ft_guid = Uuid::new_v4().to_string().to_uppercase();
 
-    // facetime.create_session(Uuid::new_v4().to_string().to_uppercase(), handle.clone(), &["".to_string()]).await.expect("Failed to create session!");
-    // info!("Rung!");
+
+    facetime.create_session(last_ft_guid.clone(), handle.clone(), 
+        &[handle.clone(), "mailto:jerrylandgreen@copper.jjtech.dev".to_string()]).await.expect("Failed to create session!");
+
+    let group = facetime.state.read().await.sessions[&last_ft_guid].connection.clone().unwrap();
+    info!("Rung!");
+
+    tokio::spawn(async move {
+        let ffplay_args = [
+            "-loglevel", "verbose",
+            "-nostats",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-sync",
+            "video",
+            "-an", "-sn",
+            "-autoexit",
+            "-x", "667", "-y", "375",
+            "-window_title", "FaceTime HEVC",
+            "-f", "hevc",
+            "-i", "pipe:0",
+            "-ec", "0",
+            // "-fflags", "nobuffer",
+            // "-flags", "low_delay",
+        ];
+        warn!("starting ffplay {}", ffplay_args.join(" "));
+
+        let mut ffplay = Command::new("ffplay")
+            .args(ffplay_args)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to launch ffplay; install ffmpeg/ffplay and make sure it is on PATH");
+
+        let mut stdin = ffplay.stdin.take().expect("ffplay stdin was not piped");
+        let mut stderr = ffplay.stderr.take().expect("ffplay stderr was not piped");
+        if let Err(e) = fs::create_dir_all("secondary").await {
+            warn!("failed creating HEVC dump directory: {e}");
+        }
+        let hevc_dump_path = "facetime.hevc";
+        let mut hevc_dump = fs::File::create(hevc_dump_path)
+            .await
+            .expect("failed to create HEVC dump file");
+        warn!("umbrees writing HEVC Annex-B dump to {hevc_dump_path}");
+        tokio::spawn(async move {
+            let mut read_buf = [0u8; 1024];
+            let mut line = Vec::new();
+            loop {
+                match stderr.read(&mut read_buf).await {
+                    Ok(0) => {
+                        if !line.is_empty() {
+                            warn!("ffplay: {}", String::from_utf8_lossy(&line));
+                        }
+                        break;
+                    },
+                    Ok(read) => {
+                        for byte in &read_buf[..read] {
+                            if *byte == b'\n' || *byte == b'\r' {
+                                if !line.is_empty() {
+                                    warn!("ffplay: {}", String::from_utf8_lossy(&line));
+                                    line.clear();
+                                }
+                            } else {
+                                line.push(*byte);
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        warn!("failed reading ffplay stderr: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut frames = group.frames.lock().await;
+        let mut sample_index = 0usize;
+        let mut image_description_index = 0usize;
+        let mut poc_tracker = HevcPocTracker::default();
+        while let Some(sample) = frames.recv().await {
+            match sample {
+                ChannelFrame::Sample(frame) => {
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    sample_index += 1;
+                    let nal_types = hevc_annex_b_nal_types(&frame);
+                    let poc = poc_tracker
+                        .poc_for_sample(&frame)
+                        .map(|poc| poc.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    if let Some(nal_type) = hevc_annex_b_nal_type(&frame) {
+                        warn!(
+                            "writing HEVC sample #{sample_index} poc={} nal_type={nal_type} kind={} nal_types=[{}] len={} prefix={}",
+                            poc,
+                            hevc_nal_kind(nal_type),
+                            format_hevc_nal_types(&nal_types),
+                            frame.len(),
+                            hex_prefix(&frame, 16),
+                        );
+                    } else {
+                        warn!(
+                            "writing HEVC sample #{sample_index} poc={} with unknown nal type nal_types=[{}] len={} prefix={}",
+                            poc,
+                            format_hevc_nal_types(&nal_types),
+                            frame.len(),
+                            hex_prefix(&frame, 16),
+                        );
+                    }
+                    warn!(
+                        "umbrees HEVC sample #{sample_index} nal_layout count={} layout={}",
+                        nal_types.len(),
+                        hevc_annex_b_nal_layout(&frame),
+                    );
+                    if !is_annex_b(&frame) {
+                        if let Err(e) = hevc_dump.write_all(&[0, 0, 0, 1]).await {
+                            warn!("failed writing HEVC dump start code: {e}");
+                            break;
+                        }
+                        if let Err(e) = stdin.write_all(&[0, 0, 0, 1]).await {
+                            warn!("ffplay closed before start code write: {e}");
+                            break;
+                        }
+                    }
+                    if let Err(e) = hevc_dump.write_all(&frame).await {
+                        warn!("failed writing HEVC dump sample: {e}");
+                        break;
+                    }
+                    if let Err(e) = hevc_dump.flush().await {
+                        warn!("failed flushing HEVC dump: {e}");
+                        break;
+                    }
+                    if let Err(e) = stdin.write_all(&frame).await {
+                        warn!("ffplay closed before sample write: {e}");
+                        break;
+                    }
+                    if let Err(e) = stdin.flush().await {
+                        warn!("ffplay closed before sample flush: {e}");
+                        break;
+                    }
+                },
+                ChannelFrame::ImageDescription(desc) => {
+                    image_description_index += 1;
+                    match extract_hevc_parameter_sets(&desc) {
+                        Ok(parameter_sets) => {
+                            warn!("extracted {} HEVC parameter sets from ImageDescription #{image_description_index}", parameter_sets.len());
+                            for parameter_set in parameter_sets {
+                                let nal_type = hevc_nal_type(&parameter_set).unwrap_or(0);
+                                poc_tracker.add_parameter_set(&parameter_set);
+                                warn!(
+                                    "writing HEVC parameter set nal_type={nal_type} kind={} len={} prefix={}",
+                                    hevc_nal_kind(nal_type),
+                                    parameter_set.len(),
+                                    hex_prefix(&parameter_set, 16),
+                                );
+                                if let Err(e) = hevc_dump.write_all(&[0, 0, 0, 1]).await {
+                                    warn!("failed writing HEVC dump parameter set start code: {e}");
+                                    break;
+                                }
+                                if let Err(e) = hevc_dump.write_all(&parameter_set).await {
+                                    warn!("failed writing HEVC dump parameter set: {e}");
+                                    break;
+                                }
+                                if let Err(e) = hevc_dump.flush().await {
+                                    warn!("failed flushing HEVC dump parameter set: {e}");
+                                    break;
+                                }
+                                if let Err(e) = stdin.write_all(&[0, 0, 0, 1]).await {
+                                    warn!("ffplay closed before parameter set start code write: {e}");
+                                    break;
+                                }
+                                if let Err(e) = stdin.write_all(&parameter_set).await {
+                                    warn!("ffplay closed before parameter set write: {e}");
+                                    break;
+                                }
+                                if let Err(e) = stdin.flush().await {
+                                    warn!("ffplay closed before parameter set flush: {e}");
+                                    break;
+                                }
+                            }
+                        },
+                        Err(e) => warn!("failed to extract HEVC parameter sets: {e}"),
+                    }
+                }
+            }
+        }
+        drop(stdin);
+        match ffplay.wait().await {
+            Ok(status) => warn!("ffplay exited with {status}"),
+            Err(e) => warn!("failed waiting for ffplay: {e}"),
+        }
+    });
+    // let link = facetime.get_link_for_usage(&handle, "testing").await.unwrap();
+    // info!("Facetime link {}", link);
 
 
     // let manager = SyncController::new(shared_streams, PathBuf::from_str("syncstate.plist").unwrap(), FFMpegFilePackager::default(), Duration::from_secs(60 * 30)).await;
@@ -923,7 +1602,6 @@ async fn main() {
     std::io::stdout().flush().unwrap();
 
     let mut received_msgs = vec![];
-    let mut last_ft_guid = "AE271F00-2F67-42C4-8EF2-74600055A2B7".to_string();
     
     let mut circle_session: Option<CircleServerSession<DefaultAnisetteProvider>> = None;
 
@@ -961,42 +1639,42 @@ async fn main() {
 
                 // keychain.handle(msg.clone()).await.unwrap();
 
-                // if let Err(e) = statuskit_client.handle(msg.clone()).await {
-                //     error!("Statuskit error {e}");
-                //     continue;
-                // }
-                // match facetime.handle(msg.clone()).await {
-                //     Err(e) => {
-                //         error!("Failed to receive {}", e);
-                //         continue;
-                //     },
-                //     Ok(None) => {},
-                //     Ok(Some(a)) => {
-                //         info!("Got ftmessage {a:?}");
-                //         match a {
-                //             FTMessage::LetMeInRequest(request) => {
-                //                 if request.delegation_uuid.is_none() {
-                //                     if let Err(e) = facetime.respond_letmein(request, Some(&last_ft_guid)).await {
-                //                         warn!("Failed {e}");
-                //                     }
-                //                     // facetime.respond_letmein(request, None).await.expect("Request failed");
-                //                 }
-                //             },
-                //             FTMessage::JoinEvent { guid, ring, .. } => {
-                //                 // if ring {
-                //                 //     warn!("Preparing to decline!");
-                //                 //     tokio::time::sleep(Duration::from_secs(10)).await;
-                //                 //     let mut lock = facetime.state.write().await;
-                //                 //     let state = lock.sessions.values_mut().find(|a| a.group_id == guid).expect("state");
-                //                 //     facetime.ensure_allocations(state, &[]).await.expect("state");
-                //                 //     facetime.decline_invite(state).await.expect("failed to unprop?");
-                //                 // }
-                //                 last_ft_guid = guid;
-                //             },
-                //             _ => {}
-                //         }
-                //     }
-                // }
+                if let Err(e) = statuskit_client.handle(msg.clone()).await {
+                    error!("Statuskit error {e}");
+                    continue;
+                }
+                match facetime.handle(msg.clone()).await {
+                    Err(e) => {
+                        error!("Failed to receive {}", e);
+                        continue;
+                    },
+                    Ok(None) => {},
+                    Ok(Some(a)) => {
+                        info!("Got ftmessage {a:?}");
+                        match a {
+                            FTMessage::LetMeInRequest(request) => {
+                                if request.delegation_uuid.is_none() {
+                                    if let Err(e) = facetime.respond_letmein(request, Some(&last_ft_guid)).await {
+                                        warn!("Failed {e}");
+                                    }
+                                    // facetime.respond_letmein(request, None).await.expect("Request failed");
+                                }
+                            },
+                            FTMessage::JoinEvent { guid, ring, .. } => {
+                                // if ring {
+                                //     warn!("Preparing to decline!");
+                                //     tokio::time::sleep(Duration::from_secs(10)).await;
+                                //     let mut lock = facetime.state.write().await;
+                                //     let state = lock.sessions.values_mut().find(|a| a.group_id == guid).expect("state");
+                                //     facetime.ensure_allocations(state, &[]).await.expect("state");
+                                //     facetime.decline_invite(state).await.expect("failed to unprop?");
+                                // }
+                                last_ft_guid = guid;
+                            },
+                            _ => {}
+                        }
+                    }
+                }
                 let msg = client.handle(msg).await;
                 if msg.is_err() {
                     error!("Failed to receive {}", msg.err().unwrap());

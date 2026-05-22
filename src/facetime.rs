@@ -1,20 +1,31 @@
-use std::{collections::{BTreeSet, HashMap, HashSet}, io::Cursor, ops::Deref, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{BTreeSet, HashMap, HashSet}, fmt::Display, io::Cursor, net::{SocketAddr, SocketAddrV4}, ops::Deref, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use aes_gcm::{aead::Aead, Aes256Gcm, Nonce};
 use base64::engine::general_purpose;
+use deku::prelude::*;
 use facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
+use h3::client;
+use h3_quinn::Connection;
 use hkdf::Hkdf;
+use http::Request;
 use log::{debug, info, warn};
-use openssl::{derive::Deriver, pkey::Private, sha::sha1, symm::{decrypt, Cipher}};
+use openssl::{derive::Deriver, hash::MessageDigest, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, decrypt}};
 use plist::{Data, Dictionary, Value};
 use base64::Engine;
-use prost::Message;
+use prost::{Message, bytes::Buf};
+use quinn::crypto::rustls::QuicClientConfig;
+use rtc_media::{Sample, io::sample_builder::SampleBuilder};
+use rtc_rtp::codec::h265::H265Packet;
+use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
+use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
+use rtc_shared::marshal::Unmarshal;
 
-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
+use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, facetime::facetimep::{VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessageWrapper}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::GlobalLink, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -179,6 +190,21 @@ pub struct FTSession {
     pub mode: Option<FTMode>,
     #[serde(skip)]
     pub recent_member_adds: HashMap<String, u64>,
+    #[serde(skip)]
+    pub connection: Option<Arc<FTSessionConnection>>,
+    #[serde(skip)]
+    pub av_config: Option<AVConfig>,
+}
+
+pub struct FTSessionConnection {
+    link: Arc<GlobalLink>,
+    pub frames: Mutex<tokio::sync::mpsc::Receiver<ChannelFrame>>,
+    pub their_session_id: Mutex<HashMap<u64, String>>,
+}
+
+pub enum ChannelFrame {
+    Sample(Vec<u8>),
+    ImageDescription(Vec<u8>),
 }
 
 // time to track recently added members
@@ -287,6 +313,697 @@ impl ToString for ParticipantID {
     }
 }
 
+fn participant_from_meta(id: ParticipantID, ids_sender: &str, avc_data: Vec<u8>, message: &ConversationMessage, context: &ConversationParticipantDidJoinContext) -> ConversationParticipant {
+    ConversationParticipant {
+        version: context.version,
+        identifier: id.into(),
+        handle: Some(handle_from_ids(ids_sender)),
+        avc_data: avc_data.into(),
+        is_moments_available: Some(context.is_moments_available),
+        is_screen_sharing_available: Some(context.is_screen_sharing_available),
+        is_gondola_calling_available: Some(context.is_gondola_calling_available),
+        is_mirage_available: Some(context.is_mirage_available),
+        is_lightweight: Some(context.is_lightweight),
+        share_play_protocol_version: context.share_play_protocol_version,
+        // options: 1,
+        options: 0, // default (missing)
+        is_gft_downgrade_to_one_to_one_available: context.is_gft_downgrade_to_one_to_one_available,
+        guest_mode_enabled: Some(message.guest_mode_enabled),
+        association: context.participant_association.clone(),
+        is_u_plus_n_downgrade_available: context.is_u_plus_n_downgrade_available,
+        av_mode: message.av_mode,
+        supports_leave_context: context.supports_leave_context,
+        is_u_plus_one_screen_sharing_available: context.is_u_plus_one_screen_sharing_available,
+        persona_handshake_data: None,
+        is_spatial_persona_enabled: context.is_spatial_persona_enabled,
+        is_u_plus_one_av_less_available: context.is_u_plus_one_av_less_available,
+        vision_feature_version: context.vision_feature_version,
+        vision_call_establishment_version: context.vision_call_establishment_version,
+        is_u_plus_one_vision_to_vision_available: context.is_u_plus_one_vision_to_vision_available,
+        supports_request_to_screen_share: context.supports_request_to_screen_share,
+        spatial_persona_generation_counter: Some(0),
+        is_photos_share_play_available: context.is_photos_share_play_available,                            
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AVCData {
+    #[serde(rename = "vcSessionParticipantKeyUUID")]
+    vc_session_participant_key_uuid: String,
+    pub b2n: Data,
+    pub vc_session_participant_key_media_blob: Data,
+    pub vc_session_participant_key_call_info_blob: Data,
+}
+
+#[derive(Clone)]
+pub struct AVConfig {
+    session: String,
+    start_time: u64,
+}
+
+#[test]
+fn waht() {
+    let features = EnabledAVFeatures::from_bytes(&[0xff, 0x0f]);
+    panic!("features {}", features);
+}
+
+impl AVConfig {
+    fn new() -> Self {
+        Self {
+            session: Uuid::new_v4().to_string().to_uppercase(),
+            start_time: duration_since_epoch().as_millis() as u64,
+        }
+    }
+
+    // MUST NOT USE RANDOMIZATION/Time, any mismatch between link avc and IDS avc will cause lack of stream.
+    fn avc_data(&self) -> AVCData {
+        // FLS2;RVRA1;CH1;CR;CF;FA; - macos features
+        let features = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+        let mut video_features = features.to_bytes().to_vec();
+
+        let supported_features = EnabledAVFeatures::from_str("FLS2;RVRA1;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;");
+        video_features.extend_from_slice(&supported_features.to_bytes());
+
+
+        let now = Duration::from_millis(self.start_time);
+
+        let ntp_time = ((now.as_secs() + 2_208_988_800) << 32)
+        | (((now.subsec_nanos() as u128) << 32) / 1_000_000_000) as u64;
+
+        info!("talfjsadf {ntp_time}");
+
+
+        let media = VcMediaNegotiationBlobV2 {
+            general_info: Some(VcMediaNegotiationBlobV2GeneralInfo {
+                ntp_time: Some(ntp_time),
+                cname: None,
+                ab_switches: Some(201326586),
+                screen_res: Some(268437760),
+            }),
+            bandwidth_settings: Some(VcMediaNegotiationBlobV2BandwidthSettings {
+                cap2g: Some(0),
+                cap3g: Some(0),
+                cap_lte: Some(0),
+                cap5g: Some(0),
+                cap_wifi: Some(6500),
+            }),
+            codec_support: Some(VcMediaNegotiationBlobV2CodecFeatures {
+                audio_features: None,
+                video_features: Some(video_features.clone()),
+            }),
+            microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
+                rtp_ssrc: Some(3695227082),
+                payloads: None,
+                cipher_suites: Some(5),
+            }),
+            camera_u1: Some(VcMediaNegotiationBlobV2CameraSettingsU1 {
+                rtp_ssrc: Some(911343032),
+                payloads: vec![
+                    VcMediaNegotiationBlobV2VideoPayload {
+                        video_payload: None,
+                        parameter_set: Some(1),
+                        encode_formats: Some(404062694),
+                        decode_formats: Some(101975526),
+                        encode_decode_features: Some(vec![0x2d, 0x00, 0xed, 0x0f]),
+                        preferred_decode_format: Some(0),
+                    },
+                    VcMediaNegotiationBlobV2VideoPayload {
+                        video_payload: Some(2),
+                        parameter_set: Some(14),
+                        encode_formats: None,
+                        decode_formats: Some(104333312),
+                        encode_decode_features: Some(video_features.clone()),
+                        preferred_decode_format: Some(0),
+                    },
+                ],
+                landscape_aspect_ratio_x: None,
+                landscape_aspect_ratio_y: None,
+                portrait_aspect_ratio_x: Some(2),
+                portrait_aspect_ratio_y: Some(3),
+                mismatched_display_aspect_ratio_x: None,
+                mismatched_display_aspect_ratio_y: None,
+                cipher_suites: Some(3),
+            }),
+            moments_settings: Some(VcMediaNegotiationBlobV2MomentsSettings {
+                capabilities: Some(10),
+                supported_codecs: Some(15),
+            }),
+            stream_groups: vec![
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(6),
+                    payloads: vec![
+                        VcMediaNegotiationBlobV2StreamGroupPayload { ..Default::default() },
+                        VcMediaNegotiationBlobV2StreamGroupPayload { ..Default::default() },
+                    ],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(1009781331),
+                            stream_index: Some(0),
+                            max_network_bitrate_v2: Some(32400),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(2708855962),
+                            stream_index: Some(1),
+                            max_network_bitrate_v2: Some(76200),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: None,
+                },
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(3),
+                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+                        rtcp_flags: Some(4),
+                        ..Default::default()
+                    }],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(1409061878),
+                            stream_index: Some(0),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(3893587782),
+                            stream_index: Some(8),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(3560702437),
+                            stream_index: Some(9),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(4263985395),
+                            stream_index: Some(10),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(1600051301),
+                            stream_index: Some(11),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                        rtp_ssrc: Some(925355770),
+                        encode_decode_features: vec![
+                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                rtp_payload: Some(126),
+                                encode_decode_features: Some(vec![0x00, 0x08, 0xed, 0x0f]),
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                rtp_payload: Some(123),
+                                encode_decode_features: Some(vec![0x00, 0x08, 0xed, 0x0f]),
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                rtp_payload: Some(100),
+                                encode_decode_features: Some(vec![0x02, 0x08, 0xff, 0x0f]),
+                            },
+                        ],
+                    }),
+                },
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(2),
+                    payloads: vec![
+                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(108), ..Default::default() },
+                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(13), ..Default::default() },
+                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(104), ..Default::default() },
+                    ],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(2704322536),
+                            stream_index: Some(0),
+                            max_network_bitrate_v2: Some(31334),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(890728963),
+                            stream_index: Some(1),
+                            max_network_bitrate_v2: Some(73400),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                        rtp_ssrc: Some(3695227082),
+                        encode_decode_features: vec![],
+                    }),
+                },
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(4),
+                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+                        rtp_payload: Some(101),
+                        p_time: Some(40),
+                        ..Default::default()
+                    }],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(3755905642),
+                            stream_index: Some(0),
+                            max_network_bitrate_v2: Some(73800),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(1043709230),
+                            stream_index: Some(1),
+                            max_network_bitrate_v2: Some(153200),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                        rtp_ssrc: Some(2287042244),
+                        encode_decode_features: vec![],
+                    }),
+                },
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(1),
+                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+                        rtcp_flags: Some(4),
+                        ..Default::default()
+                    }],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(1014562129),
+                            repaired_max_network_bitrate: Some(78640),
+                            stream_index: Some(0),
+                            max_network_bitrate_v2: Some(32000),
+                            repaired_max_network_bitrate_v2: Some(78640),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(2123964153),
+                            stream_index: Some(1),
+                            max_network_bitrate_v2: Some(60800),
+                            repaired_max_network_bitrate_v2: Some(136240),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(478364846),
+                            stream_index: Some(2),
+                            max_network_bitrate_v2: Some(110800),
+                            repaired_max_network_bitrate_v2: Some(236240),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(2140118365),
+                            stream_index: Some(3),
+                            max_network_bitrate_v2: Some(220400),
+                            repaired_max_network_bitrate_v2: Some(470080),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(1363890893),
+                            stream_index: Some(4),
+                            max_network_bitrate_v2: Some(440800),
+                            repaired_max_network_bitrate_v2: Some(922720),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            payload_spec_or_payloads: Some(1),
+                            rtp_ssrc: Some(730812412),
+                            stream_index: Some(5),
+                            max_network_bitrate_v2: Some(876800),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                        rtp_ssrc: Some(911343032),
+                        encode_decode_features: vec![
+                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                rtp_payload: Some(123),
+                                encode_decode_features: Some(vec![0x2d, 0x00, 0xed, 0x0f]),
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                rtp_payload: Some(100),
+                                encode_decode_features: Some(video_features.clone()),
+                            },
+                        ],
+                    }),
+                },
+                VcMediaNegotiationBlobV2StreamGroup {
+                    stream_group: Some(5),
+                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+                        rtcp_flags: Some(6),
+                        ..Default::default()
+                    }],
+                    streams: vec![
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(963856646),
+                            stream_index: Some(0),
+                            max_network_bitrate_v2: Some(61640),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(2687807534),
+                            stream_index: Some(1),
+                            max_network_bitrate_v2: Some(217280),
+                            ..Default::default()
+                        },
+                        VcMediaNegotiationBlobV2StreamGroupStream {
+                            rtp_ssrc: Some(1375152617),
+                            stream_index: Some(2),
+                            max_network_bitrate_v2: Some(869120),
+                            ..Default::default()
+                        },
+                    ],
+                    settings_u1: None,
+                },
+            ],
+        };
+
+        let mediav1 = VcMediaNegotiationBlob {
+            allow_dynamic_max_bitrate: Some(true),
+            allows_contents_change_with_aspect_preservation: Some(true),
+            audio_settings: Some(VcMediaNegotiationBlobAudioSettings {
+                rtp_ssrc: Some(3695227082),
+                audio_unit_model: Some(67072),
+                support_flags: Some(1),
+                payload_flags: Some(3711),
+                secondary_flags: Some(2674),
+                use_sbr: Some(true),
+            }),
+            video_settings: Some(VcMediaNegotiationBlobVideoSettings {
+                rtp_ssrc: Some(911343032),
+                allow_rtcpfb: Some(false),
+                video_payload_collections: vec![
+                    VcMediaNegotiationBlobVideoPayloadSettings {
+                        payload: Some(123),
+                        video_rule_collections: vec![
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(1),
+                                operation: Some(1),
+                                formats: Some(200511),
+                                preferred_format: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(1),
+                                operation: Some(2),
+                                formats: Some(1208159423),
+                                preferred_format: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(2),
+                                operation: Some(1),
+                                formats: Some(16389),
+                                preferred_format: Some(16384),
+                                formats_ext1: Some(24),
+                                preferred_format_ext1: Some(8),
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(2),
+                                operation: Some(2),
+                                formats: Some(16389),
+                                preferred_format: Some(16384),
+                                formats_ext1: Some(8),
+                                preferred_format_ext1: Some(8),
+                            },
+                        ],
+                        feature_string: Some("FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;AR:16/9,2/3;XR:16/9,2/3;".to_string()),
+                        parameter_set: Some(1),
+                    },
+                    VcMediaNegotiationBlobVideoPayloadSettings {
+                        payload: Some(100),
+                        video_rule_collections: vec![
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(1),
+                                operation: Some(1),
+                                formats: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(1),
+                                operation: Some(2),
+                                formats: Some(1275471872),
+                                preferred_format: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(2),
+                                operation: Some(1),
+                                formats: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobVideoRuleCollection {
+                                transport: Some(2),
+                                operation: Some(2),
+                                formats: Some(67158029),
+                                preferred_format: Some(67141632),
+                                ..Default::default()
+                            },
+                        ],
+                        feature_string: Some("FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;AR:16/9,2/3;XR:16/9,2/3;".to_string()),
+                        parameter_set: Some(14),
+                    },
+                ],
+                ltrp_enabled: Some(true),
+                ..Default::default()
+            }),
+            screen_settings: None,
+            user_agent: Some("Viceroy 1.7.0".to_string()),
+            baseband_codec: None,
+            baseband_codec_sample_rate: Some(0),
+            bandwidth_settings: vec![
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(4),
+                    max_bandwidth: Some(6500),
+                    configuration_extension: None,
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(4074),
+                    max_bandwidth: Some(0),
+                    configuration_extension: Some(16384),
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(0),
+                    max_bandwidth: Some(20000000),
+                    configuration_extension: Some(98304),
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(0),
+                    max_bandwidth: Some(60000000),
+                    configuration_extension: Some(262144),
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(0),
+                    max_bandwidth: Some(40000000),
+                    configuration_extension: Some(12288),
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(1),
+                    max_bandwidth: Some(299),
+                    configuration_extension: None,
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(0),
+                    max_bandwidth: Some(6000000),
+                    configuration_extension: Some(131072),
+                },
+                VcMediaNegotiationBlobBandwidthSettings {
+                    configuration: Some(16),
+                    max_bandwidth: Some(4100),
+                    configuration_extension: None,
+                },
+            ],
+            captions_settings: None,
+            multiway_audio_streams: vec![
+                VcMediaNegotiationBlobMultiwayAudioStream {
+                    ssrc: Some(2704322536),
+                    max_network_bitrate: Some(31334),
+                    supported_payloads: Some(3072),
+                    stream_id: Some(45032),
+                    quality_index: Some(25),
+                    max_media_bitrate: Some(13200),
+                    max_packets_per_second: Some(16.0),
+                    repaired_stream_id: None,
+                    repaired_max_network_bitrate: None,
+                },
+                VcMediaNegotiationBlobMultiwayAudioStream {
+                    ssrc: Some(890728963),
+                    max_network_bitrate: Some(73400),
+                    supported_payloads: Some(3592),
+                    stream_id: Some(29187),
+                    quality_index: Some(200),
+                    max_media_bitrate: Some(48000),
+                    max_packets_per_second: Some(25.0),
+                    repaired_stream_id: None,
+                    repaired_max_network_bitrate: None,
+                },
+            ],
+            moments_settings: Some(VcMediaNegotiationBlobMomentsSettings {
+                capabilities: Some(4),
+                supported_video_codecs: Some(3),
+                supported_image_types: Some(3),
+                multiway_capabilities: Some(4),
+            }),
+            ntp_time: Some(ntp_time),
+            blob_version: Some(2),
+            multiway_video_stream: vec![
+                VcMediaNegotiationBlobMultiwayVideoStream {
+                    ssrc: Some(2123964153),
+                    max_network_bitrate: Some(60800),
+                    payload: Some(1),
+                    stream_id: Some(7929),
+                    metadata: Some(0),
+                    quality_index: Some(62),
+                    supported_video_formats: Some(512),
+                    frame_rate: Some(15),
+                    key_frame_interval: Some(0),
+                    max_media_bitrate: None,
+                    max_packets_per_second: None,
+                    repaired_stream_id: Some(7930),
+                    repaired_max_network_bitrate: Some(136240),
+                },
+                VcMediaNegotiationBlobMultiwayVideoStream {
+                    ssrc: Some(478364846),
+                    max_network_bitrate: Some(110800),
+                    payload: Some(1),
+                    stream_id: Some(17582),
+                    metadata: Some(0),
+                    quality_index: Some(125),
+                    supported_video_formats: Some(1024),
+                    frame_rate: Some(15),
+                    key_frame_interval: Some(0),
+                    max_media_bitrate: None,
+                    max_packets_per_second: None,
+                    repaired_stream_id: Some(17583),
+                    repaired_max_network_bitrate: Some(236240),
+                },
+                VcMediaNegotiationBlobMultiwayVideoStream {
+                    ssrc: Some(2140118365),
+                    max_network_bitrate: Some(220400),
+                    payload: Some(1),
+                    stream_id: Some(40285),
+                    metadata: Some(0),
+                    quality_index: Some(250),
+                    supported_video_formats: Some(2048),
+                    frame_rate: Some(15),
+                    key_frame_interval: Some(0),
+                    max_media_bitrate: None,
+                    max_packets_per_second: None,
+                    repaired_stream_id: Some(40286),
+                    repaired_max_network_bitrate: Some(470080),
+                },
+                VcMediaNegotiationBlobMultiwayVideoStream {
+                    ssrc: Some(1363890893),
+                    max_network_bitrate: Some(440800),
+                    payload: Some(1),
+                    stream_id: Some(21197),
+                    metadata: Some(0),
+                    quality_index: Some(425),
+                    supported_video_formats: Some(4096),
+                    frame_rate: Some(15),
+                    key_frame_interval: Some(0),
+                    max_media_bitrate: None,
+                    max_packets_per_second: None,
+                    repaired_stream_id: Some(21198),
+                    repaired_max_network_bitrate: Some(922720),
+                },
+                VcMediaNegotiationBlobMultiwayVideoStream {
+                    ssrc: Some(730812412),
+                    max_network_bitrate: Some(876800),
+                    payload: Some(1),
+                    stream_id: Some(20476),
+                    metadata: Some(0),
+                    quality_index: Some(1000),
+                    supported_video_formats: Some(32768),
+                    frame_rate: Some(15),
+                    key_frame_interval: Some(0),
+                    max_media_bitrate: None,
+                    max_packets_per_second: None,
+                    repaired_stream_id: Some(20477),
+                    repaired_max_network_bitrate: Some(1370000),
+                },
+            ],
+            media_control_info_version: Some(2),
+            face_time_settings: Some(VcMediaNegotiationFaceTimeSettings {
+                capabilities: Some(0),
+                switches: Some(201326586),
+                one_to_one_mode_supported: Some(true),
+                media_control_info_sub_version: Some(0),
+                link_probing_capability_version: Some(0),
+            }),
+            access_network_type: None,
+        };
+
+        let call_info = VcCallInfoBlob {
+            call_id: Some(1458276328),
+            client_version: Some(1),
+            device_type: Some("iMac19,2".to_string()),
+            framework_version: Some("2090.17.5.1".to_string()),
+            os_version: Some("24C101".to_string()),
+            device_name: None,
+            audio_device_uid: None,
+        };
+
+        AVCData {
+            vc_session_participant_key_uuid: self.session.clone(),
+            b2n: Data::new(media.encode_to_vec()),
+            vc_session_participant_key_media_blob: Data::new(deflate(&mediav1.encode_to_vec()).unwrap()),
+            vc_session_participant_key_call_info_blob: Data::new(call_info.encode_to_vec()),
+        }
+    }
+}
+
+fn my_conv_participant(config: &AVConfig) -> ConversationParticipant {
+    let avc_data = config.avc_data();
+
+    ConversationParticipant {
+        version: 0,
+        identifier: 0,
+        handle: None,
+        avc_data: plist_to_bin(&avc_data).expect("failed to serialize AVC data"),
+        is_moments_available: Some(true),
+        is_screen_sharing_available: Some(true),
+        is_gondola_calling_available: Some(true),
+        is_mirage_available: Some(false),
+        is_lightweight: Some(false),
+        share_play_protocol_version: 4,
+        options: 1,
+        is_gft_downgrade_to_one_to_one_available: Some(true),
+        guest_mode_enabled: None,
+        association: None,
+        is_u_plus_n_downgrade_available: Some(true),
+        av_mode: Some(2),
+        supports_leave_context: Some(true),
+        is_u_plus_one_screen_sharing_available: Some(true),
+        persona_handshake_data: None,
+        is_spatial_persona_enabled: Some(false),
+        is_u_plus_one_av_less_available: Some(true),
+        vision_feature_version: Some(0),
+        vision_call_establishment_version: Some(0),
+        is_u_plus_one_vision_to_vision_available: Some(false),
+        supports_request_to_screen_share: Some(true),
+        spatial_persona_generation_counter: None,
+        is_photos_share_play_available: Some(false),
+        ..Default::default()
+    }
+}
+
+#[derive(DekuRead, DekuWrite, Clone, Debug)]
+struct SFramePacket {
+    #[deku(bits = 1)]
+    sig_flag: bool,
+    #[deku(bits = 3)]
+    ctr_len: u8,
+    #[deku(bits = 1)]
+    extended_keyid: bool,
+    #[deku(bits = 3)]
+    keyid_len: u8,
+    #[deku(bytes = "*keyid_len as usize + 1")]
+    key_id: u64,
+    #[deku(bytes = "*ctr_len as usize + 1")]
+    ctr: u64,
+}
+
 #[derive(Clone, Debug)]
 pub enum FTMessage {
     LetMeInRequest(LetMeInRequest),
@@ -324,6 +1041,153 @@ pub enum FTMessage {
     },
 }
 
+#[derive(Debug)]
+struct AVFeature {
+    feature: &'static str,
+    size: usize,
+}
+
+const FEATURES: &[AVFeature] = &[
+    AVFeature { feature: "RVRA1", size: 0x2 },
+    AVFeature { feature: "VRAE", size: 0x4 },
+    AVFeature { feature: "CH1", size: 0x2 },
+    AVFeature { feature: "CR", size: 0x4 },
+    AVFeature { feature: "CF", size: 0x0 },
+    AVFeature { feature: "FA", size: 0x4 },
+    AVFeature { feature: "POS", size: 0x3 },
+    AVFeature { feature: "HTS", size: 0x8 },
+    AVFeature { feature: "EOD", size: 0x0 },
+    AVFeature { feature: "RR", size: 0x4 },
+    AVFeature { feature: "QP", size: 0x1 },
+    AVFeature { feature: "SW", size: 0x8 },
+    AVFeature { feature: "MLS", size: 0x0 },
+    AVFeature { feature: "POSE", size: 0x6 },
+];
+
+#[derive(Debug)]
+struct EnabledAVFeatures(Vec<&'static AVFeature>);
+
+impl Display for EnabledAVFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FLS2;{}", self.0.iter().map(|i| format!("{};", i.feature)).collect::<Vec<_>>().join(""))
+    }
+}
+
+impl EnabledAVFeatures {
+    fn from_str(features: &str) -> Self {
+        let mut result = [false; FEATURES.len()];
+        for feature in features.split(";") {
+            if feature.is_empty() { continue }
+            let mut parts = feature.split(":");
+            let name = parts.next().unwrap();
+            if let Some(pos) = FEATURES.iter().position(|i| i.feature == name) {
+                result[pos] = true;
+            }
+        }
+        Self::from_bits(&result)
+    }
+
+    fn from_bits(bits: &[bool]) -> Self {
+        Self(bits.iter().take(FEATURES.len()).enumerate().filter(|i| *i.1).map(|(i, _)| &FEATURES[i]).collect())
+    }
+
+    fn from_bytes(features: &[u8]) -> Self {
+        let mut list = vec![false; features.len() * 8];
+        for (byte, list) in features.iter().zip(list.chunks_mut(8)) {
+            for (idx, feature) in list.iter_mut().enumerate() {
+                *feature = ((*byte >> idx) & 1) == 1;
+            }
+        }
+
+        Self::from_bits(&list)
+    }
+
+    fn to_bits(&self) -> [bool; FEATURES.len()] {
+        self.0.iter().fold([false; FEATURES.len()], |mut acc, i| {
+            let pos = FEATURES.iter().position(|f| std::ptr::eq(f, *i)).expect("no feature???");
+            acc[pos] = true;
+            acc
+        })
+    }
+
+    fn to_bytes(&self) -> [u8; (FEATURES.len() + 7) / 8] {
+        let bits = self.to_bits();
+        let mut bytes = [0u8; (FEATURES.len() + 7) / 8];
+        for (bits, byte) in bits.chunks(8).zip(bytes.iter_mut()) {
+            for (idx, bit) in bits.iter().enumerate() {
+                if !*bit { continue }
+                *byte |= 1 << idx;
+            }
+        }
+        bytes
+    }
+
+    fn parse_frame<'a>(&self, decode: &'a [u8]) -> &'a [u8] {
+        let ctrl = *decode.last().unwrap() as usize;
+
+        let frame_features = self.0.iter().filter(|i| i.feature != "MLS").enumerate().take(7).filter(|(idx, feature)| 
+            ((ctrl >> idx) & 1) == 1).map(|i| *i.1).collect::<Vec<_>>();
+
+        let total_len = frame_features.iter().fold(0, |a, c| a + c.size);
+
+        let mut idx = decode.len() - 2;
+
+        if ctrl & 0x80 != 0 {
+            // extension bytes, seems to always return 0
+            while decode[idx] & 0x80 != 0 {
+                idx -= 1;
+            }
+            idx -= 1;
+        }
+
+
+        let mut output = vec![];
+        while output.len() < total_len {
+            if &decode[idx - 2..=idx] != &[0, 0, 3] {
+                output.insert(0, decode[idx]);
+            }
+            idx -= 1;
+        }
+        let mut trailer_offset = 0;
+        let mut decoded_features = Vec::new();
+        for feature in &frame_features {
+            let end = trailer_offset + feature.size;
+            let bytes = &output[trailer_offset..end];
+            decoded_features.push(format!(
+                "{}={}",
+                feature.feature,
+                encode_hex(bytes)
+            ));
+            trailer_offset = end;
+        }
+        info!(
+            "umbrees av_trailer ctrl=0x{ctrl:02x} removed={} features=[{}] raw={}",
+            decode.len() - idx - 1,
+            decoded_features.join(","),
+            encode_hex(&output),
+        );
+
+        &decode[..=idx]
+    }
+}
+
+#[test]
+fn parse_av() {
+    let features = [61, 0];
+    let f = EnabledAVFeatures::from_bytes(&features);
+    println!("Got features {f}");
+}
+
+#[test]
+fn parse_ntp_timestamp_ms_since_epoch() {
+    let ntp_time = 17130066577794576307;
+    let seconds = (ntp_time >> 32) - 2_208_988_800;
+    let fraction = ntp_time & 0xffff_ffff;
+    let millis = seconds * 1000 + ((fraction as u128 * 1000) >> 32) as u64;
+
+    panic!("ms since epoch: {millis}");
+}
+
 #[derive(Clone, Debug)]
 pub struct LetMeInRequest {
     pub shared_secret: Vec<u8>,
@@ -335,6 +1199,49 @@ pub struct LetMeInRequest {
     pub usage: Option<String>,
 }
 
+pub struct ControlKeySet {
+    key_id: Vec<u8>,
+    salt_key: [u8; 16],
+    encryption_key: [u8; 16],
+    authentication_key: [u8; 32],
+}
+
+impl ControlKeySet {
+    pub fn from_master(key_id: Vec<u8>, master: [u8; 32]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(&master[16..]), &master[..16]);
+
+        let mut salt_key = [0u8; 16];
+        hk.expand(b"SFrameSaltKey", &mut salt_key).unwrap();
+        let mut encryption_key = [0u8; 16];
+        hk.expand(b"SFrameEncryptionKey", &mut encryption_key).unwrap();
+        let mut authentication_key = [0u8; 32];
+        hk.expand(b"SFrameAuthenticationKey", &mut authentication_key).unwrap();
+        
+        Self {
+            key_id,
+            salt_key,
+            encryption_key,
+            authentication_key,
+        }
+    }
+
+    pub fn decrypt(&self, payload: &[u8]) -> Vec<u8> {
+        let ((msg, _), packet) = SFramePacket::from_bytes((payload, 0)).unwrap();
+        
+        let hmac = PKey::hmac(&self.authentication_key).unwrap();
+        let signature = Signer::new(MessageDigest::sha256(), &hmac).unwrap()
+            .sign_oneshot_to_vec(&payload[..payload.len() - 10]).unwrap();
+
+        assert_eq!(&payload[payload.len() - 10..], &signature[..10]);
+
+        let mut salt = self.salt_key;
+        for (idx, i) in packet.ctr.to_le_bytes().into_iter().enumerate() {
+            salt[idx] ^= i;
+        }
+
+        decrypt(Cipher::aes_128_ctr(), &self.encryption_key, Some(&salt), &msg[..msg.len() - 10]).unwrap()
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct FTState {
@@ -342,7 +1249,7 @@ pub struct FTState {
     pub sessions: HashMap<String, FTSession>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct FTWireMessage {
     #[serde(rename = "s")]
@@ -395,69 +1302,173 @@ impl FTClient {
         if has_relay {
             return Ok(())
         }
+
+        if session.connection.is_some() { return Ok(()) }
         
         // we need to do quickrelay allocations
         let people_in_chatroom: Vec<String> = session.members.iter().chain(new_members).map(|m| m.handle.clone()).collect();
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
+
+        let mut relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id).await?;
+
+        for allocation in &relay_session.state.lock().await.configuration.allocations {
+            let id = allocation.id as u64;
+            let participant = session.participants.entry(id.to_string()).or_default();
+            participant.handle = allocation.participant.clone();
+            participant.participant_id = id;
+            participant.token = Some(base64_encode(allocation.token.as_ref()));
+        }
+
+        let avc_data = my_conv_participant(session.av_config.as_ref().expect("no av config")).encode_to_vec();
+        relay_session.alloc_bind(&avc_data).await?;
+
+        
+        let wire_message = FTWireMessage {
+            session: session.group_id.clone(),
+            prekey: Some(relay_session.get_public_key().await?.into()),
+            prekey_wrap_mode: Some(1),
+            fanout_groupid: session.group_id.clone(),
+            ..Default::default()
+        };
+
+        let (send, recv) = tokio::sync::mpsc::channel(1024);
+        session.connection = Some(Arc::new(FTSessionConnection {
+            link: relay_session.clone(),
+            frames: Mutex::new(recv),
+            their_session_id: Mutex::new(HashMap::new()),
+        }));
+
+        let item = session.connection.clone().unwrap();
+        let session_id = session.av_config.as_ref().expect("no av config").session.clone();
+        let session_handle = relay_session.clone();
+        tokio::spawn(async move {
+            let enabled = EnabledAVFeatures::from_str("FLS2;RVRA1;CH1;CR;CF;FA;");
+            let mut channel_contexts: HashMap<u32, (Context, Option<SampleBuilder<H265Packet>>)> = HashMap::new();
+            while let Some(recv) = session_handle.recv().await {
+                match recv.data[0] {
+                    0x90 => {
+                        let header = rtc_rtp::Header::unmarshal(&mut &recv.data[..]).unwrap();
+                        info!("Header {:?}", header);
+
+                        if !channel_contexts.contains_key(&header.ssrc) {
+                            let state = session_handle.state.lock().await;
+                            // find right participant and interation
+                            let Some(mkm) = state.states.iter().find_map(|i| i.1.mkm.first()) else {
+                                warn!("No SKM!");
+                                continue
+                            };
+
+                            let key = mkm.get_key(header.ssrc);
+                            channel_contexts.insert(header.ssrc, (Context::new(
+                                &key[..16], 
+                                &key[16..], 
+                                if header.payload_type == 104 { ProtectionProfile::Aes128CmHmacSha2mki_32 } else { ProtectionProfile::Aes128CmHmacSha2mki_80 }, 
+                                None, 
+                                None
+                            ).unwrap(), if header.payload_type == 100 {
+                                Some(SampleBuilder::new(
+                                    50,          // max_late in sequence numbers
+                                    H265Packet::default(),
+                                    90_000,     // RTP video clock
+                                ))
+                            } else {
+                                None
+                            }));
+                        }
+
+                        let (context, depacket) = channel_contexts.get_mut(&header.ssrc).unwrap();
+                        let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                info!("Error {e}");
+                                continue
+                            }
+                        };
+                        let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
+
+                        info!("Result {:?}", encode_hex(&unmarshalled.payload));
+
+                        // this constant is hardcoded
+                        if &unmarshalled.payload[..4] == &[0x92, 0xe6, 0xc0, 0xa3] {
+                            let qtff_format = &unmarshalled.payload[4..];
+                            info!("mediainfo {}", encode_hex(qtff_format));
+                            let _ = send.try_send(ChannelFrame::ImageDescription(qtff_format.to_vec()));
+                        } else if let Some(depacket) = depacket {
+                            depacket.push(unmarshalled);
+                            while let Some(sample) = depacket.pop() {
+                                info!("Smaple before {}", encode_hex(&sample.data));
+                                let parse = enabled.parse_frame(&sample.data);
+                                info!("sample {} {}", encode_hex(&parse), sample.prev_dropped_packets);
+                                let _ = send.try_send(ChannelFrame::Sample(parse.to_vec()));
+                            }
+                        }
+                    },
+                    0x40 => {
+                        let lock = item.their_session_id.lock().await.values().next().cloned();
+                        let their = if let Some(their) = lock {
+                            their
+                        } else {
+                            warn!("Missing their participant ID!");
+                            // tokio::time::sleep(Duration::from_secs(5)).await;
+                            // let lock = item.their_session_id.lock().await.values().next().cloned();
+                            // if let Some(their) = lock {
+                            //     their
+                            // } else {
+                            //     warn!("Still Missing their participant ID!");
+                            //     continue;
+                            // }
+                            continue;
+                        };
+                        let state = session_handle.state.lock().await;
+                        // find right participant and interation
+                        let Some(mkm) = state.states.iter().find_map(|i| i.1.mkm.first()) else {
+                            warn!("No SKM!");
+                            continue
+                        };
+
+                        let key = mkm.get_control(&their, &session_id);
+                        let decrypted = key.decrypt(&recv.data[1..]);
+
+                        // let wrapper = VcccMessageWrapper::decode(&decrypted[..]).unwrap();
+                        
+                        info!("Hi {:?}", encode_hex(&decrypted));
+                    },
+                    _unk => {
+                        info!("Got unknown header {_unk}");
+                    }
+                }
+            }
+        });
+
+        let relevant_people: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
+
+        let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity.cache_keys(
             topic,
-            &people_in_chatroom,
+            &relevant_people,
             &handle,
             false,
             &QueryOptions { required_for_message: true, result_expected: true }
         ).await?;
 
-        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, handle, &people_in_chatroom);
-        let receiver = self.conn.subscribe().await;
-        let uuid = Uuid::new_v4();
-        self.identity.send_message(topic, IDSSendMessage::quickrelay(handle.clone(), uuid, IDSQuickRelaySettings {
-            reason: 0, // something along the lines of 'someone joined'
-            group_id: session.group_id.clone(),
-            request_type: 3, // allocate relay
-            member_count: people_in_chatroom.len() as u32,
-        }), targets).await?;
+        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
+        self.identity.send_message(topic, IDSSendMessage {
+            sender: handle.clone(),
+            raw: Raw::Body(plist_to_bin(&wire_message)?),
+            send_delivered: false,
+            command: 210,
+            no_response: false,
+            id: Uuid::new_v4().to_string().to_uppercase(),
+            scheduled_ms: None,
+            queue_id: None,
+            relay: None,
+            extras: Dictionary::from_iter([
+                ("siu", Value::Boolean(false)),
+            ]),
+        }, targets).await?;
 
-        #[derive(Deserialize)]
-        pub struct QuickRelayAllocation {
-            #[serde(rename = "qri")]
-            id: i64,
-            #[serde(rename = "tP")]
-            participant: String,
-            #[serde(rename = "t")]
-            token: Data,
-        }
-
-        #[derive(Deserialize)]
-        pub struct QuickRelayAllocationsResponse {
-            #[serde(rename = "U")]
-            for_id: Data,
-            #[serde(rename = "qal")]
-            allocations: Vec<QuickRelayAllocation>,
-        }
-
-        let response = self.conn.wait_for_timeout(receiver, get_message(|payload| {
-            info!("Got relay {:?}", payload);
-            let parsed = match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    info!("Failed to parse {e}");
-                    return None;
-                }
-            };
-            // let Ok(parsed) = plist::from_value::<QuickRelayAllocationsResponse>(&payload) else {
-            //     return None
-            // };
-            if parsed.for_id.as_ref() == uuid.as_bytes() { Some(parsed) } else { None }
-        }, &["com.apple.private.alloy.quickrelay"])).await?;
-
-        for allocation in response.allocations {
-            let id = allocation.id as u64;
-            let participant = session.participants.entry(id.to_string()).or_default();
-            participant.handle = allocation.participant;
-            participant.participant_id = id;
-            participant.token = Some(base64_encode(allocation.token.as_ref()));
-        }
+        info!("Connected!");
         
         Ok(())
     }
@@ -606,6 +1617,8 @@ impl FTClient {
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
+            connection: None,
+            av_config: Some(AVConfig::new()),
         };
 
         let mut my_session = self.state.write().await;
@@ -731,6 +1744,10 @@ impl FTClient {
 
         let base64_encoded = Some(base64_encode(&self_token));
 
+        let link_prekey: Option<Data> = if let Some(link) = &session.connection {
+            Some(link.link.get_public_key().await?.into())
+        } else { None };
+
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
 
@@ -754,6 +1771,8 @@ impl FTClient {
                 let mut update_context = ConversationParticipantDidJoinContext::default();
                 update_context.members = builder_session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
 
+                let participant = my_conv_participant(builder_session.av_config.as_ref().expect("no avc!"));
+
                 let mut message = ConversationMessage::default();
                 // ring not sending to ourselves
                 if ring && target.participant != my_participant.handle {
@@ -766,35 +1785,52 @@ impl FTClient {
                     ConversationInvitationPreference { version: 0, handle_type: HandleType::Generic as i32, notification_styles: 1 },
                     ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
                 ];
+                if let Some(guest_mode_enabled) = participant.guest_mode_enabled {
+                    message.guest_mode_enabled = guest_mode_enabled;
+                }
+                message.av_mode = participant.av_mode;
 
                 update_context.message = Some(message);
-                update_context.is_moments_available = true;
+                update_context.version = participant.version;
+                update_context.is_moments_available = participant.is_moments_available.unwrap_or_default();
                 update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
                 // maybe make these optional/forced
                 update_context.video = Some(true);
                 update_context.video_enabled = Some(false);
 
-                update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
-                update_context.is_u_plus_n_downgrade_available = Some(false);
-                update_context.is_u_plus_one_av_less_available = Some(false);
-
-                update_context.is_screen_sharing_available = true;
-                update_context.is_gondola_calling_available = true;
-                update_context.share_play_protocol_version = 4;
+                update_context.is_screen_sharing_available = participant.is_screen_sharing_available.unwrap_or_default();
+                update_context.is_mirage_available = participant.is_mirage_available.unwrap_or_default();
+                update_context.is_lightweight = participant.is_lightweight.unwrap_or_default();
+                update_context.is_gondola_calling_available = participant.is_gondola_calling_available.unwrap_or_default();
+                update_context.share_play_protocol_version = participant.share_play_protocol_version;
+                // was false
+                update_context.is_gft_downgrade_to_one_to_one_available = participant.is_gft_downgrade_to_one_to_one_available;
+                update_context.participant_association = participant.association.clone();
+                // was false
+                update_context.is_u_plus_n_downgrade_available = participant.is_u_plus_n_downgrade_available;
+                update_context.supports_leave_context = participant.supports_leave_context;
+                update_context.is_u_plus_one_screen_sharing_available = participant.is_u_plus_one_screen_sharing_available;
+                update_context.is_spatial_persona_enabled = participant.is_spatial_persona_enabled;
+                // was false
+                update_context.is_u_plus_one_av_less_available = participant.is_u_plus_one_av_less_available;
+                update_context.vision_feature_version = participant.vision_feature_version;
+                update_context.vision_call_establishment_version = participant.vision_call_establishment_version;
+                update_context.is_u_plus_one_vision_to_vision_available = participant.is_u_plus_one_vision_to_vision_available;
+                update_context.supports_request_to_screen_share = participant.supports_request_to_screen_share;
+                update_context.is_photos_share_play_available = participant.is_photos_share_play_available;
 
                 let participant_map: HashMap<String, Vec<ParticipantID>> = builder_session.participants.values().fold(HashMap::new(), |mut a, i| {
                     a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
                     a
                 });
 
-
                 let wire_message = FTWireMessage {
                     session: builder_session.group_id.clone(),
-                    prekey: None,
-                    prekey_wrap_mode: None,
+                    prekey: link_prekey.clone(),
+                    prekey_wrap_mode: link_prekey.as_ref().map(|_| 1),
                     fanout_groupid: builder_session.group_id.clone(),
                     client_context_data_key: Some(update_context.encode_to_vec().into()),
-                    participant_data_key: Some(include_bytes!("sampleavcdata.bplist").to_vec().into()), // should be AV mode, hopefully this doens't give us trouble?
+                    participant_data_key: Some(participant.avc_data.clone().into()), // should be AV mode, hopefully this doens't give us trouble?
                     is_initiator_key: Some(is_initiator),
                     fanout_groupmembers: Some(builder_session.members.iter().map(|a| a.handle.clone()).collect()),
                     is_u_plus_one_key: Some(is_u_plus_one),
@@ -1274,6 +2310,8 @@ impl FTClient {
                         session.link = Some(link.clone());
                     }
 
+                    info!("here");
+
                     if let Some(report) = &message.report_data {
                         session.report_id = report.conversation_id.clone();
                         session.start_time = Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
@@ -1284,29 +2322,24 @@ impl FTClient {
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
 
+                    let avc: AVCData = plist::from_bytes(avc_data.as_ref())?;
+                    info!("recievedaa {:?}", encode_hex(avc.vc_session_participant_key_media_blob.as_ref()));
+                    let inflated = inflate(avc.vc_session_participant_key_media_blob.as_ref())?;
+                    info!("here");
+                    let blob = VcMediaNegotiationBlob::decode(&inflated[..])?;
+                    let v2 = VcMediaNegotiationBlobV2::decode(avc.b2n.as_ref())?;
+                    info!("Got media blob {blob:?}");
+                    info!("Got v2 blob {v2:?}");
+                    if let Some(conn) = &session.connection {
+                        conn.their_session_id.lock().await.insert(participant.into(), avc.vc_session_participant_key_uuid.clone());
+                    }
+
                     session.participants.insert(participant.to_string(), FTParticipant {
                         token: Some(base64_encode(&token)),
                         participant_id: participant.into(),
                         last_join_date: Some(ns_since_epoch / 1000000),
                         handle: sender.clone(),
-                        active: Some(ConversationParticipant {
-                            version: decoded_context.version,
-                            identifier: participant.into(),
-                            handle: Some(handle_from_ids(&sender)),
-                            avc_data: avc_data.into(),
-                            is_moments_available: Some(decoded_context.is_moments_available),
-                            is_screen_sharing_available: Some(decoded_context.is_screen_sharing_available),
-                            is_gondola_calling_available: Some(decoded_context.is_gondola_calling_available),
-                            is_mirage_available: Some(decoded_context.is_mirage_available),
-                            is_lightweight: Some(decoded_context.is_lightweight),
-                            share_play_protocol_version: decoded_context.share_play_protocol_version,
-                            // options: 1,
-                            options: 0, // default (missing)
-                            is_gft_downgrade_to_one_to_one_available: decoded_context.is_gft_downgrade_to_one_to_one_available,
-                            guest_mode_enabled: Some(message.guest_mode_enabled),
-                            association: decoded_context.participant_association.clone(),
-                            is_u_plus_n_downgrade_available: decoded_context.is_u_plus_n_downgrade_available,
-                        }),
+                        active: Some(participant_from_meta(participant, &sender, avc_data.into(), message, &decoded_context)),
                     });
 
                     // if we propped it up for a join, someone else (or us) have joined
@@ -1427,4 +2460,3 @@ impl FTClient {
         })
     }
 }
-

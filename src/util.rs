@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use base64::engine::general_purpose;
-use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
+use deku::prelude::*;
 use hkdf::hmac::Hmac;
 use keystore::KeystorePublicKey;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
@@ -556,6 +556,22 @@ pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoder = Decoder::new(bytes)?;
     let mut decoded_data = Vec::new();
     decoder.read_to_end(&mut decoded_data)?;
+    Ok(decoded_data)
+}
+
+pub fn inflate(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libflate::zlib::Decoder;
+    let mut decoder = Decoder::new(bytes)?;
+    let mut decoded_data = Vec::new();
+    decoder.read_to_end(&mut decoded_data)?;
+    Ok(decoded_data)
+}
+
+pub fn deflate(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libflate::zlib::Encoder;
+    let mut decoded_data = Vec::new();
+    let mut decoder = Encoder::new(Cursor::new(&mut decoded_data))?;
+    decoder.write_all(bytes)?;
     Ok(decoded_data)
 }
 

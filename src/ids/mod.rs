@@ -9,6 +9,7 @@ use num_bigint::{BigInt, Sign};
 
 pub mod user;
 pub mod identity_manager;
+pub mod link;
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
