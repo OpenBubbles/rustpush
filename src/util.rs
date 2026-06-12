@@ -680,6 +680,11 @@ struct Carrier {
 
 const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version?languageCode=en";
 
+const HARDCODED_GATEWAYS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("311588", "28818773"), // Cape Cellular (MVNO on AT&T) -> AT&T SMS gateway
+    ])
+});
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -724,7 +729,18 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, Push
         .send().await?;
     
     let master: MasterList = plist::from_bytes(&data.bytes().await?)?;
-    let my_carrier = master.mobile_device_carriers_by_mcc_mnc.get(mccmnc).ok_or(PushError::CarrierNotFound)?;
+    let my_carrier = match master.mobile_device_carriers_by_mcc_mnc.get(mccmnc) {
+        Some(c) => c,
+        None => {
+            if let Some(gateway) = HARDCODED_GATEWAYS.get(mccmnc) {
+                return Ok(CarrierConfig {
+                    gateway: gateway.to_string(),
+                    carrier: None,
+                });
+            }
+            return Err(PushError::CarrierNotFound);
+        }
+    };
 
     let mut my_bundles = my_carrier.get_bundles();
     my_bundles.shuffle(&mut thread_rng());
