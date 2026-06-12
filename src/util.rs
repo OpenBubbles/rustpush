@@ -674,7 +674,7 @@ impl CarrierAddress {
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Carrier {
-    phone_number_registration_gateway_address: CarrierAddress,
+    phone_number_registration_gateway_address: Option<CarrierAddress>,
     carrier_entitlements: Option<CarrierEntitlements>,
 }
 
@@ -683,6 +683,7 @@ const CARRIER_CONFIG: &str = "https://itunes.apple.com/WebObjects/MZStore.woa/wa
 const HARDCODED_GATEWAYS: LazyLock<HashMap<&str, &str>> = LazyLock::new(|| {
     HashMap::from([
         ("311588", "28818773"), // Cape Cellular (MVNO on AT&T) -> AT&T SMS gateway
+        ("310410", "28818773"), // AT&T US
     ])
 });
 
@@ -729,10 +730,11 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, Push
         .send().await?;
     
     let master: MasterList = plist::from_bytes(&data.bytes().await?)?;
+    let fallback_gateway = HARDCODED_GATEWAYS.get(mccmnc).copied();
     let my_carrier = match master.mobile_device_carriers_by_mcc_mnc.get(mccmnc) {
         Some(c) => c,
         None => {
-            if let Some(gateway) = HARDCODED_GATEWAYS.get(mccmnc) {
+            if let Some(gateway) = fallback_gateway {
                 return Ok(CarrierConfig {
                     gateway: gateway.to_string(),
                     carrier: None,
@@ -763,10 +765,19 @@ pub async fn get_gateways_for_mccmnc(mccmnc: &str) -> Result<CarrierConfig, Push
         info!("here {:?}", plist::from_bytes::<Value>(&out)?);
 
         let parsed_file: Carrier = plist::from_bytes(&out)?;
+        if let Some(gateway) = parsed_file.phone_number_registration_gateway_address.and_then(|gateway| gateway.vec().choose(&mut thread_rng()).cloned()) {
+            return Ok(CarrierConfig {
+                gateway,
+                carrier: parsed_file.carrier_entitlements,
+            })
+        }
+    }
+
+    if let Some(gateway) = fallback_gateway {
         return Ok(CarrierConfig {
-            gateway: parsed_file.phone_number_registration_gateway_address.vec().choose(&mut thread_rng()).ok_or(PushError::CarrierNotFound)?.clone(),
-            carrier: parsed_file.carrier_entitlements,
-        })
+            gateway: gateway.to_string(),
+            carrier: None,
+        });
     }
 
     Err(PushError::CarrierNotFound)
