@@ -118,6 +118,14 @@ pub struct IMClient {
     pub identity: IdentityManager,
     os_config: Arc<dyn OSConfig>,
     _interest_token: APSInterestToken,
+    /// Push token of the SMS-relay device (the iPhone holding the SIM), learned
+    /// from any SMS-relay message it forwards to us. Lets an outgoing SMS target
+    /// its transmit-request at the SIM device only, so companion devices receive
+    /// just the threadable display reflection instead of an unbound relay request.
+    pub sms_relay_token: std::sync::RwLock<Option<Vec<u8>>>,
+    /// Disk path where `sms_relay_token` is persisted, so split-targeting works
+    /// on the first send after a restart without re-learning from inbound relay.
+    sms_relay_path: PathBuf,
 }
 
 impl IMClient {
@@ -140,6 +148,12 @@ impl IMClient {
             }
         });
 
+        // Persisted SMS-relay device token (see field docs). Derive a sibling
+        // path next to the IDS key cache and load any saved token before
+        // cache_path is consumed below.
+        let sms_relay_path = cache_path.with_file_name("sms_relay_token");
+        let initial_relay_token = std::fs::read(&sms_relay_path).ok().filter(|b| !b.is_empty());
+
         let identity = IdentityResource::new(users, identity, services, cache_path, conn.clone(), os_config.clone()).await;
 
         let mut to_refresh = identity.generated_signal.subscribe();
@@ -161,6 +175,8 @@ impl IMClient {
             conn,
             os_config: os_config.clone(),
             identity,
+            sms_relay_token: std::sync::RwLock::new(initial_relay_token),
+            sms_relay_path,
         }
     }
 
@@ -211,6 +227,32 @@ impl IMClient {
     
     async fn process_msg(&self, mut payload: IDSRecvMessage) -> Result<Option<MessageInst>, PushError> {
         let command = payload.command;
+
+        // Learn the SMS-relay device (iPhone) push token from any SMS-relay
+        // message it forwards to us (incoming texts, sent-message reflections,
+        // activation, receipts). The send path uses this to target an outgoing
+        // SMS transmit-request at the SIM device only.
+        if matches!(command, 140 | 141 | 143 | 144 | 145 | 146 | 147 | 149) {
+            if let Some(token) = &payload.token {
+                let changed = {
+                    let mut slot = self.sms_relay_token.write().unwrap();
+                    if slot.as_deref() != Some(token.as_slice()) {
+                        *slot = Some(token.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    // Persist so split-targeting survives a restart without
+                    // needing fresh inbound relay traffic to re-learn the token.
+                    if let Err(e) = std::fs::write(&self.sms_relay_path, token.as_slice()) {
+                        warn!("failed to persist SMS relay token: {}", e);
+                    }
+                }
+            }
+        }
+
         // delivered/read
         if let IDSRecvMessage {
             command: 101 | 102 | 113,
