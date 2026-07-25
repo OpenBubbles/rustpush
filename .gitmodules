@@ -3,4 +3,4 @@
 	url = https://github.com/OpenBubbles/apple-private-apis.git
 [submodule "open-absinthe"]
 	path = open-absinthe
-	url = git@github.com:OpenBubbles/OpenAbsinthe-Stub.git
+	url = https://github.com/OpenBubbles/OpenAbsinthe-Stub.git
