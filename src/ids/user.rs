@@ -804,19 +804,18 @@ impl IDSUser {
             .send(&REQWEST).await?
             .bytes().await?;
 
-        info!("Got alias response {}", str::from_utf8(&bytes).expect("Bytes to urtf8"));
-
         #[derive(Deserialize)]
         struct AliasResult {
-            alias: String,
+            #[serde(default)]
+            alias: Option<String>,
             status: u32,
         }
 
         let parsed: AliasResult = plist::from_bytes(&bytes)?;
-        *alias = Some(parsed.alias);
         if parsed.status != 0 {
             return Err(PushError::AliasError(parsed.status))
         }
+        *alias = Some(parsed.alias.ok_or(PushError::BadMsg)?);
 
         info!("Just took action {operation} on alias {} for handle {handle}", alias.as_ref().expect("No alias!"));
 
