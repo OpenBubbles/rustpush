@@ -4,6 +4,18 @@ fn main() -> Result<()> {
     let mut prost_build = prost_build::Config::new();
     // Enable a protoc experimental feature.
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
-    prost_build.compile_protos(&["src/icloud/mmcs.proto", "src/ids/ids.proto", "src/facetime.proto", "src/statuskit.proto", "src/imessage/cloud_messages.proto", "src/passwords.proto"], &["src/"])?;
+    prost_build.compile_protos(
+        &[
+            "src/icloud/mmcs.proto",
+            "src/ids/ids.proto",
+            "src/ids/qr.proto",
+            "src/facetime.proto",
+            "src/avconference.proto",
+            "src/statuskit.proto",
+            "src/imessage/cloud_messages.proto",
+            "src/passwords.proto",
+        ],
+        &["src/"],
+    )?;
     Ok(())
 }

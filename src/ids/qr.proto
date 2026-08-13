@@ -1,0 +1,481 @@
+syntax = "proto3";
+
+package qrp;
+
+message IDSQRProtoAllocBindAllocBind {
+}
+
+message IDSQRProtoAllocBindJoinInfo {
+  optional uint64 participant_id = 1;
+  optional IDSQRProtoMaterial client_context_blob = 2;
+  optional int32 reason = 3;
+}
+
+message IDSQRProtoAllocBindRequest {
+  optional uint32 service_id = 1;
+  optional string client_os_version = 2;
+  optional string client_hw_version = 3;
+  optional uint64 capabilities = 4;
+  repeated uint32 published_stream_ids = 5;
+  repeated IDSQRProtoSubscribedStream subscribed_streams = 6;
+  optional bool all_wildcard_subscription = 7;
+  optional uint32 max_concurrent_streams = 8;
+  optional uint32 channel_binding_info = 9;
+  optional uint32 max_embedded_stats_response_delay = 10;
+  repeated IDSQRProtoQuicConnectionInfo quic_connection_infos = 11;
+  optional uint32 state_flags = 12;
+  optional IDSQRProtoMaterial client_context_blob = 13;
+  optional int32 reason = 14;
+  repeated IDSQRProtoMaterial materials = 15;
+  optional bytes random_salt = 16;
+  optional bytes access_token = 17;
+  optional bytes server_blob = 18;
+  repeated IDSQRProtoAllocBindStaleLink stale_links = 23;
+  optional IDSQRProtoAllocBindTestOption test_option = 25;
+  repeated IDSQRProtoSessionExperiment session_experiments = 26;
+}
+
+message IDSQRProtoAllocBindResponse {
+  optional string client_address = 1;
+  optional uint32 channel_id = 2;
+  optional string software = 3;
+  repeated IDSQRProtoPeerPublishedStream peer_published_streams = 4;
+  repeated uint32 peer_subscribed_stream_ids = 5;
+  optional uint32 link_id = 6;
+  optional uint32 channel_settings = 7;
+  optional bytes reporting_data_blob = 9;
+  repeated uint64 lightweight_participant_id_lists = 10;
+  repeated IDSQRProtoQuicConnectionInfo quic_connection_infos = 11;
+  optional uint32 participant_type = 12;
+  repeated IDSQRProtoMaterial materials = 15;
+  optional uint32 generation_counter = 16;
+  optional uint32 session_state_counter = 17;
+  repeated uint32 acked_stale_link_ids = 21;
+  repeated IDSQRProtoChannelExperiment active_experiments = 25;
+  repeated IDSQRProtoAllocBindJoinInfo joined_participants = 28;
+  repeated IDSQRProtoUnAllocBindLeaveInfo left_participants = 29;
+  repeated IDSQRProtoParticipantUpdateParticipantModeInfo updated_participants = 30;
+}
+
+message IDSQRProtoAllocBindStaleLink {
+  optional string server_address = 1;
+  optional string client_address = 2;
+  optional uint32 link_id = 3;
+}
+
+message IDSQRProtoAllocBindTestOption {
+  repeated IDSQRProtoExperimentOverride experiment_overrides = 1;
+}
+
+message IDSQRProtoChannelExperiment {
+  optional int32 experiment_id = 1;
+  optional bool bool_value = 2;
+  optional string string_value = 3;
+  optional int32 int32_value = 4;
+  optional string experiment_name = 5;
+}
+
+message IDSQRProtoDiagnosticDiagnostic {
+}
+
+message IDSQRProtoDiagnosticIndication {
+  optional string failure_subtype = 1;
+  optional string failure_subtype_context = 2;
+  optional uint32 packets_record_duration = 3;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoErrorIndication {
+  optional uint32 channel_id = 1;
+  optional uint32 error_code = 2;
+  optional string error_reason = 3;
+  optional string client_address = 4;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoExperimentOverride {
+  optional int32 experiment_id = 1;
+  optional bool value = 2;
+  optional string experiment_name = 5;
+}
+
+message IDSQRProtoGetMaterialGetMaterial {
+}
+
+message IDSQRProtoGetMaterialRequest {
+  repeated IDSQRProtoMaterialOwner material_owners = 1;
+}
+
+message IDSQRProtoGetMaterialResponse {
+  repeated IDSQRProtoMaterial materials = 1;
+}
+
+message IDSQRProtoGoAwayGoAway {
+}
+
+message IDSQRProtoGoAwayIndication {
+  optional uint32 reason_code = 1;
+  optional string reason_string = 2;
+  optional bytes server_blob = 3;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterAckE2EChannelRegisterAck {
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterAckRequest {
+  optional bytes e2e_channel_uuid = 1;
+  optional bool accept = 2;
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterAckResponse {
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterE2EChannelInfo {
+  optional bytes quic_client_connection_id = 1;
+  optional bytes quic_server_connection_id = 2;
+  optional uint32 quic_client_link_id = 3;
+  optional uint32 quic_server_link_id = 4;
+  optional bool server_generated_connection_ids = 5;
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterE2EChannelRegister {
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterIndication {
+  optional bytes e2e_channel_uuid = 1;
+  optional IDSQRProtoH3EndToEndChannelRegisterE2EChannelInfo channel_info = 2;
+  optional bytes virtual_quic_client_connection_id = 3;
+  optional uint64 txn_id = 4;
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterRequest {
+  optional bytes e2e_channel_uuid = 1;
+  optional IDSQRProtoH3EndToEndChannelRegisterE2EChannelInfo channel_info = 2;
+}
+
+message IDSQRProtoH3EndToEndChannelRegisterResponse {
+  optional bytes virtual_quic_server_connection_id = 1;
+  optional IDSQRProtoH3EndToEndChannelRegisterE2EChannelInfo channel_info = 2;
+}
+
+message IDSQRProtoH3EndToEndChannelUnRegisterE2EChannelUnRegister {
+}
+
+message IDSQRProtoH3EndToEndChannelUnRegisterIndication {
+  optional bytes e2e_channel_uuid = 1;
+  optional uint64 txn_id = 2;
+}
+
+message IDSQRProtoH3EndToEndChannelUnRegisterRequest {
+  optional bytes e2e_channel_uuid = 1;
+}
+
+message IDSQRProtoH3EndToEndChannelUnRegisterResponse {
+}
+
+message IDSQRProtoH3Message {
+  optional IDSQRProtoAllocBindRequest allocbind_request = 1;
+  optional IDSQRProtoAllocBindResponse allocbind_response = 2;
+  optional IDSQRProtoDiagnosticIndication diagnostic_indication = 3;
+  optional IDSQRProtoGoAwayIndication goaway_indication = 4;
+  optional IDSQRProtoInfoRequest info_request = 5;
+  optional IDSQRProtoInfoResponse info_response = 6;
+  optional IDSQRProtoParticipantUpdateRequest participantupdate_request = 7;
+  optional IDSQRProtoParticipantUpdateResponse participantupdate_response = 8;
+  optional IDSQRProtoParticipantUpdateIndication participantupdate_indication = 9;
+  optional IDSQRProtoPluginControlRequest plugincontrol_request = 10;
+  optional IDSQRProtoPluginControlResponse plugincontrol_response = 11;
+  optional IDSQRProtoPluginControlIndication plugincontrol_indication = 12;
+  optional IDSQRProtoErrorIndication error_indication = 13;
+  optional IDSQRProtoReallocateIndication reallocate_indication = 14;
+  optional IDSQRProtoSessionInfoRequest sessioninfo_request = 15;
+  optional IDSQRProtoSessionInfoResponse sessioninfo_response = 16;
+  optional IDSQRProtoSessionInfoIndication sessioninfo_indication = 17;
+  optional IDSQRProtoStatsRequest stats_request = 18;
+  optional IDSQRProtoStatsResponse stats_response = 19;
+  optional IDSQRProtoTestRequest test_request = 20;
+  optional IDSQRProtoTestResponse test_response = 21;
+  optional IDSQRProtoUnAllocBindRequest unallocbind_request = 22;
+  optional IDSQRProtoUnAllocBindResponse unallocbind_response = 23;
+  optional IDSQRProtoPutMaterialRequest putmaterial_request = 24;
+  optional IDSQRProtoPutMaterialResponse putmaterial_response = 25;
+  optional IDSQRProtoPutMaterialIndication putmaterial_indication = 26;
+  optional IDSQRProtoGetMaterialRequest getmaterial_request = 27;
+  optional IDSQRProtoGetMaterialResponse getmaterial_response = 28;
+  optional IDSQRProtoH3EndToEndChannelRegisterRequest register_request = 31;
+  optional IDSQRProtoH3EndToEndChannelRegisterResponse register_response = 32;
+  optional IDSQRProtoH3EndToEndChannelRegisterIndication register_indication = 33;
+  optional IDSQRProtoH3EndToEndChannelRegisterAckRequest register_ack_request = 34;
+  optional IDSQRProtoH3EndToEndChannelRegisterAckResponse register_ack_response = 35;
+  optional IDSQRProtoH3EndToEndChannelUnRegisterRequest unregister_request = 36;
+  optional IDSQRProtoH3EndToEndChannelUnRegisterResponse unregister_response = 37;
+  optional IDSQRProtoH3EndToEndChannelUnRegisterIndication unregister_indication = 38;
+}
+
+message IDSQRProtoInfoInfo {
+}
+
+message IDSQRProtoInfoRequest {
+  optional uint32 info_flags = 1;
+  optional bytes access_token = 2;
+}
+
+message IDSQRProtoInfoResponse {
+  optional string client_address = 1;
+  repeated uint64 active_participants = 2;
+  repeated uint64 active_lightweight_participants = 3;
+  repeated uint64 active_virtual_participants = 16;
+}
+
+message IDSQRProtoMaterial {
+  optional uint64 owner_participant_id = 1;
+  optional uint64 receiver_participant_id = 2;
+  repeated IDSQRProtoMaterialInfo material_infos = 3;
+}
+
+message IDSQRProtoMaterialInfo {
+  optional bytes material_id = 1;
+  // MIRAGEKEY - 5
+  // MIRAGEBLOB - 6
+  // IDS_CONTEXT_BLOB - 7
+  // ..
+  // ..
+  // ..
+  // PREKEY - 11
+  // AVCBLOB - 12
+  // MKM - 13
+  // SKM - 14
+  optional int32 material_type = 2;
+  optional bytes material_content = 3;
+  optional uint32 short_material_id_length = 4;
+}
+
+message IDSQRProtoMaterialOwner {
+  optional uint64 participant_id = 1;
+  repeated int32 material_types = 2;
+}
+
+message IDSQRProtoParticipantStatusMapEntry {
+  optional int32 participant_status = 1;
+  repeated uint64 participant_ids = 2;
+}
+
+message IDSQRProtoParticipantUpdateIndication {
+  repeated uint64 participant_id_lists = 3;
+  optional uint32 operation_flags = 4;
+  optional uint64 txn_id = 15;
+  optional uint32 session_state_counter = 16;
+}
+
+message IDSQRProtoParticipantUpdateParticipantModeInfo {
+  optional uint64 participant_id = 1;
+  optional int32 mode = 2;
+  optional IDSQRProtoMaterial client_context_blob = 3;
+}
+
+message IDSQRProtoParticipantUpdateParticipantUpdate {
+}
+
+message IDSQRProtoParticipantUpdateRequest {
+  optional uint32 operation_flags = 1;
+  repeated uint64 participant_id_lists = 2;
+  optional IDSQRProtoMaterial client_context_blob = 3;
+  optional uint32 session_state_counter = 16;
+}
+
+message IDSQRProtoParticipantUpdateResponse {
+  optional uint32 operation_flags = 1;
+  repeated uint64 participant_id_lists = 2;
+  optional uint32 session_state_counter = 16;
+}
+
+message IDSQRProtoPeerPublishedStream {
+  optional uint64 peer_participant_id = 2;
+  repeated uint32 peer_stream_ids = 3;
+}
+
+message IDSQRProtoPluginControlIndication {
+  optional uint32 plugin_operation = 1;
+  optional uint64 plugin_participant_id = 2;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoPluginControlPluginControl {
+}
+
+message IDSQRProtoPluginControlRequest {
+  optional uint32 plugin_operation = 1;
+  optional string plugin_name = 2;
+  optional uint32 plugin_stream_id = 3;
+  optional bytes plugin_client_raw_public_key = 4;
+}
+
+message IDSQRProtoPluginControlResponse {
+  optional uint64 plugin_participant_id = 1;
+  optional string plugin_server_cert_hostname = 2;
+  optional string plugin_server_cert_oid = 3;
+}
+
+message IDSQRProtoPropertyOverride {
+  optional int32 property_name = 1;
+  optional bool bool_value = 2;
+  optional string string_value = 3;
+  optional uint32 uint32_value = 4;
+}
+
+message IDSQRProtoPutMaterialErrorIndication {
+  optional uint64 receiver_participant_id = 1;
+  optional IDSQRProtoMaterialOwner material_owner = 2;
+}
+
+message IDSQRProtoPutMaterialIndication {
+  repeated IDSQRProtoMaterial materials = 1;
+  optional IDSQRProtoPutMaterialErrorIndication missing_material = 2;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoPutMaterialMaterials {
+  repeated IDSQRProtoMaterial materials = 1;
+}
+
+message IDSQRProtoPutMaterialPutMaterial {
+}
+
+message IDSQRProtoPutMaterialRequest {
+  repeated IDSQRProtoMaterial materials = 1;
+}
+
+message IDSQRProtoPutMaterialResponse {
+}
+
+message IDSQRProtoQuicConnectionInfo {
+  // 0 - AVC, 1 - IDS
+  int32 quic_connection_type = 1;
+  optional bytes quic_connection_id = 2;
+}
+
+message IDSQRProtoReallocateIndication {
+  optional bytes reallocate_token = 1;
+  optional bytes session_id = 2;
+  optional string client_address = 3;
+  optional string server_address = 4;
+  optional bytes server_blob = 5;
+  optional uint64 txn_id = 15;
+}
+
+message IDSQRProtoReallocateReallocate {
+}
+
+message IDSQRProtoSessionExperiment {
+  optional bool bool_value = 2;
+  optional string string_value = 3;
+  optional int32 int32_value = 4;
+  optional string experiment_name = 5;
+}
+
+message IDSQRProtoSessionInfoIndication {
+  repeated IDSQRProtoPeerPublishedStream peer_published_streams = 1;
+  repeated uint32 peer_subscribed_stream_ids = 2;
+  repeated uint64 lightweight_participant_id_lists = 3;
+  repeated IDSQRProtoAllocBindJoinInfo joined_participants = 4;
+  repeated IDSQRProtoUnAllocBindLeaveInfo left_participants = 5;
+  repeated IDSQRProtoParticipantUpdateParticipantModeInfo updated_participants = 6;
+  optional uint64 txn_id = 15;
+  optional uint32 generation_counter = 16;
+}
+
+message IDSQRProtoSessionInfoRequest {
+  repeated uint32 published_stream_ids = 1;
+  repeated IDSQRProtoSubscribedStream subscribed_streams = 2;
+  optional bool all_wildcard_subscription = 3;
+  optional uint32 max_concurrent_streams = 4;
+  optional uint32 link_id = 6;
+  optional uint32 request_id = 7;
+  optional uint32 command_flags = 8;
+  optional uint32 generation_counter = 16;
+}
+
+message IDSQRProtoSessionInfoResponse {
+  repeated IDSQRProtoPeerPublishedStream peer_published_streams = 1;
+  repeated uint32 peer_subscribed_stream_ids = 2;
+  repeated uint64 lightweight_participant_id_lists = 3;
+  optional uint32 command_flags = 4;
+  repeated IDSQRProtoAllocBindJoinInfo joined_participants = 8;
+  repeated IDSQRProtoUnAllocBindLeaveInfo left_participants = 9;
+  repeated IDSQRProtoParticipantUpdateParticipantModeInfo updated_participants = 10;
+  optional uint32 generation_counter = 16;
+}
+
+message IDSQRProtoSessionInfoSessionInfo {
+}
+
+message IDSQRProtoSessionParameters {
+  optional bytes qr_access_token = 10;
+  optional string software_version = 11;
+  optional uint64 participant_capabilities = 12;
+  optional uint64 web_participant_capabilities = 13;
+  optional uint32 service_id = 14;
+}
+
+message IDSQRProtoStatsRequest {
+  optional uint32 client_timestamp_ntp = 1;
+  optional uint32 client_latency_ms = 2;
+  optional uint32 sent_packets = 3;
+  optional uint32 received_packets = 4;
+}
+
+message IDSQRProtoStatsResponse {
+  optional uint32 client_timestamp_ntp = 1;
+  optional uint64 server_timestamp_ms = 2;
+  optional uint32 sent_packets = 3;
+  optional uint32 received_packets = 4;
+  optional uint32 uplink_bandwidth = 5;
+}
+
+message IDSQRProtoStatsStats {
+}
+
+message IDSQRProtoSubscribedStream {
+  optional bool wildcard_subscription = 1;
+  optional uint64 peer_participant_id = 2;
+  repeated uint32 peer_stream_ids = 3;
+  optional bool is_seamless_transition = 4;
+}
+
+message IDSQRProtoTestRequest {
+  optional uint32 test_option_flags = 1;
+  optional uint32 requested_message_type = 2;
+  optional uint32 requested_error_code = 3;
+  optional string sub_operation = 4;
+}
+
+message IDSQRProtoTestResponse {
+}
+
+message IDSQRProtoTestTest {
+}
+
+message IDSQRProtoUnAllocBindLeaveInfo {
+  optional uint64 participant_id = 1;
+  optional IDSQRProtoMaterial client_context_blob = 2;
+  optional int32 reason = 3;
+}
+
+message IDSQRProtoUnAllocBindRequest {
+  optional int32 reason = 1;
+  optional IDSQRProtoMaterial client_context_blob = 2;
+}
+
+message IDSQRProtoUnAllocBindResponse {
+  optional bytes reporting_data_blob = 1;
+}
+
+message IDSQRProtoUnAllocBindUnAllocBind {
+}
+
+message PSIDSLinkHBHEncryptedPayload {
+  optional bytes initializationVector = 1;
+  optional bytes cipherText = 2;
+  optional bytes authenticationTag = 3;
+}

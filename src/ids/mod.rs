@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{util::{bin_deserialize_opt_vec, encode_hex, plist_to_bin, ungzip}, PushError};
 use num_bigint::{BigInt, Sign};
 
+pub mod link;
 pub mod user;
 pub mod identity_manager;
 

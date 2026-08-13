@@ -1,0 +1,306 @@
+syntax = "proto3";
+
+package avconferencep;
+
+message VCCCMessage {
+  optional uint64 transaction_id = 1;
+  optional string topic = 2;
+  optional bytes payload = 3;
+}
+
+message VCCCMessageAcknowledgment {
+  optional uint64 transaction_id = 1;
+  optional uint32 status = 2;
+}
+
+message VCCCMessageWrapper {
+  optional VCCCMessage message = 1;
+  optional VCCCMessageAcknowledgment acknowledgement = 2;
+}
+
+message VCCallInfoBlob {
+  optional uint32 call_id = 1;
+  optional uint32 client_version = 2;
+  optional string device_type = 3;
+  optional string framework_version = 4;
+  optional string os_version = 5;
+  optional string device_name = 6;
+  optional string audio_device_uid = 7;
+}
+
+message VCCaptionsSegmentBlob {
+  optional uint32 confidence = 1;
+  optional bool has_space_after = 2;
+  optional string text = 3;
+}
+
+message VCCaptionsTranscriptionBlob {
+  optional uint32 utterance_number = 1;
+  optional uint32 update_number = 2;
+  optional bool is_local = 3;
+  optional bool is_final = 4;
+  repeated VCCaptionsSegmentBlob segments = 5;
+}
+
+message VCMediaNegotiationBlob {
+  optional bool allow_dynamic_max_bitrate = 1;
+  optional bool allows_contents_change_with_aspect_preservation = 2;
+  optional VCMediaNegotiationBlobAudioSettings audio_settings = 3;
+  optional VCMediaNegotiationBlobVideoSettings video_settings = 4;
+  optional VCMediaNegotiationBlobVideoSettings screen_settings = 5;
+  optional string user_agent = 6;
+  optional string baseband_codec = 7;
+  optional uint32 baseband_codec_sample_rate = 8;
+  repeated VCMediaNegotiationBlobBandwidthSettings bandwidth_settings = 9;
+  optional VCMediaNegotiationBlobCaptionsSettings captions_settings = 10;
+  repeated VCMediaNegotiationBlobMultiwayAudioStream multiway_audio_streams = 11;
+  optional VCMediaNegotiationBlobMomentsSettings moments_settings = 12;
+  optional uint64 ntp_time = 13;
+  optional uint32 blob_version = 14;
+  repeated VCMediaNegotiationBlobMultiwayVideoStream multiway_video_stream = 15;
+  optional uint32 media_control_info_version = 16;
+  optional VCMediaNegotiationFaceTimeSettings face_time_settings = 17;
+  optional uint32 access_network_type = 18;
+}
+
+message VCMediaNegotiationBlobAudioSettings {
+  optional uint32 rtp_ssrc = 1;
+  optional uint32 audio_unit_model = 2;
+  optional uint32 support_flags = 3;
+  optional uint32 payload_flags = 4;
+  optional uint32 secondary_flags = 5;
+  optional bool use_sbr = 6;
+}
+
+message VCMediaNegotiationBlobBandwidthSettings {
+  optional int32 configuration = 1;
+  optional uint32 max_bandwidth = 2;
+  optional int32 configuration_extension = 3;
+}
+
+message VCMediaNegotiationBlobCaptionsSettings {
+  optional bool can_display_captions = 1;
+  optional uint32 sender_languages = 2;
+}
+
+message VCMediaNegotiationBlobMomentsSettings {
+  optional uint32 capabilities = 1;
+  optional uint32 supported_video_codecs = 2;
+  optional uint32 supported_image_types = 3;
+  optional uint32 multiway_capabilities = 4;
+}
+
+message VCMediaNegotiationBlobMultiwayAudioStream {
+  optional uint32 ssrc = 1;
+  optional uint32 max_network_bitrate = 2;
+  optional uint32 supported_payloads = 3;
+  optional uint32 stream_id = 4;
+  optional uint32 quality_index = 5;
+  optional uint32 max_media_bitrate = 6;
+  optional float max_packets_per_second = 7;
+  optional uint32 repaired_stream_id = 8;
+  optional uint32 repaired_max_network_bitrate = 9;
+}
+
+message VCMediaNegotiationBlobMultiwayVideoStream {
+  optional uint32 ssrc = 1;
+  optional uint32 max_network_bitrate = 2;
+  optional uint32 payload = 3;
+  optional uint32 stream_id = 4;
+  optional uint32 metadata = 5;
+  optional uint32 quality_index = 6;
+  optional uint32 supported_video_formats = 7;
+  optional uint32 frame_rate = 8;
+  optional uint32 key_frame_interval = 9;
+  optional uint32 max_media_bitrate = 10;
+  optional uint32 max_packets_per_second = 11;
+  optional uint32 repaired_stream_id = 12;
+  optional uint32 repaired_max_network_bitrate = 13;
+}
+
+message VCMediaNegotiationBlobV2 {
+  optional VCMediaNegotiationBlobV2GeneralInfo general_info = 1;
+  optional VCMediaNegotiationBlobV2BandwidthSettings bandwidth_settings = 2;
+  optional VCMediaNegotiationBlobV2CodecFeatures codec_support = 3;
+  optional VCMediaNegotiationBlobV2MicrophoneSettingsU1 microphone_u1 = 4;
+  optional VCMediaNegotiationBlobV2CameraSettingsU1 camera_u1 = 5;
+  optional VCMediaNegotiationBlobV2MomentsSettings moments_settings = 6;
+  repeated VCMediaNegotiationBlobV2StreamGroup stream_groups = 7;
+}
+
+message VCMediaNegotiationBlobV2BandwidthSettings {
+  optional uint32 cap2g = 1;
+  optional uint32 cap3g = 2;
+  optional uint32 cap_lte = 3;
+  optional uint32 cap5g = 4;
+  optional uint32 cap_wifi = 5;
+}
+
+message VCMediaNegotiationBlobV2CameraSettingsU1 {
+  optional uint32 rtp_ssrc = 1;
+  repeated VCMediaNegotiationBlobV2VideoPayload payloads = 2;
+  optional uint32 landscape_aspect_ratio_x = 3;
+  optional uint32 landscape_aspect_ratio_y = 4;
+  optional uint32 portrait_aspect_ratio_x = 5;
+  optional uint32 portrait_aspect_ratio_y = 6;
+  optional uint32 mismatched_display_aspect_ratio_x = 7;
+  optional uint32 mismatched_display_aspect_ratio_y = 8;
+  optional int32 cipher_suites = 9;
+}
+
+message VCMediaNegotiationBlobV2CodecFeatures {
+  optional uint32 audio_features = 1;
+  optional bytes video_features = 2;
+}
+
+message VCMediaNegotiationBlobV2GeneralInfo {
+  optional uint64 ntp_time = 1;
+  optional string cname = 2;
+  optional uint32 ab_switches = 3;
+  optional uint32 screen_res = 4;
+}
+
+message VCMediaNegotiationBlobV2MicrophoneSettingsU1 {
+  optional uint32 rtp_ssrc = 1;
+  optional uint32 payloads = 2;
+  optional int32 cipher_suites = 3;
+}
+
+message VCMediaNegotiationBlobV2MomentsSettings {
+  optional uint32 capabilities = 1;
+  optional uint32 supported_codecs = 2;
+}
+
+message VCMediaNegotiationBlobV2SettingsU1 {
+  optional uint32 rtp_ssrc = 1;
+  repeated VCMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures encode_decode_features = 2;
+}
+
+message VCMediaNegotiationBlobV2StreamGroup {
+  optional uint32 stream_group = 1;
+  repeated VCMediaNegotiationBlobV2StreamGroupPayload payloads = 2;
+  repeated VCMediaNegotiationBlobV2StreamGroupStream streams = 3;
+  optional VCMediaNegotiationBlobV2SettingsU1 settings_u1 = 4;
+}
+
+message VCMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+  optional uint32 rtp_payload = 1;
+  optional bytes encode_decode_features = 2;
+}
+
+message VCMediaNegotiationBlobV2StreamGroupPayload {
+  optional uint32 codec_type = 1;
+  optional uint32 rtp_payload = 2;
+  optional uint32 p_time = 3;
+  optional uint32 rtcp_flags = 4;
+  optional uint32 media_flags = 5;
+  optional uint32 profile_level_id = 6;
+  optional uint32 rtp_sample_rate = 7;
+  optional uint32 cipher_suite = 8;
+  optional bytes packed_payload = 9;
+  optional uint32 encoder_usage = 10;
+}
+
+message VCMediaNegotiationBlobV2StreamGroupStream {
+  // bit 0 (0x01): isSubStream
+  // bit 1 (0x02): isTemporalStream
+  // bit 2 (0x04): keyFrameInterval == 0
+  // bit 3 (0x08): explicit codec/payload configuration present
+  optional uint32 metadata = 1;
+  optional uint32 payload_spec_or_payloads = 2;
+  optional uint32 quality_index = 3;
+  optional uint32 rtp_ssrc = 4;
+  optional uint32 stream_id = 5;
+  optional uint32 max_network_bitrate = 6;
+  optional uint32 repaired_max_network_bitrate = 7;
+  optional uint32 audio_channel_count = 8;
+  optional uint32 stream_index = 9;
+  optional bytes required_packed_payload = 10;
+  optional bytes optional_packed_payload = 11;
+  optional uint32 coordinate_system = 12;
+  optional uint32 payloads_version = 13;
+  optional uint32 max_network_bitrate_v2 = 14;
+  optional uint32 repaired_max_network_bitrate_v2 = 15;
+}
+
+message VCMediaNegotiationBlobV2VideoPayload {
+  // 2 => HEVC
+  // 1/Unset => h.264
+  optional uint32 video_payload = 1;
+  optional uint32 parameter_set = 2;
+
+  // bit 0   0x00000001  192x112   15 fps
+  // bit 1   0x00000002  320x240   15 fps
+  // bit 2   0x00000004  320x240   30 fps
+  // bit 3   0x00000008  480x272   15 fps
+  // bit 4   0x00000010  480x272   30 fps
+  // bit 5   0x00000020  480x368   15 fps
+  // bit 6   0x00000040  480x368   30 fps
+  // bit 7   0x00000080  640x480   15 fps
+  // bit 8   0x00000100  640x480   30 fps
+  // bit 9   0x00000200  848x480   15 fps
+  // bit 10  0x00000400  848x480   30 fps
+  // bit 11  0x00000800  896x672   15 fps
+  // bit 12  0x00001000  896x672   30 fps
+  // bit 13  0x00002000  896x672   60 fps
+  // bit 14  0x00004000  1024x576  15 fps
+  // bit 15  0x00008000  1024x768  15 fps
+  // bit 16  0x00010000  1024x768  30 fps
+  // bit 17  0x00020000  1024x768  60 fps
+  // bit 18  0x00040000  1280x720  15 fps
+  // bit 19  0x00080000  1024x576  30 fps
+  // bit 20  0x00100000  1280x720  30 fps
+  // bit 21  0x00200000  1280x720  60 fps
+  // bit 22  0x00400000  1440x1080 30 fps
+  // bit 23  0x00800000  1664x1248 30 fps
+  // bit 24  0x01000000  1664x1248 60 fps
+  // bit 25  0x02000000  1920x1080 30 fps
+  // bit 26  0x04000000  1920x1080 60 fps
+  // bit 27  0x08000000  1088x1088 60 fps
+  // bit 28  0x10000000  1088x1088 30 fps
+  optional uint32 encode_formats = 3;
+  optional uint32 decode_formats = 4;
+  optional bytes encode_decode_features = 5;
+  // same format as encode_formats
+  optional uint32 preferred_decode_format = 6;
+}
+
+message VCMediaNegotiationBlobVideoPayloadSettings {
+  optional uint32 payload = 1;
+  repeated VCMediaNegotiationBlobVideoRuleCollection video_rule_collections = 2;
+  optional string feature_string = 3;
+  optional uint32 parameter_set = 4;
+}
+
+message VCMediaNegotiationBlobVideoRuleCollection {
+  optional int32 transport = 1;
+  optional int32 operation = 2;
+  optional uint32 formats = 3;
+  optional uint32 preferred_format = 4;
+  optional uint32 formats_ext1 = 5;
+  optional uint32 preferred_format_ext1 = 6;
+}
+
+message VCMediaNegotiationBlobVideoSettings {
+  optional uint32 rtp_ssrc = 1;
+  optional bool allow_rtcpfb = 2;
+  repeated VCMediaNegotiationBlobVideoPayloadSettings video_payload_collections = 3;
+  optional uint32 custom_video_width = 4;
+  optional uint32 custom_video_height = 5;
+  optional uint32 tiles_per_frame = 6;
+  optional bool ltrp_enabled = 7;
+  optional uint32 pixel_formats = 8;
+  optional uint32 hdr_modes_supported = 9;
+  optional bool fec_enabled = 10;
+  optional bool rtx_enabled = 11;
+  optional bool black_frame_on_clear_screen_enabled = 12;
+  optional bool foveation_supported = 13;
+}
+
+message VCMediaNegotiationFaceTimeSettings {
+  optional uint32 capabilities = 1;
+  optional uint32 switches = 2;
+  optional bool one_to_one_mode_supported = 3;
+  optional uint32 media_control_info_sub_version = 4;
+  optional uint32 link_probing_capability_version = 5;
+}

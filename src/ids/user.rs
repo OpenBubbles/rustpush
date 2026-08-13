@@ -404,7 +404,7 @@ fn derive_hkdf_key_iv(secret: &[u8]) -> Result<([u8; 32], [u8; 16]), PushError> 
 pub struct IDSNGMIdentity {
     legacy: IDSUserIdentity,
     #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
-    device_key: CompactECKey<Private>,
+    pub device_key: CompactECKey<Private>,
     #[serde(serialize_with = "ec_serialize_priv", deserialize_with = "ec_deserialize_priv_compact")]
     pre_key: CompactECKey<Private>,
 }

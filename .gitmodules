@@ -1,6 +1,18 @@
 [submodule "apple-private-apis"]
-	path = apple-private-apis
+	path = third_party/apple-private-apis
 	url = git@github.com:OpenBubbles/apple-private-apis.git
 [submodule "open-absinthe"]
 	path = open-absinthe
 	url = git@github.com:OpenBubbles/OpenAbsinthe-Stub.git
+[submodule "third_party/rtc"]
+	path = third_party/rtc
+	url = https://github.com/OpenBubbles/rtc.git
+[submodule "third_party/rustls"]
+	path = third_party/rustls
+	url = https://github.com/OpenBubbles/rustls.git
+[submodule "third_party/rustls-platform-verifier"]
+	path = third_party/rustls-platform-verifier
+	url = https://github.com/OpenBubbles/rustls-platform-verifier.git
+[submodule "third_party/quinn"]
+	path = third_party/quinn
+	url = https://github.com/OpenBubbles/quinn.git

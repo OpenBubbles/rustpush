@@ -1,20 +1,23 @@
-use std::{collections::{BTreeSet, HashMap, HashSet}, io::Cursor, ops::Deref, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 
-use aes_gcm::{aead::Aead, Aes256Gcm, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, Payload}};
 use base64::engine::general_purpose;
+use deku::{ctx::Endian, prelude::*};
 use facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
 use hkdf::Hkdf;
 use log::{debug, info, warn};
-use openssl::{derive::Deriver, pkey::Private, sha::sha1, symm::{decrypt, Cipher}};
+use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
 use plist::{Data, Dictionary, Value};
 use base64::Engine;
-use prost::Message;
+use prost::{Message, bytes::{Buf, BytesMut}};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
+use crate::{avconference::{AVConfig, AVSession, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
-use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
+// static HAS_JOINED: AtomicBool = AtomicBool::new(false);
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -159,6 +162,10 @@ pub enum FTMode {
     MissedOutgoing,
 }
 
+fn default_enabled() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct FTSession {
     pub group_id: String,
@@ -170,15 +177,19 @@ pub struct FTSession {
     pub report_id: String, // this is different from group_id because we are thinking different
     pub start_time: Option<u64>, // ms since epoch
     pub last_rekey: Option<u64>, // ms since epoch
-    #[serde(skip)]
-    pub is_propped: bool,
     // WARNING: this value may not accurately represent state. It's just used as a temporary store to see if we need to prop it up
     // also represents ringing from other (our) devices
     #[serde(skip)]
     pub is_ringing_inaccurate: bool,
     pub mode: Option<FTMode>,
+    #[serde(default = "default_enabled")]
+    pub is_video: bool,
     #[serde(skip)]
     pub recent_member_adds: HashMap<String, u64>,
+    #[serde(skip)]
+    pub connection: Option<Arc<AVSession>>,
+    #[serde(skip)]
+    pub av_config: Option<AVConfig>,
 }
 
 // time to track recently added members
@@ -256,6 +267,16 @@ impl FTSession {
             }
         }
     }
+
+    fn import_allocations(&mut self, allocations: &QuickRelayAllocationsResponse) {
+        for allocation in &allocations.allocations {
+            let id = allocation.id as u64;
+            let participant = self.participants.entry(id.to_string()).or_default();
+            participant.handle = allocation.participant.clone();
+            participant.participant_id = id;
+            participant.token = Some(base64_encode(allocation.token.as_ref()));
+        }
+    }
 }
 
 const UNIX_TO_2001: Duration = Duration::from_millis(978307200000);
@@ -284,6 +305,42 @@ impl ToString for ParticipantID {
     fn to_string(&self) -> String {
         let num: u64 = (*self).into();
         num.to_string()
+    }
+}
+
+
+pub fn my_conv_participant(config: &AVConfig, video_mode: bool) -> ConversationParticipant {
+    let avc_data = config.avc_data();
+
+    ConversationParticipant {
+        version: 0,
+        identifier: 0,
+        handle: None,
+        avc_data: plist_to_bin(&avc_data).expect("failed to serialize AVC data"),
+        is_moments_available: Some(true),
+        is_screen_sharing_available: Some(true),
+        is_gondola_calling_available: Some(true),
+        is_mirage_available: Some(false),
+        is_lightweight: Some(false),
+        share_play_protocol_version: 4,
+        options: 1,
+        is_gft_downgrade_to_one_to_one_available: Some(true),
+        guest_mode_enabled: None,
+        association: None,
+        is_u_plus_n_downgrade_available: Some(true),
+        av_mode: Some(if video_mode { 2 } else { 1 }),
+        supports_leave_context: Some(true),
+        is_u_plus_one_screen_sharing_available: Some(true),
+        persona_handshake_data: None,
+        is_spatial_persona_enabled: Some(false),
+        is_u_plus_one_av_less_available: Some(true),
+        vision_feature_version: Some(0),
+        vision_call_establishment_version: Some(0),
+        is_u_plus_one_vision_to_vision_available: Some(false),
+        supports_request_to_screen_share: Some(true),
+        spatial_persona_generation_counter: None,
+        is_photos_share_play_available: Some(false),
+        ..Default::default()
     }
 }
 
@@ -322,6 +379,12 @@ pub enum FTMessage {
     RespondedElsewhere {
         guid: String,
     },
+    Connected {
+        guid: String,
+    },
+    Disconnected {
+        guid: String,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +398,38 @@ pub struct LetMeInRequest {
     pub usage: Option<String>,
 }
 
+fn participant_from_meta(id: ParticipantID, ids_sender: &str, avc_data: Vec<u8>, message: &ConversationMessage, context: &ConversationParticipantDidJoinContext) -> ConversationParticipant {
+    ConversationParticipant {
+        version: context.version,
+        identifier: id.into(),
+        handle: Some(handle_from_ids(ids_sender)),
+        avc_data: avc_data.into(),
+        is_moments_available: Some(context.is_moments_available),
+        is_screen_sharing_available: Some(context.is_screen_sharing_available),
+        is_gondola_calling_available: Some(context.is_gondola_calling_available),
+        is_mirage_available: Some(context.is_mirage_available),
+        is_lightweight: Some(context.is_lightweight),
+        share_play_protocol_version: context.share_play_protocol_version,
+        // options: 1,
+        options: 0, // default (missing)
+        is_gft_downgrade_to_one_to_one_available: context.is_gft_downgrade_to_one_to_one_available,
+        guest_mode_enabled: Some(message.guest_mode_enabled),
+        association: context.participant_association.clone(),
+        is_u_plus_n_downgrade_available: context.is_u_plus_n_downgrade_available,
+        av_mode: message.av_mode,
+        supports_leave_context: context.supports_leave_context,
+        is_u_plus_one_screen_sharing_available: context.is_u_plus_one_screen_sharing_available,
+        persona_handshake_data: None,
+        is_spatial_persona_enabled: context.is_spatial_persona_enabled,
+        is_u_plus_one_av_less_available: context.is_u_plus_one_av_less_available,
+        vision_feature_version: context.vision_feature_version,
+        vision_call_establishment_version: context.vision_call_establishment_version,
+        is_u_plus_one_vision_to_vision_available: context.is_u_plus_one_vision_to_vision_available,
+        supports_request_to_screen_share: context.supports_request_to_screen_share,
+        spatial_persona_generation_counter: Some(0),
+        is_photos_share_play_available: context.is_photos_share_play_available,                            
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct FTState {
@@ -342,26 +437,32 @@ pub struct FTState {
     pub sessions: HashMap<String, FTSession>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct FTWireMessage {
     #[serde(rename = "s")]
-    session: String,
+    pub session: String,
     #[serde(rename = "rtmpk")]
-    prekey: Option<Data>,
+    pub prekey: Option<Data>,
     #[serde(rename = "rtmpwm")]
-    prekey_wrap_mode: Option<u32>,
+    pub prekey_wrap_mode: Option<u32>,
+    #[serde(rename = "rtskm")]
+    pub session_key_material: Option<QuickRelaySkmMaterial>,
+    #[serde(rename = "rtmkm")]
+    pub media_key_material: Option<QuickRelayMkmMaterial>,
+    #[serde(rename = "rtallmkmuri")]
+    pub all_mkm_uri: Option<Vec<String>>,
     #[serde(rename = "fanout-groupID-key")]
-    fanout_groupid: String,
-    client_context_data_key: Option<Data>,
-    participant_data_key: Option<Data>,
-    is_initiator_key: Option<bool>,
+    pub fanout_groupid: String,
+    pub client_context_data_key: Option<Data>,
+    pub participant_data_key: Option<Data>,
+    pub is_initiator_key: Option<bool>,
     #[serde(rename = "fanout-groupMembers-key")]
-    fanout_groupmembers: Option<Vec<String>>,
-    is_u_plus_one_key: Option<bool>,
-    join_notification_key: Option<u32>,
-    participant_id_key: Option<ParticipantID>, // also i64 sometimes?
-    uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
+    pub fanout_groupmembers: Option<Vec<String>>,
+    pub is_u_plus_one_key: Option<bool>,
+    pub join_notification_key: Option<u32>,
+    pub participant_id_key: Option<ParticipantID>, // also i64 sometimes?
+    pub uri_to_participant_id_key: Option<HashMap<String, Vec<ParticipantID>>>,
 }
 
 pub struct FTClient {
@@ -370,6 +471,7 @@ pub struct FTClient {
     os_config: Arc<dyn OSConfig>,
     _interest_token: APSInterestToken,
     pub state: DebugRwLock<FTState>,
+    pub interfaces: DebugRwLock<Option<Vec<IpAddr>>>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
     pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
 }
@@ -384,80 +486,59 @@ impl FTClient {
             identity,
             os_config: config,
             state: DebugRwLock::new(state),
+            interfaces: DebugRwLock::new(None),
             update_state,
             delegated_requests: DebugMutex::new(HashMap::new())
         }
     }
 
-    pub async fn ensure_allocations(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
-        // ensure all members have participant entries
-        let has_relay = session.members.iter().chain(new_members).all(|member| session.participants.values().any(|p| p.handle == member.handle));
-        if has_relay {
+    pub async fn connect_to_relay(&self, session: &mut FTSession, new_members: &[FTMember]) -> Result<(), PushError> {
+        if session.connection.is_some() {
             return Ok(())
         }
-        
+
+        info!("making new for session id {}", session.group_id);
+
         // we need to do quickrelay allocations
         let people_in_chatroom: Vec<String> = session.members.iter().chain(new_members).map(|m| m.handle.clone()).collect();
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
-        let topic = "com.apple.private.alloy.facetime.multi";
-        self.identity.cache_keys(
-            topic,
-            &people_in_chatroom,
-            &handle,
-            false,
-            &QueryOptions { required_for_message: true, result_expected: true }
-        ).await?;
 
-        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, handle, &people_in_chatroom);
-        let receiver = self.conn.subscribe().await;
-        let uuid = Uuid::new_v4();
-        self.identity.send_message(topic, IDSSendMessage::quickrelay(handle.clone(), uuid, IDSQuickRelaySettings {
-            reason: 0, // something along the lines of 'someone joined'
-            group_id: session.group_id.clone(),
-            request_type: 3, // allocate relay
-            member_count: people_in_chatroom.len() as u32,
-        }), targets).await?;
+        let (incoming_handler, ctrl_channel) = IncomingFrameHandler::new();
 
-        #[derive(Deserialize)]
-        pub struct QuickRelayAllocation {
-            #[serde(rename = "qri")]
-            id: i64,
-            #[serde(rename = "tP")]
-            participant: String,
-            #[serde(rename = "t")]
-            token: Data,
+        let incoming_copy = incoming_handler.clone();
+        let relay_session = GlobalLink::new(self.identity.clone(), handle, &people_in_chatroom, &session.group_id, 
+            Arc::new(move |packet| incoming_copy.handle_packet(packet)), true, true).await?;
+
+        session.import_allocations(&relay_session.state.lock().await.configuration);
+
+        if !session.av_config.is_some() {
+            session.av_config = Some(AVConfig::new());
         }
 
-        #[derive(Deserialize)]
-        pub struct QuickRelayAllocationsResponse {
-            #[serde(rename = "U")]
-            for_id: Data,
-            #[serde(rename = "qal")]
-            allocations: Vec<QuickRelayAllocation>,
+        let interfaces = self.interfaces.read().await;
+        let ifs = interfaces.as_ref().unwrap();
+        relay_session.update_local_interfaces(ifs).await;
+
+        session.connection = Some(AVSession::new(
+            relay_session.clone(), 
+            session.av_config.clone().unwrap(), 
+            session.group_id.clone(), 
+            ctrl_channel, 
+            incoming_handler,
+            &my_conv_participant(session.av_config.as_ref().unwrap(), session.is_video).encode_to_vec(),
+            session.is_video,
+        ).await?);
+
+        for participant in session.participants.values() {
+            let Some(active) = &participant.active else { continue };
+            if active.avc_data.is_empty() {
+                continue
+            }
+            info!("Importing cached avc data");
+            session.connection.as_ref().unwrap().import_avc(active.identifier, participant.handle.clone(), &active.avc_data).await?;
         }
 
-        let response = self.conn.wait_for_timeout(receiver, get_message(|payload| {
-            info!("Got relay {:?}", payload);
-            let parsed = match plist::from_value::<QuickRelayAllocationsResponse>(&payload) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    info!("Failed to parse {e}");
-                    return None;
-                }
-            };
-            // let Ok(parsed) = plist::from_value::<QuickRelayAllocationsResponse>(&payload) else {
-            //     return None
-            // };
-            if parsed.for_id.as_ref() == uuid.as_bytes() { Some(parsed) } else { None }
-        }, &["com.apple.private.alloy.quickrelay"])).await?;
-
-        for allocation in response.allocations {
-            let id = allocation.id as u64;
-            let participant = session.participants.entry(id.to_string()).or_default();
-            participant.handle = allocation.participant;
-            participant.participant_id = id;
-            participant.token = Some(base64_encode(allocation.token.as_ref()));
-        }
+        info!("Connected!");
         
         Ok(())
     }
@@ -589,9 +670,45 @@ impl FTClient {
         Ok(link)
     }
 
+    pub async fn upgrade_to_video(&self, guid: &str, request: bool) -> Result<(), PushError> {
+        let mut state = self.state.write().await;
+        let state = &mut *state;
+        let session = state.sessions.get_mut(guid).expect("No session found!");
+
+        let my_handle = session.my_handles.first().expect("No handle").clone();
+        if session.is_video { return Ok(()); }
+
+        if request {
+            let mut message = ConversationMessage::default();
+            message.set_type(ConversationMessageType::RequestVideoUpgrade);
+            message.conversation_group_uuid_string = session.group_id.clone();
+            
+            self.message_session(my_handle, message, session, None).await?;
+        }
+
+        session.is_video = true;
+
+        self.update_participant(session).await?;
+        
+        Ok(())
+    }
+
+    pub async fn update_participant(&self, session: &mut FTSession) -> Result<(), PushError> {
+        let my_handle = session.my_handles.first().expect("No handle").clone();
+
+        let mut message = ConversationMessage::default();
+        message.set_type(ConversationMessageType::ParticipantUpdated);
+        message.conversation_group_uuid_string = session.group_id.clone();
+        message.active_participants.push(my_conv_participant(session.av_config.as_ref().expect("no avc!"), session.is_video));
+
+        self.message_session(my_handle, message, session, None).await?;
+        Ok(())
+    }
+
     // group is random uuid
-    pub async fn create_session(&self, for_group: String, handle: String, participants: &[String]) -> Result<(), PushError> {
+    pub async fn create_session(&self, for_group: String, handle: String, participants: &[String], is_video: bool) -> Result<(), PushError> {
         let since_the_epoch = duration_since_epoch();
+        info!("Createing session for {for_group}");
 
         let session = FTSession {
             group_id: for_group,
@@ -602,21 +719,23 @@ impl FTClient {
             report_id: Uuid::new_v4().to_string().to_uppercase(),
             start_time: Some(since_the_epoch.as_millis() as u64),
             last_rekey: None,
-            is_propped: false,
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
+            connection: None,
+            av_config: Some(AVConfig::new()),
+
+            is_video,
         };
 
+        
         let mut my_session = self.state.write().await;
         let group = session.group_id.clone();
         my_session.sessions.insert(group.clone(), session);
 
         let session = my_session.sessions.get_mut(&group).unwrap();
-        
-        self.ensure_allocations(session, &[]).await?;
 
-        self.prop_up_conv(session, true).await?;
+        self.join(session, true).await?;
 
         Ok(())
     }
@@ -652,8 +771,6 @@ impl FTClient {
         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
-            prekey: None,
-            prekey_wrap_mode: None,
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(update_context.encode_to_vec().into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
@@ -666,6 +783,7 @@ impl FTClient {
                 a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
                 a
             })),
+            ..Default::default()
         };
 
 
@@ -701,8 +819,10 @@ impl FTClient {
     }
 
 
-    pub async fn prop_up_conv(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
+    pub async fn join(&self, session: &mut FTSession, ring: bool) -> Result<(), PushError> {
+        info!("joining conversation");
 
+        self.connect_to_relay(session, &[]).await?;
         let handle = session.my_handles.first().ok_or(PushError::NoHandle)?;
         // we are picking up a call (the prop isn't to ring, and we are ringing)
         if !ring && session.is_ringing_inaccurate {
@@ -731,6 +851,10 @@ impl FTClient {
 
         let base64_encoded = Some(base64_encode(&self_token));
 
+        let link_prekey: Option<Data> = if let Some(link) = &session.connection {
+            Some(link.get_public_key().await?.into())
+        } else { None };
+
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
 
@@ -754,6 +878,8 @@ impl FTClient {
                 let mut update_context = ConversationParticipantDidJoinContext::default();
                 update_context.members = builder_session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
 
+                let participant = my_conv_participant(builder_session.av_config.as_ref().expect("no avc!"), builder_session.is_video);
+
                 let mut message = ConversationMessage::default();
                 // ring not sending to ourselves
                 if ring && target.participant != my_participant.handle {
@@ -766,41 +892,59 @@ impl FTClient {
                     ConversationInvitationPreference { version: 0, handle_type: HandleType::Generic as i32, notification_styles: 1 },
                     ConversationInvitationPreference { version: 0, handle_type: HandleType::EmailAddress as i32, notification_styles: 1 },
                 ];
+                if let Some(guest_mode_enabled) = participant.guest_mode_enabled {
+                    message.guest_mode_enabled = guest_mode_enabled;
+                }
+                message.av_mode = participant.av_mode;
 
                 update_context.message = Some(message);
-                update_context.is_moments_available = true;
+                update_context.version = participant.version;
+                update_context.is_moments_available = participant.is_moments_available.unwrap_or_default();
                 update_context.provider_identifier = "com.apple.telephonyutilities.callservicesd.FaceTimeProvider".to_string();
                 // maybe make these optional/forced
-                update_context.video = Some(true);
-                update_context.video_enabled = Some(false);
+                update_context.video = Some(builder_session.is_video);
+                update_context.video_enabled = Some(builder_session.is_video);
 
-                update_context.is_gft_downgrade_to_one_to_one_available = Some(false);
-                update_context.is_u_plus_n_downgrade_available = Some(false);
-                update_context.is_u_plus_one_av_less_available = Some(false);
-
-                update_context.is_screen_sharing_available = true;
-                update_context.is_gondola_calling_available = true;
-                update_context.share_play_protocol_version = 4;
+                update_context.is_screen_sharing_available = participant.is_screen_sharing_available.unwrap_or_default();
+                update_context.is_mirage_available = participant.is_mirage_available.unwrap_or_default();
+                update_context.is_lightweight = participant.is_lightweight.unwrap_or_default();
+                update_context.is_gondola_calling_available = participant.is_gondola_calling_available.unwrap_or_default();
+                update_context.share_play_protocol_version = participant.share_play_protocol_version;
+                // was false
+                update_context.is_gft_downgrade_to_one_to_one_available = participant.is_gft_downgrade_to_one_to_one_available;
+                update_context.participant_association = participant.association.clone();
+                // was false
+                update_context.is_u_plus_n_downgrade_available = participant.is_u_plus_n_downgrade_available;
+                update_context.supports_leave_context = participant.supports_leave_context;
+                update_context.is_u_plus_one_screen_sharing_available = participant.is_u_plus_one_screen_sharing_available;
+                update_context.is_spatial_persona_enabled = participant.is_spatial_persona_enabled;
+                // was false
+                update_context.is_u_plus_one_av_less_available = participant.is_u_plus_one_av_less_available;
+                update_context.vision_feature_version = participant.vision_feature_version;
+                update_context.vision_call_establishment_version = participant.vision_call_establishment_version;
+                update_context.is_u_plus_one_vision_to_vision_available = participant.is_u_plus_one_vision_to_vision_available;
+                update_context.supports_request_to_screen_share = participant.supports_request_to_screen_share;
+                update_context.is_photos_share_play_available = participant.is_photos_share_play_available;
 
                 let participant_map: HashMap<String, Vec<ParticipantID>> = builder_session.participants.values().fold(HashMap::new(), |mut a, i| {
                     a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
                     a
                 });
 
-
                 let wire_message = FTWireMessage {
                     session: builder_session.group_id.clone(),
-                    prekey: None,
-                    prekey_wrap_mode: None,
+                    prekey: link_prekey.clone(),
+                    prekey_wrap_mode: link_prekey.as_ref().map(|_| 1),
                     fanout_groupid: builder_session.group_id.clone(),
                     client_context_data_key: Some(update_context.encode_to_vec().into()),
-                    participant_data_key: Some(include_bytes!("sampleavcdata.bplist").to_vec().into()), // should be AV mode, hopefully this doens't give us trouble?
+                    participant_data_key: Some(participant.avc_data.clone().into()), // should be AV mode, hopefully this doens't give us trouble?
                     is_initiator_key: Some(is_initiator),
                     fanout_groupmembers: Some(builder_session.members.iter().map(|a| a.handle.clone()).collect()),
                     is_u_plus_one_key: Some(is_u_plus_one),
                     join_notification_key: Some(1),
                     participant_id_key: Some(ParticipantID::Unsigned(my_participant.participant_id)),
                     uri_to_participant_id_key: Some(participant_map),
+                    ..Default::default()
                 };
                 Some(plist_to_bin(&wire_message).expect("Failed to serialize plist"))
             })),
@@ -817,8 +961,6 @@ impl FTClient {
             ]),
         }, targets).await?;
 
-        session.is_propped = true;
-
         
         Ok(())
     }
@@ -830,10 +972,6 @@ impl FTClient {
 
         let my_handle = session.my_handles.first().expect("No Handle??").clone();
 
-
-        let alive_tokens: Vec<MessageTarget> = session.participants.values()
-            .filter(|a| a.active.is_some())
-            .filter_map(|a| a.token.as_ref().map(|a| MessageTarget::Token(base64_decode(a)))).collect();
         let relevant_people: Vec<String> = session.members.iter().map(|m| m.handle.clone()).collect();
         let topic = "com.apple.private.alloy.facetime.multi";
         self.identity.cache_keys(
@@ -844,19 +982,26 @@ impl FTClient {
             &QueryOptions { required_for_message: true, result_expected: true }
         ).await?;
 
-        let targets = self.identity.cache.lock().await.get_targets(&topic, &my_handle, &relevant_people, &alive_tokens)?;
+        let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &my_handle, &relevant_people);
         self.identity.send_message(topic, send_for_message(my_handle, message, None), targets).await?;
         Ok(())
     }
 
-    pub async fn unprop_conv(&self, session: &mut FTSession) -> Result<(), PushError> {
+    pub async fn leave(&self, session: &mut FTSession) -> Result<(), PushError> {
+        info!("Leaving now!");
+
+        if let Some(session) = session.connection.take() {
+            if let Err(e) = session.link.unalloc_bind().await {
+                warn!("Failed to unbind! {e}");
+            }
+            info!("Dropping Session!");
+        }
+        
         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
         let is_initiator = true; // todo, what does this mean
         let is_u_plus_one = true; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
-            prekey: None,
-            prekey_wrap_mode: None,
             fanout_groupid: session.group_id.clone(),
             client_context_data_key: Some(vec![16, 0].into()),
             participant_data_key: None, // should be AV mode, hopefully this doens't give us trouble?
@@ -869,6 +1014,7 @@ impl FTClient {
                 a.entry(i.handle.clone()).or_default().push(ParticipantID::Unsigned(i.participant_id));
                 a
             })),
+            ..Default::default()
         };
 
 
@@ -908,9 +1054,17 @@ impl FTClient {
         let my_participant = session.participants.values_mut().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?;
         my_participant.active = None; // we left, remember?
 
-        session.is_propped = false;
         Ok(())
     }
+
+    pub async fn set_local_interfaces(&self, interfaces: &[IpAddr]) {
+        let mut state = self.interfaces.write().await;
+        *state = Some(interfaces.to_vec());
+        for session in self.state.read().await.sessions.values() {
+            let Some(link) = &session.connection else { continue };
+            link.link.update_local_interfaces(interfaces).await;
+        }
+    } 
 
     pub async fn add_members(&self, session: &mut FTSession, mut new_members: Vec<FTMember>, letmein: bool, to_members: Option<Vec<String>>) -> Result<(), PushError> {
         // if to_members is some this is a re-broadcast and they will already be in the call
@@ -925,9 +1079,6 @@ impl FTClient {
         }
 
         info!("Adding members {new_members:?} for session {}", session.group_id);
-
-        // make sure we have quickrelay ids for our new guest!
-        self.ensure_allocations(session, &new_members).await?;
 
         let mut message = ConversationMessage::default();
         message.set_type(ConversationMessageType::AddMember);
@@ -1078,8 +1229,7 @@ impl FTClient {
             let needs_prop = session.is_ringing_inaccurate && session.participants.values().filter(|a| a.active.is_some()).count() == 1;
             if needs_prop {
                 info!("Propping conversation");
-                self.ensure_allocations(session, &[]).await?;
-                self.prop_up_conv(session, false).await?;
+                self.join(session, false).await?;
                 // return Err(PushError::AESGCMError);
             }
             drop(state);
@@ -1179,6 +1329,32 @@ impl FTClient {
     }
 
     pub async fn handle(&self, msg: APSMessage) -> Result<Option<FTMessage>, PushError> {
+        let APSMessage::Notification { id: _, topic, token: _, payload, channel: _ } = &msg else { return Ok(None) };
+        if topic == &sha1("com.apple.private.alloy.quickrelay".as_bytes()) {
+            let allocate_response = match plist::from_value::<QuickRelayAllocationsResponse>(payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Parsing QuickRelay message failed {e}!");
+                    return Err(e.into());
+                }
+            };
+
+            let uuid = Uuid::from_bytes(allocate_response.session_id.as_ref().try_into().unwrap());
+            let mut session = self.state.write().await;
+            let Some(item) = session.sessions.get_mut(&uuid.to_string().to_uppercase()) else { return Ok(None) };
+
+            item.import_allocations(&allocate_response);
+
+            if let Some(session) = &item.connection {
+                session.link.update_config(allocate_response).await;
+            } else {
+                warn!("Dropping QR message for call {uuid}!");
+            }
+            
+            return Ok(None)
+        }
+
+
         let Some(IDSRecvMessage { message_unenc: Some(message), target: Some(target), command, token: Some(token), sender: Some(sender), ns_since_epoch: Some(ns_since_epoch), .. }) = 
                 self.identity.receive_message(msg, &["com.apple.private.alloy.facetime.multi", "com.apple.private.alloy.facetime.video"]).await? else { return Ok(None) };
         Ok(if command == 242 { // NiceData
@@ -1213,7 +1389,7 @@ impl FTClient {
                     if let Some(session) = state.sessions.get_mut(&decoded.conversation_group_uuid_string) {
                         session.is_ringing_inaccurate = false;
                         session.mode = Some(FTMode::MissedOutgoing); // mark as incoming
-                        self.unprop_conv(session).await?;
+                        self.leave(session).await?;
                         (self.update_state)(&state);
                     }
                     Some(FTMessage::Decline { guid: decoded.conversation_group_uuid_string.clone() })
@@ -1245,6 +1421,10 @@ impl FTClient {
                         (self.update_state)(&state);
                     }
                     Some(FTMessage::RespondedElsewhere { guid: decoded.conversation_group_uuid_string.clone() })
+                },
+                ConversationMessageType::RequestVideoUpgrade => {
+                    self.upgrade_to_video(&decoded.conversation_group_uuid_string, false).await?;
+                    None
                 }
                 _type => {
                     warn!("Couldn't handle message type {_type:?}");
@@ -1258,6 +1438,9 @@ impl FTClient {
             let mut state = self.state.write().await;
             let session = state.sessions.entry(received.session.clone()).or_default();
             session.group_id = received.session.clone();
+            if !session.av_config.is_some() {
+                session.av_config = Some(AVConfig::new());
+            }
             if !session.my_handles.contains(&target) {
                 session.my_handles.push(target.clone());
             }
@@ -1266,12 +1449,23 @@ impl FTClient {
             match (command, context, participant_meta, &received) {
                 (207, Some(context), Some(avc_data), FTWireMessage { participant_id_key: Some(participant), .. }) => {
                     info!("Someone joined!");
+                    // TODO remove this
+                    // if HAS_JOINED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    //     info!("Already set!");
+                    //     return Ok(None);
+                    // }
+
                     let participant = *participant;
                     let decoded_context = ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
                     let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
 
                     if let Some(link) = &message.link {
                         session.link = Some(link.clone());
+                    }
+
+                    info!("here");
+                    if let Some(video) = decoded_context.video {
+                        session.is_video = video;
                     }
 
                     if let Some(report) = &message.report_data {
@@ -1284,37 +1478,20 @@ impl FTClient {
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
 
+                    if let Some(conn) = &session.connection {
+                        let p: u64 = participant.into();
+                        let handle = conn.link.state.lock().await.configuration.allocations.iter()
+                            .find(|i| i.id == p as i64).expect("Added pariticpant not allocated??").participant.clone();
+                        conn.import_avc(participant.into(), handle, avc_data.as_ref()).await?;
+                    }
+
                     session.participants.insert(participant.to_string(), FTParticipant {
                         token: Some(base64_encode(&token)),
                         participant_id: participant.into(),
                         last_join_date: Some(ns_since_epoch / 1000000),
                         handle: sender.clone(),
-                        active: Some(ConversationParticipant {
-                            version: decoded_context.version,
-                            identifier: participant.into(),
-                            handle: Some(handle_from_ids(&sender)),
-                            avc_data: avc_data.into(),
-                            is_moments_available: Some(decoded_context.is_moments_available),
-                            is_screen_sharing_available: Some(decoded_context.is_screen_sharing_available),
-                            is_gondola_calling_available: Some(decoded_context.is_gondola_calling_available),
-                            is_mirage_available: Some(decoded_context.is_mirage_available),
-                            is_lightweight: Some(decoded_context.is_lightweight),
-                            share_play_protocol_version: decoded_context.share_play_protocol_version,
-                            // options: 1,
-                            options: 0, // default (missing)
-                            is_gft_downgrade_to_one_to_one_available: decoded_context.is_gft_downgrade_to_one_to_one_available,
-                            guest_mode_enabled: Some(message.guest_mode_enabled),
-                            association: decoded_context.participant_association.clone(),
-                            is_u_plus_n_downgrade_available: decoded_context.is_u_plus_n_downgrade_available,
-                        }),
+                        active: Some(participant_from_meta(participant, &sender, avc_data.into(), message, &decoded_context)),
                     });
-
-                    // if we propped it up for a join, someone else (or us) have joined
-                    // so we don't need to prop it anymore
-                    // make sure web client to not hang up on people who are picking up for us
-                    if session.is_propped && sender.starts_with("temp:") {
-                        self.unprop_conv(session).await?;
-                    }
 
                     if message.r#type() == ConversationMessageType::Invitation {
                         if sender != target {
@@ -1344,6 +1521,9 @@ impl FTClient {
                     let message = decoded_context.message.as_ref().ok_or(PushError::BadMsg)?;
                     if let Some(link) = &message.link {
                         session.link = Some(link.clone());
+                    }
+                    if let Some(video) = decoded_context.video {
+                        session.is_video = video;
                     }
                     if let Some(report) = &message.report_data {
                         session.report_id = report.conversation_id.clone();
@@ -1378,10 +1558,36 @@ impl FTClient {
                     info!("Context {:#?} {:?} {:#?}", decoded_context, meta.map(|a| encode_hex(a.as_ref())), received);
                     result
                 },
-                (210, _, _, _) => {
-                    // we don't have any realtime connection so we use the peridic rekeys as heartbeats
+                (210, _, _, FTWireMessage { prekey: Some(prekey), prekey_wrap_mode: Some(wrap_mode), .. }) => {
                     session.last_rekey = Some(ns_since_epoch / 1000000);
+                    if let Some(session) = &session.connection {
+                        if let Some(participant) = session.link.token_to_participant(&token).await {
+                            session.handle_prekey(participant, QuickRelayPreKey {
+                                public_prekey: prekey.clone(),
+                                wrap_mode: *wrap_mode,
+                                creation_date: ns_since_epoch as f64 / 1000000000.0,
+                            }).await?;
+                        } else {
+                            warn!("Ignoring prekey for unknwon participant!");
+                        }
+                    }
+
                     (self.update_state)(&state);
+                    None
+                }
+                (211, _, _, wire) => {
+                    if let Some(session) = &session.connection {
+                        if let Some(participant) = session.link.token_to_participant(&token).await {
+                            if let Some(skm) = &wire.session_key_material {
+                                session.handle_skm(participant, skm.clone()).await?;
+                            }
+                            if let Some(mkm) = &wire.media_key_material {
+                                session.handle_mkm(participant, mkm.clone()).await?;
+                            }
+                        } else {
+                            warn!("Ignoring keys for unknwon participant!");
+                        }
+                    }
                     None
                 }
                 (208, a, b, FTWireMessage { participant_id_key: Some(participant), .. }) => {
@@ -1427,4 +1633,3 @@ impl FTClient {
         })
     }
 }
-

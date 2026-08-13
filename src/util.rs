@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use base64::engine::general_purpose;
-use deku::{DekuContainerRead, DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
+use deku::prelude::*;
 use hkdf::hmac::Hmac;
 use keystore::KeystorePublicKey;
 use libflate::gzip::{HeaderBuilder, EncodeOptions, Encoder, Decoder};
@@ -556,6 +556,22 @@ pub fn ungzip(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoder = Decoder::new(bytes)?;
     let mut decoded_data = Vec::new();
     decoder.read_to_end(&mut decoded_data)?;
+    Ok(decoded_data)
+}
+
+pub fn inflate(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libflate::zlib::Decoder;
+    let mut decoder = Decoder::new(bytes)?;
+    let mut decoded_data = Vec::new();
+    decoder.read_to_end(&mut decoded_data)?;
+    Ok(decoded_data)
+}
+
+pub fn deflate(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use libflate::zlib::Encoder;
+    let mut decoded_data = Vec::new();
+    let mut decoder = Encoder::new(Cursor::new(&mut decoded_data))?;
+    decoder.write_all(bytes)?;
     Ok(decoded_data)
 }
 
@@ -2630,6 +2646,17 @@ pub trait BinaryReadExt: Read {
         let mut buf = [0u8; 4];
         self.read_exact(&mut buf)?;
         Ok(u32::from_be_bytes(buf))
+    }
+
+    fn read_u64_be(&mut self) -> io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.read_exact(&mut buf)?;
+        Ok(u64::from_be_bytes(buf))
+    }
+
+    fn read_u16_vec_be(&mut self) -> io::Result<Vec<u16>> {
+        let count = self.read_u8_exact()? as usize;
+        (0..count).map(|_| self.read_u16_be()).collect()
     }
 
     fn read_n(&mut self, n: usize) -> io::Result<Vec<u8>> {

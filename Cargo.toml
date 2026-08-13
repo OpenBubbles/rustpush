@@ -32,11 +32,11 @@ log = "0.4.20"
 pretty_env_logger = "0.5.0"
 async-trait = "0.1.73"
 flume = "0.11.0"
-icloud_auth = { path = "./apple-private-apis/icloud-auth", default-features = false }
-srp = { path = "./apple-private-apis/icloud-auth/rustcrypto-srp" }
-omnisette = { path = "./apple-private-apis/omnisette" }
+icloud_auth = { path = "./third_party/apple-private-apis/icloud-auth", default-features = false }
+srp = { path = "./third_party/apple-private-apis/icloud-auth/rustcrypto-srp" }
+omnisette = { path = "./third_party/apple-private-apis/omnisette" }
 open-absinthe = { path = "./open-absinthe", optional = true, features = ["serde"] }
-deku = "0.16.0"
+deku = "0.19.0"
 zip = { version = "2.1.5", default-features = false, features = ["deflate-zlib"] }
 rasn = "0.16.0"
 backon = "0.4.4"
@@ -49,6 +49,9 @@ aes = "0.8.4"
 sha2 = "0.10.8"
 hkdf = "0.12.4"
 aes-gcm = "0.10.3"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 cloudkit-proto = { path = "./cloudkit-proto" }
 cloudkit-derive = { path = "./cloudkit-derive" }
 keystore = { path = "./keystore" }
@@ -56,6 +59,19 @@ aes-siv = "0.7.0"
 chrono = "0.4.41"
 bitflags = "2.9.1"
 x509-cert = "0.2.5"
+quinn = { path = "./third_party/quinn/quinn" }
+rtc-media = { path = "./third_party/rtc/rtc-media" }
+rtc-rtp = { path = "./third_party/rtc/rtc-rtp" }
+rtc-rtcp = { path = "./third_party/rtc/rtc-rtcp" }
+rtc-shared = { path = "./third_party/rtc/rtc-shared" }
+rtc-srtp = { path = "./third_party/rtc/rtc-srtp" }
+rtc-stun = { path = "./third_party/rtc/rtc-stun" }
+rustls_psk = { package = "rustls", path = "./third_party/rustls/rustls" }
+mio = { version = "1.2.2", features = ["os-poll", "net"] }
+sansio = "1.0.1"
+
+[patch.crates-io]
+quinn = { path = "./third_party/quinn/quinn" }
 
 [build-dependencies]
 prost-build = { version = "0.12.0" }

@@ -6,6 +6,7 @@ mod imessage;
 mod error;
 mod auth;
 mod ids;
+pub mod avconference;
 pub mod sharedstreams;
 pub mod findmy;
 pub mod facetime;
