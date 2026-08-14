@@ -1153,7 +1153,7 @@ impl RecvStatTracker {
         time_slice.loss_count += loss;
     }
 
-    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) {
+    fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Option<FTVideoControlData> {
         self.stats.total_recv_bytes.fetch_add(recv.packet_size as u64, Ordering::Relaxed);
 
         if let Some(probe) = recv.probe_id {
@@ -1191,7 +1191,7 @@ impl RecvStatTracker {
         }
         let payload = AVSessionPayload::from_id(header.payload_type as u32).unwrap();
 
-        if !header.extensions.is_empty() {
+       let result = if !header.extensions.is_empty() {
             let mut record_index = self.stats.records.read().unwrap();
             let stream_identifier = (ssrc.owner, ssrc.stream_index);
             if !record_index.contains_key(&stream_identifier) {
@@ -1224,6 +1224,7 @@ impl RecvStatTracker {
                         }
                     }
                     // info!("Control data {data:?}");
+                    Some(data)
                 },
                 AVSessionPayload::Aac | AVSessionPayload::Evs | AVSessionPayload::Red => {
                     let data = FTAudioControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec());
@@ -1242,9 +1243,10 @@ impl RecvStatTracker {
                             self.audio_history.push(data);
                         }
                     }
+                    None
                 }
             }
-        }
+        } else { None };
 
         time_slice.expected_count += elapsed_packets as usize;
 
@@ -1310,6 +1312,8 @@ impl RecvStatTracker {
                 }.to_bits()
             });
         }
+
+        result
     }
 }
 
@@ -1552,7 +1556,7 @@ impl IncomingFrameHandler {
                 };
 
                 
-                stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
+                let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
                 
                 let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
                     let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
@@ -1664,6 +1668,7 @@ impl IncomingFrameHandler {
                                 timestamp: header.timestamp,
                                 prev_dropped: 0,
                                 metadata: HashMap::new(),
+                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
                                 frame: ChannelFrame::Configuration(config),
                             });
 
@@ -1699,6 +1704,7 @@ impl IncomingFrameHandler {
                             timestamp: sample.packet_timestamp,
                             prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
                             metadata: frame_meta,
+                            camera_meta: video_meta.as_ref().map(|i| i.camera_status),
                             frame: ChannelFrame::Sample(data.to_vec()),
                         });
                     }
@@ -2030,7 +2036,7 @@ impl ParticipantEncryptionState {
 // 136 / 0x88  media type 8
 // 140 / 0x8c  special, used for media-type mixing list
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct VCWindowState {
     #[serde(rename = "VCWindowOriginX")]
     pub window_origin_x: f32,
@@ -2044,7 +2050,7 @@ pub struct VCWindowState {
     pub window_height: f32,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct VCRateControl {
     #[serde(rename = "RCEV")]
     pub experiment_version: u32,
@@ -2060,7 +2066,7 @@ pub struct VCRateControl {
     pub retransmission_enabled: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "PascalCase")]
 pub struct VCDeviceState {
     pub thermal: Option<u32>,
@@ -2068,7 +2074,7 @@ pub struct VCDeviceState {
     pub slice_status: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct VCGenerateKeyFrame {
     #[serde(rename = "VCSessionMessageStreamID")]
     pub stream_id: u32,
@@ -2082,8 +2088,9 @@ pub struct VCGenerateKeyFrame {
     pub fir_type: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DeviceOrientation {
+    #[default]
     Portrait,
     PortraitUpsideDown,
     LandscapeLeft,
@@ -2091,6 +2098,16 @@ pub enum DeviceOrientation {
 }
 
 impl DeviceOrientation {
+    fn from_num(num: u8) -> Self {
+        match num {
+            0 => Self::Portrait,
+            1 => Self::PortraitUpsideDown,
+            2 => Self::LandscapeLeft,
+            3 => Self::LandscapeRight,
+            _ => panic!()
+        }
+    }
+
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let string = std::str::from_utf8(bytes).ok()?;
         Some(match string {
@@ -2112,7 +2129,7 @@ impl DeviceOrientation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VCControlData {
     // stream group to active index
     StreamGroupState(HashMap<u32, u8>),
@@ -2292,11 +2309,39 @@ fn test_audio_ctrl() {
     assert_eq!(ext.to_ext(), (0x8d00, data));
 }
 
+// source is 0 (normal), 1 (screen), 2, 3, (reserved)
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FTVideoCameraStatus {
+    pub orientation: DeviceOrientation,
+    pub is_mirrored: bool,
+    pub is_back: bool, // back camera, not front
+    pub source: u8,
+}
+
+impl FTVideoCameraStatus {
+    fn decode(status: u8) -> Self {
+        Self {
+            orientation: DeviceOrientation::from_num(status & 0x3),
+            is_mirrored: status & 0x4 != 0,
+            is_back: status & 0x8 != 0,
+            source: status >> 4 & 0x3,
+        }
+    }
+
+    fn encode(&self) -> u8 {
+        self.orientation as u8
+            | (self.is_mirrored as u8) << 2
+            | (self.is_back as u8) << 3
+            | (self.source & 0x3) << 4
+    }
+}
+
 // VCMediaControlInfoFaceTimeVideo
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct FTVideoControlData {
     version: u8,
-    camera_status: u8,
+    camera_status: FTVideoCameraStatus,
     ltr_bits: u8,
     ltr_timestamp: Option<u32>,
     total_packets_per_frame: Option<u16>,
@@ -2310,7 +2355,7 @@ impl FTVideoControlData {
         let version = (profile >> 14) as u8;
         Self {
             version,
-            camera_status: (profile >> 8) as u8 & 0x3f,
+            camera_status: FTVideoCameraStatus::decode((profile >> 8) as u8 & 0x3f),
             ltr_bits: (profile >> 4) as u8 & 0xf,
             ltr_timestamp: if (profile & 0x2) != 0 {
                 Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
@@ -2332,7 +2377,7 @@ impl FTVideoControlData {
 
     fn to_ext(&self) -> (u16, Vec<u8>) {
         let result = ((self.version as u16) << 14)
-            | ((self.camera_status as u16) << 8)
+            | ((self.camera_status.encode() as u16) << 8)
             | ((self.ltr_bits as u16) << 4)
             | if self.ltr_timestamp.is_some() { 0x2 } else { 0x0 }
             | if self.total_packets_per_frame.is_some() && self.version == 2 { 0x1 } else { 0x0 }
@@ -2541,6 +2586,7 @@ pub struct VideoSender {
     
     link: Arc<GlobalLink>,
     packet_buffer: Arc<std::sync::Mutex<AVChannelHistory>>,
+    pub camera_source: FTVideoCameraStatus,
 }
 
 impl VideoSender {
@@ -2616,7 +2662,7 @@ impl VideoSender {
         let payloads_len = payloads.len();
         let extension = FTVideoControlData {
             version: if self.to_participant.is_some() { 2 } else { 1 },
-            camera_status: 0,
+            camera_status: self.camera_source,
             ltr_bits: if desc.is_some() { 1 } else { 0 },
             total_packets_per_frame: Some(payloads.len() as u16),
             frame_sequence_number: Some(self.frame_number),
@@ -3194,6 +3240,7 @@ impl AVSession {
 
             link: self.link.clone(),
             last_probe: None,
+            camera_source: Default::default(),
             packet_buffer: self.ssrc_packet_buffer.lock().unwrap().entry(ssrc).or_default().clone(),
         }
     }
@@ -3482,6 +3529,14 @@ impl AVSession {
             self.link.send_control(to_participant as i64, &data)?;
         }
 
+        Ok(())
+    }
+
+    pub async fn broadcast_control_message(&self, message: VCControlData) -> Result<(), PushError> {
+        let participants = self.state.lock().await.active_participants.clone();
+        for participant in participants {
+            self.send_control_message(participant, message.clone()).await?;
+        }
         Ok(())
     }
 
@@ -4178,6 +4233,7 @@ pub struct ChannelMessage {
     pub frame: ChannelFrame,
     pub prev_dropped: u16,
     pub metadata: HashMap::<&'static str, Vec<u8>>,
+    pub camera_meta: Option<FTVideoCameraStatus>,
     pub timestamp: u32,
 }
 

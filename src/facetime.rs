@@ -190,6 +190,13 @@ pub struct FTSession {
     pub connection: Option<Arc<AVSession>>,
     #[serde(skip)]
     pub av_config: Option<AVConfig>,
+    // this is not fully right/correct, when the initiator leaves
+    // it is not reassigned to me even if it probably should be.
+    // I don't think that affects any of our existing flows, but could be
+    // relevant in the future. The main issue is a false positive rather
+    // than a false negative, which we avoid at this time.
+    #[serde(skip)]
+    pub is_initiator: bool,
 }
 
 // time to track recently added members
@@ -538,6 +545,10 @@ impl FTClient {
             session.connection.as_ref().unwrap().import_avc(active.identifier, participant.handle.clone(), &active.avc_data).await?;
         }
 
+        if relay_session.state.lock().await.active_participants.is_empty() {
+            session.is_initiator = true;
+        }
+
         info!("Connected!");
         
         Ok(())
@@ -724,6 +735,7 @@ impl FTClient {
             recent_member_adds: HashMap::new(),
             connection: None,
             av_config: Some(AVConfig::new()),
+            is_initiator: true,
 
             is_video,
         };
@@ -767,7 +779,7 @@ impl FTClient {
 
         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
 
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator; // todo, what does this mean
         let is_u_plus_one = join_type == 3; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
@@ -855,7 +867,7 @@ impl FTClient {
             Some(link.get_public_key().await?.into())
         } else { None };
 
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator; // todo, what does this mean
         let is_u_plus_one = false; // new user flag (one on one downgrade??)
 
         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
@@ -998,7 +1010,7 @@ impl FTClient {
         }
         
         let my_participant = session.get_participant(self.conn.get_token().await).ok_or(PushError::NoParticipantTokenIndex)?;
-        let is_initiator = true; // todo, what does this mean
+        let is_initiator = session.is_initiator;
         let is_u_plus_one = true; // new user flag (one on one downgrade??)
         let wire_message = FTWireMessage {
             session: session.group_id.clone(),
@@ -1016,6 +1028,8 @@ impl FTClient {
             })),
             ..Default::default()
         };
+
+        session.is_initiator = false; // can't be initiator after leaving
 
 
         let relevant_people: Vec<String> = session.members.union(&session.members).map(|m| m.handle.clone()).collect();
@@ -1060,6 +1074,7 @@ impl FTClient {
     pub async fn set_local_interfaces(&self, interfaces: &[IpAddr]) {
         let mut state = self.interfaces.write().await;
         *state = Some(interfaces.to_vec());
+        drop(state); // can trigger a race.
         for session in self.state.read().await.sessions.values() {
             let Some(link) = &session.connection else { continue };
             link.link.update_local_interfaces(interfaces).await;
@@ -1576,6 +1591,7 @@ impl FTClient {
                     None
                 }
                 (211, _, _, wire) => {
+                    info!("Got keys message {wire:?}");
                     if let Some(session) = &session.connection {
                         if let Some(participant) = session.link.token_to_participant(&token).await {
                             if let Some(skm) = &wire.session_key_material {

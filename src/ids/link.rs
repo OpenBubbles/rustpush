@@ -1335,7 +1335,7 @@ pub struct GlobalLinkState {
     pub session_request_id: u32,
     client_ip: Option<String>,
 
-    active_participants: Vec<u64>,
+    pub active_participants: Vec<u64>,
     local_interfaces: Option<Vec<std::net::IpAddr>>,
     
     participant_p2p: HashMap<i64, ParticipantP2PConfig>,
