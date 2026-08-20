@@ -572,6 +572,7 @@ pub fn deflate(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     let mut decoded_data = Vec::new();
     let mut decoder = Encoder::new(Cursor::new(&mut decoded_data))?;
     decoder.write_all(bytes)?;
+    decoder.finish().into_result()?;
     Ok(decoded_data)
 }
 

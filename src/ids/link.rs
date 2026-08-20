@@ -2604,6 +2604,10 @@ impl GlobalLink {
         })
     }
 
+    pub async fn get_reverse_participant_map(&self) -> HashMap<i64, String> {
+        self.state.lock().await.configuration.allocations.iter().map(|i| (i.id, i.participant.clone())).collect()
+    }
+
     pub fn try_send_direct(&self, data: &[u8]) -> bool {
         if self.relay_mode.load(Ordering::Relaxed) {
             return false

@@ -606,7 +606,6 @@ impl FTQualityZipper {
 
 pub struct AVSessionSSRC {
     owner: u64,
-    owner_handle: String,
     stream_index: u32,
     features: HashMap<u8, EnabledAVFeatures>,
     mkms: Vec<QuickRelayMkmMaterial>,
@@ -716,7 +715,7 @@ impl AVSessionState {
         Ok(())
     }
 
-    fn get_media_config(&self, p: u64, handle: String, config: &AVConfig) -> HashMap<u32, AVSessionSSRC> {
+    fn get_media_config(&self, p: u64, config: &AVConfig) -> HashMap<u32, AVSessionSSRC> {
         let Some(encryption_state) = self.encryption_states.get(&p) else { return HashMap::new() };
         
         if encryption_state.mkm.is_empty() {
@@ -729,7 +728,6 @@ impl AVSessionState {
             
             map.insert(u1.rtp_ssrc(), AVSessionSSRC {
                 owner: p,
-                owner_handle: handle.clone(),
                 stream_index: group.stream_group(),
                 mkms: encryption_state.mkm.clone(),
                 features: u1.encode_decode_features.iter()
@@ -1662,7 +1660,6 @@ impl IncomingFrameHandler {
                             info!("mediainfo {:?}", config);
                             incoming_handler.read().unwrap().handle(ChannelMessage {
                                 participant: ssrc.owner,
-                                participant_handle: ssrc.owner_handle.clone(),
                                 stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
                                 r#type: channel_type,
                                 timestamp: header.timestamp,
@@ -1697,7 +1694,6 @@ impl IncomingFrameHandler {
                         // info!("Handling packetd");
                         incoming_handler.read().unwrap().handle(ChannelMessage {
                             participant: ssrc.owner,
-                            participant_handle: ssrc.owner_handle.clone(),
                             // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
                             stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
                             r#type: channel_type,
@@ -3245,12 +3241,12 @@ impl AVSession {
         }
     }
 
-    pub async fn import_avc(&self, p: u64, handle: String, avc_data: &[u8]) -> Result<(), PushError> {
+    pub async fn import_avc(&self, p: u64, avc_data: &[u8]) -> Result<(), PushError> {
         let mut state = self.state.lock().await;
         state.import_avc(p, avc_data)?;
 
-        self.frame_handler.handle_keys(state.get_media_config(p, handle.clone(), &self.av_config), true);
-        self.frame_handler.handle_keys(state.get_media_config(p, handle, &self.av_config), false);
+        self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), true);
+        self.frame_handler.handle_keys(state.get_media_config(p, &self.av_config), false);
 
         drop(state);
         self.update_subscribed_streams().await?;
@@ -3425,7 +3421,7 @@ impl AVSession {
         let avc = participant.try_decrypt(&self.session_id)?;
         drop(state);
         if let Some(avc) = avc {
-            self.import_avc(owner_id, "".to_string(), &avc).await?;
+            self.import_avc(owner_id, &avc).await?;
         }
         Ok(())
     }
@@ -3448,9 +3444,8 @@ impl AVSession {
             s.mkm.push(mat);
         }
         // get_media_config will return an empty array IF no AVC blob has been configured
-        // TODO get the right handle
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, "".to_string(), &self.av_config), true);
-        self.frame_handler.handle_keys(state.get_media_config(owner_id, "".to_string(), &self.av_config), false);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, &self.av_config), true);
+        self.frame_handler.handle_keys(state.get_media_config(owner_id, &self.av_config), false);
 
         Ok(())
     }
@@ -3475,7 +3470,7 @@ impl AVSession {
                     let avc = participant.try_decrypt(&self.session_id)?;
                     drop(state);
                     if let Some(avc) = avc {
-                        self.import_avc(owner_id, "".to_string(), &avc).await?;
+                        self.import_avc(owner_id, &avc).await?;
                     }
                 }
                 13 => {
@@ -4227,7 +4222,6 @@ impl ChannelType {
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
     pub participant: u64,
-    pub participant_handle: String,
     pub stream_id: u32,
     pub r#type: ChannelType,
     pub frame: ChannelFrame,

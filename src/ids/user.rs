@@ -856,6 +856,8 @@ impl IDSUser {
 
         let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
 
+        info!("Dependent registrations {devices:?}");
+
         Ok(devices.iter().filter_map(|dev| {
             let dict = dev.as_dictionary().unwrap();
             if dict.get("service").unwrap().as_string().unwrap() != "com.apple.madrid" {

@@ -208,7 +208,13 @@ impl MessageParts {
         writer.write(XmlEvent::start_element("body")).unwrap();
         let mut inline_attachment_num = 0;
         let mut my_part_idx = 0;
+        let mut building_inline = false;
         for part in self.0.iter() {
+            if building_inline && matches!(part.part, MessagePart::Attachment(_)) {
+                // kick us out of inline mode
+                my_part_idx += 1;
+                building_inline = false;
+            }
             let part_idx = part.idx.unwrap_or(my_part_idx).to_string();
             match &part.part {
                 MessagePart::Attachment(attachment) => {
@@ -264,6 +270,7 @@ impl MessageParts {
                     }
                 },
                 MessagePart::Text(text, format) => {
+                    building_inline = true;
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
@@ -282,6 +289,7 @@ impl MessageParts {
                     format.close_flags(&mut writer);
                 },
                 MessagePart::Mention(uri, text) => {
+                    building_inline = true;
                     let mut element = XmlEvent::start_element("span").attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
@@ -293,6 +301,7 @@ impl MessageParts {
                     writer.write(XmlEvent::end_element()).unwrap();
                 },
                 MessagePart::Object(breadcrumb) => {
+                    building_inline = true;
                     let element = XmlEvent::start_element("object").attr("breadcrumbText", &breadcrumb)
                         .attr("breadcrumbOptions", "0");
                     writer.write(element).unwrap();
@@ -605,7 +614,7 @@ pub enum MessageType {
     SMS {
         is_phone: bool,
         using_number: String, // prefixed with tel:
-        from_handle: Option<String>,
+        from_handle: Option<String>, // also prefixed with tel:
     }
 }
 
@@ -635,7 +644,7 @@ impl ExtensionApp {
         })
     }
 
-    pub fn to_raw(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
+    pub fn to_raw(&self, is_backup: bool) -> Result<(Vec<u8>, Option<Vec<u8>>), PushError> {
         let arr = NSArray {
             objects: vec![NSDictionary {
                 class: NSDictionaryClass::NSDictionary,
@@ -646,7 +655,7 @@ impl ExtensionApp {
         let collapse = gzip(&plist_to_bin(&KeyedArchive::archive_item(plist::to_value(&arr)?)?)?)?;
         let mut balloon = None;
         if let Some(balloon_obj) = &self.balloon {
-            balloon = Some(balloon_obj.to_raw(self)?);
+            balloon = Some(balloon_obj.to_raw(self, is_backup)?);
         }
 
         Ok((collapse, balloon))
@@ -701,26 +710,20 @@ impl Balloon {
             layout: unpacked.layout,
             ld_text: unpacked.ldtext,
             is_live: unpacked.live_layout_info.is_some(),
-            icon: unpacked.app_icon.map(|a| ungzip(&a).unwrap()),
+            icon: unpacked.app_icon.map(|a| a.decompress().into_bytes()),
         })
     }
 
-    fn to_raw(&self, app: &ExtensionApp) -> Result<Vec<u8>, PushError> {
+    fn to_raw(&self, app: &ExtensionApp, is_backup: bool) -> Result<Vec<u8>, PushError> {
         let raw = NSDictionary {
             item: RawBalloonData {
                 ldtext: self.ld_text.clone(),
                 layout: self.layout.clone(),
-                app_icon: self.icon.as_ref().map(|icon| NSData {
-                    data: gzip(&icon).unwrap().into(),
-                    class: NSDataClass::NSMutableData
-                }),
+                app_icon: self.icon.as_ref().map(|icon| BalloonRawData::new(icon.clone(), is_backup).compress()),
                 app_name: app.name.clone(),
                 session_identifier: self.session.as_ref().map(|session| Uuid::from_str(&session).unwrap().into()),
                 live_layout_info: if self.is_live {
-                    Some(NSData {
-                        data: include_bytes!("livelayout.bplist").to_vec().into(),
-                        class: NSDataClass::NSMutableData
-                    })
+                    Some(BalloonRawData::new(include_bytes!("livelayout.bplist").to_vec(), is_backup))
                 } else { None },
                 url: NSURL {
                     base: "$null".to_string(),
@@ -1397,6 +1400,16 @@ pub enum AttachmentType {
     MMCS(MMCSFile)
 }
 
+fn normalize_sms_handle(handle: &str) -> String {
+    if handle.starts_with('+') {
+        format!("tel:{handle}")
+    } else if handle.len() >= 8 && handle.bytes().all(|b| b.is_ascii_digit()) {
+        format!("tel:+{handle}")
+    } else {
+        format!("tel:{handle}") // short code or alphanumeric sender -- leave alone
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Attachment {
@@ -1610,7 +1623,7 @@ pub enum Message {
     MessageReadOnDevice,
     SmsConfirmSent(bool /* status */),
     MarkUnread, // send for last message from other participant
-    PeerCacheInvalidate,
+    PeerCacheInvalidate, // also should re-emit profile photo, if any.
     UpdateExtension(UpdateExtensionMessage),
     Error(ErrorMessage),
     MoveToRecycleBin(MoveToRecycleBinMessage),
@@ -1622,6 +1635,7 @@ pub enum Message {
     ShareProfile(ShareProfileMessage),
     NotifyAnyways,
     SetTranscriptBackground(SetTranscriptBackgroundMessage),
+    RecoverProfile,
 }
 
 
@@ -1676,6 +1690,7 @@ impl Message {
             Self::ShareProfile(_) => 131,
             Self::NotifyAnyways => 113,
             Self::SetTranscriptBackground(_) => 138,
+            Self::RecoverProfile => 180,
         }
     }
 
@@ -1718,7 +1733,7 @@ impl Message {
                     ("c", Value::Integer(70000.into()))
                 ]))),
             ]),
-            Message::UpdateProfileSharing(_) => Dictionary::from_iter([
+            Message::UpdateProfileSharing(_) | Message::RecoverProfile => Dictionary::from_iter([
                 ("gC", Value::Integer(70000.into())),
                 ("pID", Value::Dictionary(Dictionary::new())),
             ]),
@@ -1750,6 +1765,7 @@ impl Message {
             Self::UpdateProfileSharing(_) => Some(true),
             Self::NotifyAnyways => Some(true),
             Self::SetTranscriptBackground(_) => Some(true),
+            Self::RecoverProfile => Some(true),
             _ => None
         }
     }
@@ -1835,6 +1851,9 @@ impl fmt::Display for Message {
             },
             Message::SetTranscriptBackground(_) => {
                 write!(f, "Changed the transcript background")
+            },
+            Message::RecoverProfile => {
+                write!(f, "Recovered a profile")
             }
         }
     }
@@ -2090,6 +2109,15 @@ impl MessageInst {
                 };
                 plist_to_bin(&raw).unwrap()
             },
+            Message::RecoverProfile => {
+                let raw = RawProfileRecoveryMessage {
+                    profile: RawProfileRecovery {
+                        recover: true,
+                    },
+                    unk1: 70000,
+                };
+                plist_to_bin(&raw).unwrap()
+            },
             Message::UpdateProfile(update) => {
                 let raw = RawProfileUpdateMessage {
                     profile: RawProfileUpdate {
@@ -2169,7 +2197,7 @@ impl MessageInst {
                 let mut balloon_part: Option<Vec<u8>> = None;
                 let mut app_info: Option<Data> = None;
                 if let ReactMessageType::Extension { spec: app_obj, body: _, .. } = &react.reaction {
-                    let (app, balloon) = app_obj.to_raw()?;
+                    let (app, balloon) = app_obj.to_raw(false)?;
                     app_info = if balloon.is_none() { Some(app.into()) } else { None };
                     balloon_part = balloon;
                     balloon_id = Some(app_obj.bundle_id.clone());
@@ -2227,7 +2255,7 @@ impl MessageInst {
                         let mut balloon_part: Option<Vec<u8>> = None;
                         let mut app_info: Option<Data> = None;
                         if let Some(app_obj) = &normal.app {
-                            let (app, balloon) = app_obj.to_raw()?;
+                            let (app, balloon) = app_obj.to_raw(false)?;
                             app_info = Some(app.into());
                             balloon_part = balloon;
                             balloon_id = Some(app_obj.bundle_id.clone());
@@ -2644,6 +2672,11 @@ impl MessageInst {
         if let Ok(loaded) = plist::from_value::<RawProfileSharingUpdateMessage>(&value) {
             return wrapper.to_message(None, Message::UpdateProfileSharing(loaded.profile))
         }
+        if let Ok(loaded) = plist::from_value::<RawProfileRecoveryMessage>(&value) {
+            if loaded.profile.recover {
+                return wrapper.to_message(None, Message::RecoverProfile)
+            }
+        }
         if let Ok(loaded) = plist::from_value::<RawRenameMessage>(&value) {
             return wrapper.to_message(Some(ConversationData {
                 participants: add_prefix(&loaded.participants),
@@ -2740,17 +2773,18 @@ impl MessageInst {
         if let Ok(loaded) = plist::from_value::<RawSmsIncomingMessage>(&value) {
             let system_recv: SystemTime = loaded.recieved_date.clone().into();
             let parts = MessageParts::parse_sms(&loaded);
+            let normalized_sender = normalize_sms_handle(&loaded.sender);
             let mut msg = wrapper.to_message(
                 Some(ConversationData {
                     participants: if loaded.participants.len() > 0 {
-                        let mut participants = loaded.participants.clone();
+                        let mut participants: Vec<String> = loaded.participants.iter().map(|p| normalize_sms_handle(p)).collect();
                         // duplicates cause chat matching in dart to fail (it is duplicate for RCS)
-                        if !participants.contains(&loaded.sender) {
-                            participants.push(loaded.sender.clone());
+                        if !participants.contains(&normalized_sender) {
+                            participants.push(normalized_sender.clone());
                         }
-                        participants.iter().map(|p| format!("tel:{p}")).collect()
+                        participants
                     } else {
-                        vec![format!("tel:{}", loaded.sender), format!("tel:{}", loaded.recieved_number)]
+                        vec![normalized_sender.clone(), normalize_sms_handle(&loaded.recieved_number)]
                     },
                     cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
                     sender_guid: None,
@@ -2763,8 +2797,8 @@ impl MessageInst {
                     reply_part: None, // losers
                     service: MessageType::SMS { // shame
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
-                        using_number: format!("tel:{}", loaded.recieved_number),
-                        from_handle: Some(loaded.sender.clone()),
+                        using_number: normalize_sms_handle(&loaded.recieved_number),
+                        from_handle: Some(normalized_sender),
                     },
                     subject: None,
                     app: None,

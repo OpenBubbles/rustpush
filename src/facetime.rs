@@ -542,7 +542,7 @@ impl FTClient {
                 continue
             }
             info!("Importing cached avc data");
-            session.connection.as_ref().unwrap().import_avc(active.identifier, participant.handle.clone(), &active.avc_data).await?;
+            session.connection.as_ref().unwrap().import_avc(active.identifier, &active.avc_data).await?;
         }
 
         if relay_session.state.lock().await.active_participants.is_empty() {
@@ -1495,9 +1495,7 @@ impl FTClient {
 
                     if let Some(conn) = &session.connection {
                         let p: u64 = participant.into();
-                        let handle = conn.link.state.lock().await.configuration.allocations.iter()
-                            .find(|i| i.id == p as i64).expect("Added pariticpant not allocated??").participant.clone();
-                        conn.import_avc(participant.into(), handle, avc_data.as_ref()).await?;
+                        conn.import_avc(participant.into(), avc_data.as_ref()).await?;
                     }
 
                     session.participants.insert(participant.to_string(), FTParticipant {

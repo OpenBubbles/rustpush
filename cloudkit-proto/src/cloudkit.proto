@@ -210,7 +210,7 @@ message RequestOperation {
       optional string group = 26;
       optional int32 unk1 = 29;
       optional MMCSHeaders mmcsHeaders = 30;
-      repeated string tags = 31;
+      repeated string activeThrottlingLabels = 31;
       optional string unk2 = 32; // UUID
       optional string deviceSerial = 33;
       optional int32 unk3 = 34;
@@ -586,13 +586,43 @@ message RequestOperation {
     repeated NamedHeader headers = 3;
   }
 
-  message BundledRequests {
-    repeated AssetGetResponse requests = 1;
+  message ThrottleConfig {
+    message Criteria {
+      optional string containerName = 1;
+      optional RequestOperation.Header.ContainerEnvironment containerEnvironment = 2;
+      optional Operation.Type operationType = 3;
+      optional RequestOperation.Header.Database databaseType = 4;
+      optional string zoneName = 5;
+      optional string operationGroupName = 6;
+
+      optional string invernessServiceName = 10;
+      optional string invernessFunctionName = 11;
+      optional string bundleID = 12;
+    }
+
+    message RateLimit {
+      optional int32 intervalLengthSec = 1;
+      optional int32 allowedRequestCount = 2;
+      optional int32 repeatEverySec = 3;
+      optional int64 startTimeSecondsAfterUnixEpoch = 4;
+      optional int64 startTimeSecondsAfterLocalMidnight = 5;
+    }
+
+    optional string label = 1;
+    optional Criteria criteria = 2;
+    optional RateLimit rateLimit = 3;
+    optional int32 ttlSec = 10;
+  }
+
+  message ResponseOperationHeader {
+    repeated AssetGetResponse bundled = 1;
+    repeated ThrottleConfig throttleConfigs = 2;
   }
 
   message RecordSaveRequest {
     optional Record record = 1;
     optional bool merge = 2; 
+    repeated string fieldsToDeleteIfExistOnMerge = 3;
     optional uint32 saveSemantics = 6;
     optional string zoneProtectionInfoTag = 7;
     optional string recordProtectionInfoTag = 8;
@@ -715,7 +745,7 @@ message RequestOperation {
     optional uint32 operationCost = 1;
     optional Operation response = 2;
     optional Result result = 3;
-    optional BundledRequests bundled = 4;
+    optional ResponseOperationHeader header = 4;
     optional ZoneSaveResponse zoneSaveResponse = 200;
     optional ZoneRetrieveResponse zoneRetrieveResponse = 201;
     optional ZoneDeleteResponse zoneDeleteResponse = 202;

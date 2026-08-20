@@ -467,10 +467,18 @@ pub struct SimplifiedTranscriptPoster {
 impl SimplifiedTranscriptPoster {
     pub fn parse_payload(payload: &[u8]) -> Result<Self, PushError> {
         let mut archive = ZipArchive::new(Cursor::new(&payload))?;
-        let watch: WatchBackground = read_file(&mut archive, "transcriptBackground/watchBackground")?;
+        // apple changed this to prefix a slash in later versions. This breaks compatilbity with older versions.
+        // Don't ask me questions.
+        let watch: WatchBackground = read_file(&mut archive, "/transcriptBackground/watchBackground").or_else(|_| read_file(&mut archive, "transcriptBackground/watchBackground"))?;
 
         let mut poster = vec![];
-        archive.by_name("transcriptBackground/poster")?.read_to_end(&mut poster)?;
+        let mut a = archive.by_name("/transcriptBackground/poster");
+
+        if a.is_err() {
+            drop(a);
+            a = archive.by_name("transcriptBackground/poster");
+        }
+        a?.read_to_end(&mut poster)?;
         Ok(Self {
             watch,
             poster: SimplifiedPoster::from_archive(Cursor::new(&poster))?,

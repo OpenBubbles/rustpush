@@ -212,6 +212,20 @@ struct RawProfileSharingUpdateMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+struct RawProfileRecovery {
+    #[serde(rename = "rNi")]
+    recover: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawProfileRecoveryMessage {
+    #[serde(rename = "pID")]
+    profile: RawProfileRecovery,
+    #[serde(rename = "gC")]
+    unk1: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct RawUnsendMessage {
     #[serde(rename = "emg")]
     message: String,
@@ -220,6 +234,11 @@ struct RawUnsendMessage {
     #[serde(rename = "epi")]
     part_index: u64,
     v: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RawSmsRouteQuery {
+    rc: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -446,6 +465,59 @@ struct RawIMessage {
     wallpaper_message_tag: Option<Data>,
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(untagged)]
+pub enum BalloonRawData {
+    Wire(NSData),       // Gzipped/NSData
+    Backup(Data),       // CloudKit
+}
+
+impl BalloonRawData {
+    fn compress(mut self) -> Self {
+        match &mut self {
+            Self::Wire(data) => {
+                data.data = gzip(data.data.as_ref()).unwrap().into();
+            },
+            Self::Backup(data) => { },
+        }
+        self
+    }
+
+    fn decompress(mut self) -> Self {
+        match &mut self {
+            Self::Wire(data) => {
+                data.data = ungzip(data.data.as_ref()).unwrap().into();
+            },
+            Self::Backup(data) => { },
+        }
+        self
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Wire(data) => data.data.as_ref(),
+            Self::Backup(data) => data.as_ref(),
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Wire(data) => data.data.into(),
+            Self::Backup(data) => data.into(),
+        }
+    }
+
+    fn new(data: Vec<u8>, is_backup: bool) -> Self {
+        if is_backup {
+            Self::Backup(data.into())
+        } else {
+            Self::Wire(NSData {
+                data: data.into(),
+                class: NSDataClass::NSMutableData
+            })
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -456,9 +528,9 @@ struct RawBalloonData {
     #[serde(rename = "an")]
     app_name: String,
     #[serde(rename = "ai")]
-    app_icon: Option<NSData>,
+    app_icon: Option<BalloonRawData>,
     session_identifier: Option<NSUUID>,
-    live_layout_info: Option<NSData>,
+    live_layout_info: Option<BalloonRawData>,
     #[serde(rename = "URL")]
     url: NSURL,
     appid: Option<u64>,

@@ -86,7 +86,7 @@ pub async fn prepare_cloudkit_put(file: impl Read + Send + Sync) -> Result<Prepa
 
 pub struct FetchedRecords {
     pub assets: Vec<AssetGetResponse>, 
-    responses: Vec<ResponseOperation>,
+    pub responses: Vec<ResponseOperation>,
 }
 
 impl FetchedRecords {
@@ -264,6 +264,7 @@ impl SaveRecordOperation {
             save_semantics: Some(if update.is_some() { 3 } else { 2 }),
             record_protection_info_tag: update,
             zone_protection_info_tag: key.zone_protection_tag.clone(),
+            fields_to_delete_if_exist_on_merge: vec![],
         }), tag)
     }
 
@@ -282,6 +283,7 @@ impl SaveRecordOperation {
             save_semantics: Some(if update { 3 } else { 2 }),
             record_protection_info_tag: key.and_then(|k| k.record_prot_tag.clone()),
             zone_protection_info_tag: key.and_then(|k| k.zone_protection_tag.clone()),
+            fields_to_delete_if_exist_on_merge: vec![]
         })
     }
 }
@@ -322,7 +324,7 @@ impl CloudKitOp for FetchRecordOperation {
     fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
         let mut clonedresponse = response.clone();
         FetchedRecord {
-            assets: clonedresponse.bundled.take().map(|b| b.requests).unwrap_or_default(),
+            assets: clonedresponse.header.take().map(|b| b.bundled).unwrap_or_default(),
             response: clonedresponse,
         }
     }
@@ -493,7 +495,7 @@ impl<R: CloudKitRecord> CloudKitOp for QueryRecordOperation<R> {
         output.query_retrieve_request = Some(self.0.clone());
     }
     fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
-        let extras = response.bundled.clone().map(|a| a.requests).unwrap_or_default();
+        let extras = response.header.clone().map(|a| a.bundled).unwrap_or_default();
         let retrieve = response.query_retrieve_response.clone().expect("No retrieve response??").query_results;
 
         (retrieve.into_iter().filter_map(|r| {
@@ -553,7 +555,7 @@ impl CloudKitOp for FetchRecordChangesOperation {
         output.retrieve_changes_request = Some(self.0.clone());
     }
     fn retrieve_response(response: &cloudkit_proto::ResponseOperation) -> Self::Response {
-        let extras = response.bundled.clone().map(|a| a.requests).unwrap_or_default();
+        let extras = response.header.clone().map(|a| a.bundled).unwrap_or_default();
         (extras, response.retrieve_changes_response.clone().unwrap())
     }
     fn flow_control_key() -> &'static str {
@@ -1983,22 +1985,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
                         unk1: Some(0)
                     })
                 } else { None },
-                tags: if Op::tags() { vec![
-                    "MisDenyListQueryBlockDev3".to_string(),
-                    "MisDenyListQueryBlockDev5".to_string(),
-                    "MisDenyListSyncBlockTest1".to_string(),
-                    "MisDenyListSyncBlockTest2".to_string(),
-                    "MisDenyListSyncBlockDev1".to_string(),
-                    "MisDenyListQueryBlockDev1".to_string(),
-                    "MisDenyListQueryBlockTest1".to_string(),
-                    "MisDenyListQueryBlockTest2".to_string(),
-                    "MisDenyListQueryBlockDev2".to_string(),
-                    "MisDenyListSyncBlockDev2".to_string(),
-                    "MisDenyListSyncBlockDev5".to_string(),
-                    "MisDenyListSyncBlockDev4".to_string(),
-                    "MisDenyListSyncBlockDev3".to_string(),
-                    "MisDenyListQueryBlockDev4".to_string(),
-                ] } else { vec![] },
+                active_throttling_labels: if Op::tags() { vec![] } else { vec![] },
                 unk2: if Op::is_fetch() { None } else { Some(encode_hex(&sha1(config.get_device_uuid().as_bytes()))) }, // tied to user or device, can be random
                 device_serial: if Op::is_fetch() { None } else { Some(debugmeta.serial_number) },
                 unk3: Some(0),
@@ -2054,6 +2041,11 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         for request_uuid in request_uuids {
             let op = response.iter().find(|r| r.response.as_ref().unwrap().operation_uuid() == &request_uuid).expect("Operation UUID has no response?");
             let result = op.result.as_ref().expect("No Result?");
+
+            let throttle_configs = op.header.as_ref().map(|i| &i.throttle_configs[..]).unwrap_or(&[]);
+            if !throttle_configs.is_empty() {
+                info!("Throttle configs {throttle_configs:?}");
+            }
             
             responses.push(if result.code() != cloudkit_proto::response_operation::result::Code::Success {
                 Err(PushError::CloudKitError(result.clone()))
@@ -2072,7 +2064,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     pub async fn get_assets<V: Write + Send + Sync>(&self, responses: &[AssetGetResponse], assets: Vec<(&cloudkit_proto::Asset, V)>) -> Result<(), PushError> {
         let mut requests: HashMap<&String, Vec<(&cloudkit_proto::Asset, V)>> = HashMap::new();
         for asset in assets {
-            requests.entry(asset.0.bundled_request_id.as_ref().expect("No bundled asset!")).or_default().push(asset);
+            requests.entry(asset.0.bundled_request_id.as_ref().ok_or(PushError::NoAsset)?).or_default().push(asset);
         }
         
         let mmcs_config = MMCSConfig {

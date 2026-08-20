@@ -220,4 +220,6 @@ pub enum PushError {
     SFrameWrongKeyId,
     #[error("Participant key missing!")]
     SFrameBadSignature,
+    #[error("No Asset!")]
+    NoAsset,
 }
