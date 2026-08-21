@@ -1418,6 +1418,11 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         }
     }
 
+    pub async fn clear_key_cache(&self) {
+        let mut cached_keys = self.keys.lock().await;
+        cached_keys.clear();
+    }
+
     pub async fn clear_cache_zone_encryption_config(&self, zone: &cloudkit_proto::RecordZoneIdentifier) {
         let mut cached_keys = self.keys.lock().await;
         let zone_name = zone.value.as_ref().unwrap().name().to_string();

@@ -25,9 +25,9 @@ use sha2::Sha256;
 use cloudkit_proto::RecordIdentifier;
 use tokio::sync::Mutex;
 use crate::util::DebugMutex;
-use log::info;
+use log::{info, warn};
 use uuid::Uuid;
-use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
+use crate::cloud_messages::cloudmessagesp::{ChatProto, ExtraSummaryInfo, GroupAction, GroupTitleChange, LocationShareStatusChange, MessageAction, MessageProto, MessageProto2, MessageProto3, MessageProto4, ParticipantChange};
 use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
@@ -310,9 +310,127 @@ impl CloudMessageSummary {
     }
 }
 
+
+#[derive(Debug, Clone)]
+pub enum CloudMessageType {
+    Message {
+        reaction: bool,
+        proto: MessageProto,
+        proto2: Option<MessageProto2>,
+        proto3: Option<MessageProto3>,
+        proto4: Option<MessageProto4>,
+    },
+    GroupTitleChange {
+        proto: GroupTitleChange,
+    },
+    LocationShareStatusChange {
+        proto: LocationShareStatusChange,
+    },
+    MessageAction {
+        proto: MessageAction,
+    },
+    ParticipantChange {
+        proto: ParticipantChange,
+        proto2: Option<ExtraSummaryInfo>,
+    },
+    GroupAction {
+        proto: GroupAction,
+    },
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloudMessage {
+    pub utm: Option<SystemTime>, // option for default
+    pub error: i64,
+    pub chat_id: String,
+    pub sender: String,
+    pub time: i64, // ns since apple epoch
+    pub destination_caller_id: String,
+    pub flags: MessageFlags, // unk
+    pub guid: String,
+    pub service: String,
+    pub message: CloudMessageType,
+}
+
+impl From<RemoteCloudMessage> for CloudMessage {
+    fn from(value: RemoteCloudMessage) -> Self {
+        Self {
+            message: match value.r#type {
+                1..=2 => CloudMessageType::Message { 
+                    reaction: value.r#type == 2, 
+                    proto: Message::decode(&**value.msg_proto).unwrap(), 
+                    proto2: value.msg_proto_2.map(|i| Message::decode(&**i).unwrap()), 
+                    proto3: value.msg_proto_3.map(|i| Message::decode(&**i).unwrap()), 
+                    proto4: value.msg_proto_4.map(|i| Message::decode(&**i).unwrap())
+                },
+                3 => CloudMessageType::GroupTitleChange {
+                    proto: Message::decode(&**value.msg_proto).unwrap(),
+                },
+                4 => CloudMessageType::LocationShareStatusChange { 
+                    proto: Message::decode(&**value.msg_proto).unwrap(),
+                },
+                5 => CloudMessageType::MessageAction {
+                    proto: Message::decode(&**value.msg_proto).unwrap(),
+                },
+                6 => CloudMessageType::ParticipantChange {
+                    proto: Message::decode(&**value.msg_proto).unwrap(),
+                    proto2: value.msg_proto_2.map(|i| Message::decode(&**i).unwrap()), 
+                },
+                7 => CloudMessageType::GroupAction {
+                    proto: Message::decode(&**value.msg_proto).unwrap(),
+                },
+                _ => {
+                    warn!("Got unknown cloud message {value:?}");
+                    CloudMessageType::Unknown
+                }
+            },
+            utm: value.utm,
+            error: value.error,
+            chat_id: value.chat_id,
+            sender: value.sender,
+            time: value.time,
+            destination_caller_id: value.destination_caller_id,
+            flags: value.flags,
+            guid: value.guid,
+            service: value.service,
+        }
+    }
+}
+
+impl Into<RemoteCloudMessage> for CloudMessage {
+    fn into(self) -> RemoteCloudMessage {
+        let (r#type, msg_proto, msg_proto_2, msg_proto_3, msg_proto_4) = match self.message {
+            CloudMessageType::Message { reaction, proto, proto2, proto3, proto4 } => (if reaction { 2 } else { 1 }, GZipWrapper(proto.encode_to_vec()), proto2.map(|v| GZipWrapper(v.encode_to_vec())), proto3.map(|v| GZipWrapper(v.encode_to_vec())), proto4.map(|v| GZipWrapper(v.encode_to_vec()))),
+            CloudMessageType::GroupTitleChange { proto } => (3, GZipWrapper(proto.encode_to_vec()), None, None, None),
+            CloudMessageType::LocationShareStatusChange { proto } => (4, GZipWrapper(proto.encode_to_vec()), None, None, None),
+            CloudMessageType::MessageAction { proto } => (5, GZipWrapper(proto.encode_to_vec()), None, None, None),
+            CloudMessageType::ParticipantChange { proto, proto2 } => (6, GZipWrapper(proto.encode_to_vec()), proto2.map(|v| GZipWrapper(v.encode_to_vec())), None, None),
+            CloudMessageType::GroupAction { proto } => (7, GZipWrapper(proto.encode_to_vec()), None, None, None),
+            CloudMessageType::Unknown => (0, GZipWrapper(Vec::new()), None, None, None),
+        };
+        RemoteCloudMessage {
+            r#type,
+            utm: self.utm,
+            error: self.error,
+            chat_id: self.chat_id,
+            sender: self.sender,
+            time: self.time,
+            msg_proto_2,
+            destination_caller_id: self.destination_caller_id,
+            msg_proto,
+            flags: self.flags,
+            guid: self.guid,
+            msg_proto_3,
+            service: self.service,
+            msg_proto_4,
+        }
+    }
+}
+
 #[derive(CloudKitRecord, Debug, Default, Clone)]
 #[cloudkit_record(type = "MessageEncryptedV3", encrypted)]
-pub struct CloudMessage {
+pub struct RemoteCloudMessage {
     #[cloudkit(unencrypted)]
     pub utm: Option<SystemTime>, // option for default
     #[cloudkit(rename = "msgType", unencrypted)]
@@ -324,19 +442,19 @@ pub struct CloudMessage {
     pub sender: String,
     pub time: i64, // ns since apple epoch
     #[cloudkit(rename = "msgProto2")]
-    pub msg_proto_2: Option<GZipWrapper<MessageProto2>>, // always empty afaict??
+    pub msg_proto_2: Option<GZipWrapper<Vec<u8>>>, // always empty afaict??
     #[cloudkit(rename = "dcId")]
     pub destination_caller_id: String,
     #[cloudkit(rename = "msgProto")]
-    pub msg_proto: GZipWrapper<MessageProto>,
+    pub msg_proto: GZipWrapper<Vec<u8>>,
     pub flags: MessageFlags, // unk
     pub guid: String,
     #[cloudkit(rename = "msgProto3")]
-    pub msg_proto_3: Option<GZipWrapper<MessageProto3>>,
+    pub msg_proto_3: Option<GZipWrapper<Vec<u8>>>,
     #[cloudkit(rename = "svc")]
     pub service: String,
     #[cloudkit(rename = "msgProto4")]
-    pub msg_proto_4: Option<GZipWrapper<MessageProto4>>,
+    pub msg_proto_4: Option<GZipWrapper<Vec<u8>>>,
 }
 
 impl CloudKitEncryptedValue for MessageFlags {
@@ -648,6 +766,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
 
         ], IsolationLevel::Operation).await?;
+        container.clear_key_cache().await;
         Ok(())
     }
 
@@ -664,11 +783,13 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
-        self.sync_records("messageManateeZone", continuation_token).await
+        let res: (Vec<u8>, HashMap<String, Option<RemoteCloudMessage>>, i32) = self.sync_records("messageManateeZone", continuation_token).await?;
+        Ok((res.0, res.1.into_iter().map(|i| (i.0, i.1.map(|i| i.into()))).collect(), res.2))
     }
 
     pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
-        self.save_records("messageManateeZone", messages).await
+        let records: HashMap<String, RemoteCloudMessage> = messages.into_iter().map(|i| (i.0, i.1.into())).collect();
+        self.save_records("messageManateeZone", records).await
     }
 
     pub async fn delete_messages(&self, messages: &[String]) -> Result<(), PushError> {

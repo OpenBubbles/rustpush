@@ -3,15 +3,18 @@ syntax = "proto3";
 package cloudmessagesp;
 
 message ChatProto {
-    optional uint32 unk1 = 2; // always 0
+    optional uint32 version = 1;
+    optional uint32 isRecovered = 2; // always 0
 }
 
 message MessageProto2 {
+    optional uint32 version = 1;
     optional string reply = 2;
+    optional bytes padding = 3;
 }
 
 message MessageProto {
-    uint32 unk1 = 1; // always 1, is finished or ck sync state
+    uint32 version = 1; // always 1, is finished or ck sync state
     optional string subject = 2;
     optional string text = 3;
     optional bytes attributedBody = 4;
@@ -20,10 +23,10 @@ message MessageProto {
     optional bytes messageSummaryInfo = 7;
     optional string effect = 8;
     optional uint64 dateRead = 9;
-    optional uint32 unk10 = 10; // always 0
-    optional uint32 unk11 = 11; // always 0
+    optional uint32 timePlayed = 10; // default 0
+    optional uint32 timeExpressiveSentPlayed = 11; // default 0
     optional uint64 dateDelivered = 13;
-    optional uint32 unk14 = 14; // always 0
+    optional uint32 expireState = 14; // default 0
     optional uint32 associatedMessageType = 15;
     optional string associatedMessageGuid = 16;
     optional uint32 associatedMessageRangeLocation = 17; // always 0
@@ -31,15 +34,61 @@ message MessageProto {
 }
 
 message MessageProto3 {
-    optional uint32 unk2 = 2; // always 0
-    optional uint32 unk3 = 3; // always 0 
+    optional uint32 version = 1;
+    optional uint32 cmmState = 2; // always 0 (shared with you?/cmm?)
+    optional uint32 cmmAssetOffset = 3; // always 0 
+    optional bytes padding = 4;
 }
 
 message MessageProto4 {
+    optional uint32 version = 1;
     optional string associated_message_emoji = 2;
+    optional bytes padding = 3;
     optional string service = 4;
     optional uint32 schedule_type = 5; // test is 0, unconfirmed
     optional uint32 schedule_state = 6;
     optional string groupId = 7;
     optional uint32 sent_or_received_off_grid = 8; // test is 0, uncomfirmed
+}
+
+message GroupTitleChange {
+  optional uint32 version     = 1;
+  optional string groupTitle  = 2;
+  optional string otherHandle = 3;
+  optional bytes  padding     = 4;
+}
+
+message LocationShareStatusChange {
+  optional uint32 version        = 1;
+  optional int64  shareStatus    = 2;
+  optional int64  shareDirection = 3;
+  optional string otherHandle    = 4;
+  optional bytes  padding        = 5;
+}
+
+message MessageAction {
+  optional uint32 version             = 1;
+  optional int64  messageActionType   = 2;
+  optional string otherHandle         = 3;
+  optional string originalMessageGuid = 4;
+  optional bytes  padding             = 5;
+}
+
+message ParticipantChange {
+  optional uint32 version               = 1;
+  optional int64  participantChangeType = 2;
+  optional string otherHandle           = 3;
+  optional bytes  padding               = 4;
+}
+
+message GroupAction {
+  optional uint32 version         = 1;
+  optional int64  groupActionType = 2;
+  optional string otherHandle     = 3;
+  optional bytes  padding         = 4;
+}
+
+message ExtraSummaryInfo {
+  optional bytes messageSummaryInfo = 1;
+  optional bytes padding            = 2;
 }

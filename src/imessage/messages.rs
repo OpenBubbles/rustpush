@@ -394,8 +394,8 @@ impl MessageParts {
                 let corresponding = if part.starts_with("(null)") {
                     raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
                 } else {
-                    let filename = part.split("(").next().unwrap();
-                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.as_str()) == Some(filename)).unwrap()
+                    let filename = part.split("(").next().unwrap().to_lowercase();
+                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.to_lowercase()).as_ref() == Some(&filename)).unwrap()
                 };
                 parse_data(idx, corresponding)
             }).collect())
