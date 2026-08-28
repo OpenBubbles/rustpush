@@ -1,12 +1,14 @@
 use std::{any::Any, io, sync::Arc, time::SystemTimeError};
 
 use deku::DekuError;
+use h3::error::{ConnectionError, StreamError};
 use keystore::KeystoreError;
 use omnisette::AnisetteError;
 #[cfg(feature = "macos-validation-data")]
 use open_absinthe::AbsintheError;
 use openssl::{error::ErrorStack, aes::KeyError};
 use plist::Value;
+use quinn::ConnectError;
 use thiserror::Error;
 use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Elapsed};
 
@@ -222,4 +224,12 @@ pub enum PushError {
     SFrameBadSignature,
     #[error("No Asset!")]
     NoAsset,
+    #[error("QR Connect error {0}!")]
+    QrConnectError(#[from] quinn::ConnectionError),
+    #[error("QR H3 Connect error {0}!")]
+    QrH3ConnectError(#[from] ConnectionError),
+    #[error("QR H3 Stream error {0}!")]
+    QrStreamError(#[from] StreamError),
+    #[error("RTC Error {0}!")]
+    RtcError(#[from] rtc_shared::error::Error),
 }

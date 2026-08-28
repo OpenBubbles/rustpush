@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
 use h3::client;
 use h3_quinn::Connection;
@@ -9,7 +9,7 @@ use rtc_rtcp::transport_feedbacks::transport_layer_nack::{NackPair, TransportLay
 use rtc_rtp::{Header, Packet, codec::{h264::H264Packet, h265::{H265Packet, HevcPayloader}}, header::Extension, packetizer::{Depacketizer, Payloader}};
 use rtc_srtp::{cipher::new_cipher, context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, Ipv4Addr, ServerName, UnixTime};
-use tokio::{select, sync::{Mutex, Notify, mpsc}, time::{Instant, sleep_until}};
+use tokio::{select, sync::{Mutex, Notify, mpsc}, time::{Instant, sleep, sleep_until}};
 use rtc_shared::{marshal::{Marshal, Unmarshal}, time::SystemInstant};
 use crate::{facetime::{FTWireMessage, my_conv_participant}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use std::str::FromStr;
@@ -630,6 +630,46 @@ const BITRATE_TABLE: &[usize] = &[
 ];
 const U1_CHANGE_SETTLE_TIME: Duration = Duration::from_secs(5);
 
+// U1 outgoing rate control. Borrows the shape of WebRTC's GCC -- decrease fast, increase only on
+// sustained evidence, approach a rate that already failed with caution -- but drives off loss
+// alone. GCC's delay half needs per-packet arrival timing to build a usable gradient; the only
+// delay available here is q13 in the audio report, and measured over a real call it does not
+// separate healthy from congested (see the comment at the drop_tiers decision).
+//
+/// Settle window for *decreases*. The long settle exists to stop upgrade oscillation, so applying
+/// it to drops means shipping broken video for its full duration -- a measured 32% loss sat
+/// ignored for 3.8s behind it. It is not zero because a report arriving immediately after a change
+/// still describes the previous rate, and acting on that would double-drop on one event.
+const U1_DROP_SETTLE_TIME: Duration = Duration::from_millis(1500);
+/// Expected-packet counts below which a loss *fraction* is too noisy to act on at full strength.
+/// Windows this small come from low-bitrate or low-framerate streams, where one damaged frame can
+/// read as 20-40% loss. Rungs are ~1.35x apart, so even a single-rung cut is ~26% and a three-rung
+/// cut is well over half the rate -- the bigger the response, the better the estimate behind it
+/// needs to be.
+const U1_MIN_LOSS_SAMPLE: u64 = 25;
+/// Loss deadband. Below this, loss is treated as the background rate every real link has and
+/// does not block an increase; a chronically 1% lossy wifi link would otherwise ratchet to the
+/// floor and stay there.
+const U1_LOSS_IGNORE: f64 = 0.02;
+/// Above this, loss is congestion rather than noise.
+const U1_LOSS_CONGESTED: f64 = 0.10;
+/// Consecutive clean reports required before increasing. One clean sample is not evidence: the
+/// loss signal reads zero repeatedly in the middle of a collapse, which is how the old code
+/// bumped *up* while the far end was failing to decode.
+const U1_CLEAN_STREAK: usize = 4;
+/// How long the ceiling holds before relaxing by a *single* rung, letting one probe upward.
+///
+/// Deliberately not a "forget it all at once" timeout. A flat expiry meant the ceiling lifted at
+/// the same moment the bump backoff did, and the rate walked straight back into a rung that had
+/// already failed twice. Real controllers do not work that way either: GCC keeps a continuous
+/// estimate and approaches the last overuse point with additive increase, CUBIC remembers W_max
+/// until the next loss with no timeout at all. We cannot approach gradually in bitrate -- the
+/// rungs are ~1.35x apart -- so the gradual approach is expressed in time instead.
+///
+/// The interval is wide because a failed probe is expensive here: one rung up, but potentially
+/// four rungs back down. A controller that can probe at +8% can afford to do it every few seconds.
+const U1_CEILING_PROBE_INTERVAL: Duration = Duration::from_secs(90);
+
 pub struct AVSessionState {
     pub participant_session_ids: HashMap<u64, String>,
     pub encryption_states: HashMap<u64, ParticipantEncryptionState>,
@@ -647,6 +687,10 @@ pub struct AVSessionState {
     quality_bump_failures: usize,
     active_participants: HashSet<u64>,
     current_video_bitrate: usize,
+    /// Consecutive reports with loss at or below the deadband.
+    u1_clean_streak: usize,
+    /// Rate index that most recently failed, and when it did.
+    u1_failed_rung: Option<(usize, Instant)>,
 }
 
 impl AVSessionState {
@@ -1730,6 +1774,10 @@ impl IncomingFrameHandler {
     }
     
     pub fn handle_packet(&self, recv: GlobalPacket) {
+        if recv.data.len() < 2 {
+            warn!("Packet too small!");
+            return;
+        }
         if (recv.data[0] & 0x80) == 0 {
             // not RTP/RTCP
             let _ = self.target_control.try_send(AVInternalMessage::SFrame(recv));
@@ -2465,18 +2513,21 @@ enum SendControl {
     Ack (u64, u64),
 }
 
-fn manage_control(link: Arc<GlobalLink>) -> tokio::sync::mpsc::Sender<SendControl> {
+fn manage_control(link: Weak<GlobalLink>) -> tokio::sync::mpsc::Sender<SendControl> {
     let (control_send, mut control_recv) = tokio::sync::mpsc::channel(1024);
     tokio::spawn(async move {
         let mut pending_messages: BTreeMap<Instant, PendingControlMessage> = BTreeMap::new();
-        let far_future = Instant::now() + Duration::from_secs(100 * 365 * 24 * 60 * 60);
         loop {
+            let far_future = Instant::now() + Duration::from_secs(1 * 60 * 60);
             select! {
                 recv = control_recv.recv() => {
                     let Some(i) = recv else { break };
                     match i {
                         SendControl::Send(i) => {
                             info!("Control Sending message! {i:?}");
+                            let Some(link) = link.upgrade() else {
+                                break;
+                            };
                             if let Err(e) = link.send_control(i.participant as i64, &i.data) {
                                 warn!("Control send error {e}");
                             }
@@ -2494,8 +2545,12 @@ fn manage_control(link: Arc<GlobalLink>) -> tokio::sync::mpsc::Sender<SendContro
                     }
                 },
                 _ = sleep_until(pending_messages.keys().next().copied().unwrap_or(far_future)) => {
+                    if pending_messages.is_empty() { continue };
                     let next = pending_messages.pop_first().unwrap().1;
                     info!("Control Resending message with {next:?}");
+                    let Some(link) = link.upgrade() else {
+                        break;
+                    };
                     if let Err(e) = link.send_control(next.participant as i64, &next.data) {
                         warn!("Control resend error {e}");
                     }
@@ -2943,13 +2998,15 @@ impl AVSession {
                 last_quality_bump: start_now,
                 last_quality_downgrade: start_now,
                 quality_bump_failures: 0,
+                u1_clean_streak: 0,
+                u1_failed_rung: None,
                 active_participants: HashSet::new(),
                 current_video_bitrate: BITRATE_TABLE.len() / 2,
             }),
             av_config,
             session_id: group_id,
             frame_handler: packet_handler,
-            outgoing_control: manage_control(relay_session.clone()),
+            outgoing_control: manage_control(Arc::downgrade(&relay_session)),
 
             ssrc_packet_buffer: Default::default(),
 
@@ -3113,37 +3170,46 @@ impl AVSession {
         let mut data = self.state.lock().await;
         data.video_enabled = video;
         drop(data);
-        self.send_stream_groups_state().await
+        self.send_stream_groups_state(None).await
     }
 
-    async fn send_stream_groups_state(&self) -> Result<(), PushError> {
+    async fn send_stream_groups_state(&self, to: Option<u64>) -> Result<(), PushError> {
         let data = self.state.lock().await;
         let video = data.video_enabled;
-        let mine = *data.participant_session_ids.keys().next().unwrap();
+        let participants = data.active_participants.clone();
         drop(data);
         info!("Sending stream group state!");
-        self.send_control_message(mine, VCControlData::StreamGroupState(HashMap::from_iter([
-            (136, 0),
-            (128, if video { 1 } else { 2 }),
-            (10, 0),
-            (132, 0),
-            (11, 0),
-            (129, 1),
-            (133, 0),
-            (1, if video { 1 } else { 2 }),
-            (2, 1),
-            (3, 0),
-            (134, 0),
-            (4, 0),
-            (5, if video { 1 } else { 2 }),
-            (130, 0),
-            (6, 1),
-            (135, 0),
-            (7, 0),
-            (8, 0),
-            (131, 0),
-            (9, 0),
-        ]))).await?;
+        let send = |item| {
+            self.send_control_message(item, VCControlData::StreamGroupState(HashMap::from_iter([
+                (136, 0),
+                (128, if video { 1 } else { 2 }),
+                (10, 0),
+                (132, 0),
+                (11, 0),
+                (129, 1),
+                (133, 0),
+                (1, if video { 1 } else { 2 }),
+                (2, 1),
+                (3, 0),
+                (134, 0),
+                (4, 0),
+                (5, if video { 1 } else { 2 }),
+                (130, 0),
+                (6, 1),
+                (135, 0),
+                (7, 0),
+                (8, 0),
+                (131, 0),
+                (9, 0),
+            ])))
+        };
+        if let Some(to) = to {
+            send(to).await?;
+        } else {
+            for to in participants {
+                send(to).await?;
+            }
+        }
         Ok(())
     }
 
@@ -3554,7 +3620,7 @@ impl AVSession {
     async fn handle_control(&self, recv: AVInternalMessage) -> Result<(), PushError> {
         match recv {
             AVInternalMessage::Rtcp(rtcp) => {
-                let rtcp_packet = rtc_rtcp::packet::unmarshal(&mut &rtcp.data[..]).unwrap();
+                let rtcp_packet = rtc_rtcp::packet::unmarshal(&mut &rtcp.data[..])?;
                 for packet in rtcp_packet {
                     info!("Got RTCP packet {:?} {:?}", rtcp.link, packet);
                     if let Some(nack) = packet.as_any().downcast_ref::<TransportLayerNack>() {
@@ -3618,7 +3684,7 @@ impl AVSession {
                             info!("Got control message {item:?}");
                             match item {
                                 VCControlData::FetchStreamGroupState => {
-                                    self.send_stream_groups_state().await?;
+                                    self.send_stream_groups_state(Some(id as u64)).await?;
                                 },
                                 VCControlData::OneToOneEnabledState(enabled) => {
                                     let state = self.state.lock().await;
@@ -3697,14 +3763,54 @@ impl AVSession {
                         && damaged_video_frames >= 2;
                     let loss = video_loss_fraction.unwrap_or_default();
                     let no_recent_packet_loss = video_samples != 0 && video_packets_lost == 0;
-                    let high_q13 = latest_q13 >= 2000;
+                    // The multi-rung cuts are gated on having enough packets to believe the
+                    // fraction. A 2/9 window reads as 22% loss, but the standard error at n=9 is
+                    // ~13 points -- that is one frame of noise, and it was observed cutting the
+                    // rate by three rungs. Thin windows still react, just one tier lower.
+                    let loss_confident = video_packets_expected >= U1_MIN_LOSS_SAMPLE;
+                    // Extreme loss is conclusive even in a small window, and the sample gate must
+                    // not swallow it: 13 of 16 packets lost is ~81% with a lower bound still north
+                    // of 60%, yet a flat confidence requirement produced no action at all. The
+                    // evidence needed should scale with the size of the claim, not be a fixed bar.
+                    let loss_undeniable = video_packets_lost >= 6 && loss >= 0.40;
                     let loss_drop_tiers = match loss {
-                        loss if loss >= 0.40 => 4,
-                        loss if loss >= 0.20 => 3,
-                        loss if sustained_packet_loss && loss >= 0.08 => 2,
-                        loss if sustained_packet_loss && loss > 0.0 => 1,
+                        loss if loss >= 0.40 && (loss_confident || loss_undeniable) => 4,
+                        loss if loss >= 0.20 && loss_confident => 3,
+                        // A moderate cut needs either a window big enough to trust the fraction,
+                        // or loss that actually persisted across frames. One damaged frame in a
+                        // small window reads as 15-25% loss, and because dropping the rate also
+                        // shrinks the window, that was observed walking the rate down 12 -> 10 -> 8
+                        // with each reading noisier than the last -- noise driving its own spiral.
+                        loss if loss >= U1_LOSS_CONGESTED
+                            && (loss_confident || sustained_packet_loss) => 2,
+                        // Below the congestion threshold, only loss that is actually persistent is
+                        // worth acting on -- a single damaged frame is normal on any real link.
+                        loss if sustained_packet_loss && loss > U1_LOSS_IGNORE => 1,
                         _ => 0,
                     };
+                    // Loss confined to a single frame is a burst, not sustained overload, so cap
+                    // how far it can cut. Observed repeatedly: 8/32, 6/25 and 6/30 each had one
+                    // damaged frame and each took three rungs, ~59% of the rate, off a transient.
+                    // `sustained` is a poor *gate* here because these windows hold only 2-4 frames
+                    // and it fails for lack of samples -- but it is a fine bound on magnitude. If
+                    // the burst really is congestion it persists into the next report and drops
+                    // again 1.5s later; nothing is lost but the overshoot.
+                    let loss_drop_tiers = if sustained_packet_loss || loss_undeniable {
+                        loss_drop_tiers
+                    } else {
+                        loss_drop_tiers.min(2)
+                    };
+
+                    // Delay is the early signal, and it earns its place: measured over a real call,
+                    // q13 at >=10% loss ran p90=5289 against p90=453 when loss was zero, and
+                    // `>=2000 && rising` was followed by >=10% loss within ~3s on 6 of 10
+                    // occurrences, against a 1.3% base rate. It leads the loss by about a second.
+                    //
+                    // Requiring *both* absolute elevation and a rising trend is what keeps the
+                    // absolute threshold safe on other networks: a link that simply sits at a high
+                    // one-way delay (cellular, satellite) reads high but not rising, so it does not
+                    // trip. Only a link whose delay is climbing -- a queue actually filling -- does.
+                    let high_q13 = latest_q13 >= 2000;
                     let q13_drop_tiers = if sustained_packet_loss {
                         match latest_q13 {
                             8000.. => 4,
@@ -3714,17 +3820,42 @@ impl AVSession {
                             _ => 0,
                         }
                     } else if high_q13 && q13_rising {
+                        // Early warning only, so a single rung: right about 60% of the time, which
+                        // justifies acting but not over-correcting.
                         1
                     } else {
                         0
                     };
                     let drop_tiers = loss_drop_tiers.max(q13_drop_tiers);
 
-                    let wants_upgrade = q13_sample_count >= 2
-                        && latest_q13 < 2000
-                        && !q13_rising
-                        && no_recent_packet_loss;
                     let mut state = self.state.lock().await;
+
+                    // A single clean report means nothing -- the loss signal reads zero repeatedly
+                    // mid-collapse. Only a run of them is evidence the path is actually healthy.
+                    let report_is_clean = loss <= U1_LOSS_IGNORE
+                        && video_samples != 0
+                        && !(high_q13 && q13_rising);
+                    state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
+
+                    // A rate that recently failed is not retried until the memory expires. A clean
+                    // streak was tried first and is not enough: ~10s of quiet was treated as
+                    // evidence the rate had become viable, and it climbed straight back to the rung
+                    // that had just failed and collapsed at 71% loss. Below the ceiling we climb
+                    // normally; at it we wait for the memory to age out and then probe once.
+                    let failed_rung = state.u1_failed_rung
+                        .map(|(rung, when)| {
+                            rung + (when.elapsed().as_secs() / U1_CEILING_PROBE_INTERVAL.as_secs()) as usize
+                        })
+                        .filter(|rung| *rung < BITRATE_TABLE.len());
+                    let blocked_by_ceiling = failed_rung
+                        .is_some_and(|rung| state.current_video_bitrate + 1 >= rung);
+
+                    let wants_upgrade = q13_sample_count >= 2
+                        && !high_q13
+                        && !q13_rising
+                        && no_recent_packet_loss
+                        && !blocked_by_ceiling
+                        && state.u1_clean_streak >= U1_CLEAN_STREAK;
                     if state.last_quality_bump.elapsed() > Duration::from_secs(60)
                         && state.last_quality_bump > state.last_quality_downgrade
                     {
@@ -3733,10 +3864,20 @@ impl AVSession {
                     let bump_backoff_elapsed = state.quality_bump_failures == 0
                         || state.last_quality_downgrade.elapsed().as_secs()
                             > (60 * (1u64 << state.quality_bump_failures.saturating_sub(1).min(4))).min(15 * 60);
-                    let (bucket, held_for): (isize, Option<&str>) = if state.last_stream_change.elapsed() < U1_CHANGE_SETTLE_TIME {
+                    // Decreases and increases are deliberately gated differently. The settle window
+                    // is there to stop the increase path oscillating; a decrease is a response to
+                    // damage already happening, and delaying it only prolongs the damage.
+                    let settle = state.last_stream_change.elapsed();
+                    let (bucket, held_for): (isize, Option<&str>) = if drop_tiers != 0 {
+                        if settle < U1_DROP_SETTLE_TIME {
+                            (0, Some("drop settle (report predates last change)"))
+                        } else {
+                            (-(drop_tiers as isize), None)
+                        }
+                    } else if settle < U1_CHANGE_SETTLE_TIME {
                         (0, Some("recent quality change"))
-                    } else if drop_tiers != 0 {
-                        (-(drop_tiers as isize), None)
+                    } else if blocked_by_ceiling && state.u1_clean_streak >= U1_CLEAN_STREAK {
+                        (0, Some("at recent failure ceiling"))
                     } else if wants_upgrade && !bump_backoff_elapsed {
                         (0, Some("failed quality bump backoff"))
                     } else if wants_upgrade {
@@ -3746,7 +3887,11 @@ impl AVSession {
                     };
 
                     info!(
-                        "U1 send rate bucket {bucket} held_for={held_for:?}: q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, bump_failures={}",
+                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
+                        BITRATE_TABLE[state.current_video_bitrate],
+                        state.current_video_bitrate,
+                        state.u1_clean_streak,
+                        U1_CLEAN_STREAK,
                         state.quality_bump_failures
                     );
 
@@ -3764,10 +3909,34 @@ impl AVSession {
                                     info!("U1 quality bump failed after {} secs!", state.last_quality_bump.elapsed().as_secs());
                                     state.quality_bump_failures += 1;
                                 }
+                                // Remember the rate we were *at* when it broke, not the one we are
+                                // retreating to. Climbing straight back into it is what turned
+                                // every one of these events into a repeating sawtooth.
+                                //
+                                // Within a single retreat -- several drops in a row with no bump
+                                // between -- keep the *highest* rung, so the bottom of the walk-down
+                                // is not mistaken for the ceiling. But a failure that happens after
+                                // climbing again is new information: the safe rate is lower than we
+                                // thought, so it replaces the old ceiling instead of being maxed
+                                // away. Without this, failing at 16 under a remembered ceiling of 17
+                                // leaves 16 open and simply moves the sawtooth down a rung.
+                                let climbed_since_last_failure =
+                                    state.last_quality_bump > state.last_quality_downgrade;
+                                let previous = state.u1_failed_rung
+                                    .filter(|_| !climbed_since_last_failure)
+                                    .filter(|(_, when)| when.elapsed() < U1_CEILING_PROBE_INTERVAL)
+                                    .map(|(rung, _)| rung);
+                                state.u1_failed_rung = Some((
+                                    previous.map_or(old_bitrate, |p| p.max(old_bitrate)),
+                                    Instant::now(),
+                                ));
                                 state.last_quality_downgrade = Instant::now();
                             } else {
                                 state.last_quality_bump = Instant::now();
                             }
+                            // The next few reports still describe the old rate, so they are not
+                            // evidence about the new one either way.
+                            state.u1_clean_streak = 0;
                             state.last_stream_change = Instant::now();
                             info!("Changed U1 bitrate to {}", BITRATE_TABLE[state.current_video_bitrate]);
                             self.frame_handler.stats.frame_change_time.store(self.frame_handler.stats.outgoing_send_time.load(Ordering::Relaxed), Ordering::Relaxed);

@@ -166,7 +166,7 @@ fn default_enabled() -> bool {
     true
 }
 
-#[derive(Serialize, Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FTSession {
     pub group_id: String,
     pub my_handles: Vec<String>,
@@ -177,6 +177,7 @@ pub struct FTSession {
     pub report_id: String, // this is different from group_id because we are thinking different
     pub start_time: Option<u64>, // ms since epoch
     pub last_rekey: Option<u64>, // ms since epoch
+    pub creation_time: u64,
     // WARNING: this value may not accurately represent state. It's just used as a temporary store to see if we need to prop it up
     // also represents ringing from other (our) devices
     #[serde(skip)]
@@ -188,8 +189,8 @@ pub struct FTSession {
     pub recent_member_adds: HashMap<String, u64>,
     #[serde(skip)]
     pub connection: Option<Arc<AVSession>>,
-    #[serde(skip)]
-    pub av_config: Option<AVConfig>,
+    #[serde(skip, default = "AVConfig::new")]
+    pub av_config: AVConfig,
     // this is not fully right/correct, when the initiator leaves
     // it is not reassigned to me even if it probably should be.
     // I don't think that affects any of our existing flows, but could be
@@ -197,6 +198,29 @@ pub struct FTSession {
     // than a false negative, which we avoid at this time.
     #[serde(skip)]
     pub is_initiator: bool,
+}
+
+impl Default for FTSession {
+    fn default() -> Self {
+        Self {
+            group_id: Default::default(),
+            my_handles: Default::default(),
+            participants: Default::default(),
+            link: Default::default(),
+            members: Default::default(),
+            report_id: Default::default(),
+            start_time: Default::default(),
+            last_rekey: Default::default(),
+            creation_time: duration_since_epoch().as_millis() as u64,
+            is_ringing_inaccurate: Default::default(),
+            mode: Default::default(),
+            is_video: Default::default(),
+            recent_member_adds: Default::default(),
+            connection: Default::default(),
+            av_config: AVConfig::new(),
+            is_initiator: Default::default(),
+        }
+    }
 }
 
 // time to track recently added members
@@ -444,6 +468,16 @@ pub struct FTState {
     pub sessions: HashMap<String, FTSession>,
 }
 
+impl FTState {
+    fn cleanup(&mut self) {
+        while self.sessions.len() > 1024 {
+            let session = self.sessions.iter().min_by_key(|i| 
+                    i.1.last_rekey.unwrap_or(i.1.creation_time)).unwrap().0.clone();
+            self.sessions.remove(&session);
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct FTWireMessage {
@@ -518,21 +552,17 @@ impl FTClient {
 
         session.import_allocations(&relay_session.state.lock().await.configuration);
 
-        if !session.av_config.is_some() {
-            session.av_config = Some(AVConfig::new());
-        }
-
         let interfaces = self.interfaces.read().await;
         let ifs = interfaces.as_ref().unwrap();
         relay_session.update_local_interfaces(ifs).await;
 
         session.connection = Some(AVSession::new(
             relay_session.clone(), 
-            session.av_config.clone().unwrap(), 
+            session.av_config.clone(), 
             session.group_id.clone(), 
             ctrl_channel, 
             incoming_handler,
-            &my_conv_participant(session.av_config.as_ref().unwrap(), session.is_video).encode_to_vec(),
+            &my_conv_participant(&session.av_config, session.is_video).encode_to_vec(),
             session.is_video,
         ).await?);
 
@@ -710,7 +740,7 @@ impl FTClient {
         let mut message = ConversationMessage::default();
         message.set_type(ConversationMessageType::ParticipantUpdated);
         message.conversation_group_uuid_string = session.group_id.clone();
-        message.active_participants.push(my_conv_participant(session.av_config.as_ref().expect("no avc!"), session.is_video));
+        message.active_participants.push(my_conv_participant(&session.av_config, session.is_video));
 
         self.message_session(my_handle, message, session, None).await?;
         Ok(())
@@ -730,11 +760,12 @@ impl FTClient {
             report_id: Uuid::new_v4().to_string().to_uppercase(),
             start_time: Some(since_the_epoch.as_millis() as u64),
             last_rekey: None,
+            creation_time: duration_since_epoch().as_millis() as u64,
             is_ringing_inaccurate: true,
             mode: Some(FTMode::Outgoing),
             recent_member_adds: HashMap::new(),
             connection: None,
-            av_config: Some(AVConfig::new()),
+            av_config: AVConfig::new(),
             is_initiator: true,
 
             is_video,
@@ -742,6 +773,7 @@ impl FTClient {
 
         
         let mut my_session = self.state.write().await;
+        my_session.cleanup();
         let group = session.group_id.clone();
         my_session.sessions.insert(group.clone(), session);
 
@@ -890,7 +922,7 @@ impl FTClient {
                 let mut update_context = ConversationParticipantDidJoinContext::default();
                 update_context.members = builder_session.members.iter().map(|a| a.to_conversation()).collect::<Vec<_>>();
 
-                let participant = my_conv_participant(builder_session.av_config.as_ref().expect("no avc!"), builder_session.is_video);
+                let participant = my_conv_participant(&builder_session.av_config, builder_session.is_video);
 
                 let mut message = ConversationMessage::default();
                 // ring not sending to ourselves
@@ -1381,6 +1413,7 @@ impl FTClient {
             match decoded.r#type() {
                 ConversationMessageType::LinkChanged | ConversationMessageType::LinkCreated => {
                     let mut state = self.state.write().await;
+                    state.cleanup();
                     let session = state.sessions.entry(decoded.conversation_group_uuid_string.clone()).or_default();
                     session.link = decoded.link.clone();
                     let guid = session.group_id.clone();
@@ -1451,11 +1484,9 @@ impl FTClient {
             info!("recieved {:?}", received);
             let mut received: FTWireMessage = plist::from_value(&received)?;
             let mut state = self.state.write().await;
+            state.cleanup();
             let session = state.sessions.entry(received.session.clone()).or_default();
             session.group_id = received.session.clone();
-            if !session.av_config.is_some() {
-                session.av_config = Some(AVConfig::new());
-            }
             if !session.my_handles.contains(&target) {
                 session.my_handles.push(target.clone());
             }
