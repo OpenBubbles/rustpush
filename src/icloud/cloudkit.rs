@@ -1326,7 +1326,7 @@ impl<'t> CloudKitContainer<'t> {
             .send().await?;
 
         if response.status().as_u16() == 401 {
-            client.token_provider.refresh_mme().await?;
+            client.token_provider.refresh_mme(&mut *client.token_provider.state.lock().await).await?;
         }
 
         let response: CkInitResponse = response.json().await?;
@@ -2029,7 +2029,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             .send().await?;
 
         if response.status().as_u16() == 401 {
-            self.client.token_provider.refresh_mme().await?;
+            self.client.token_provider.refresh_mme(&mut *self.client.token_provider.state.lock().await).await?;
         }
         if response.status().as_u16() == 429 {
             return Err(PushError::TooManyRequests);

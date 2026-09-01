@@ -1985,7 +1985,7 @@ impl<P: AnisetteProvider> FindMyFriendsClient<P> {
         let response = request.json(&req).send().await?;
 
         if response.status().as_u16() == 401 {
-            self.token_provider.refresh_mme().await?;
+            self.token_provider.refresh_mme(&mut *self.token_provider.state.lock().await).await?;
         }
 
         let raw_request: serde_json::Value = response.json().await?;

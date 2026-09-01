@@ -71,10 +71,25 @@ impl LoginDelegate {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct TokenProviderState {
+    mme: Option<MobileMeDelegateResponse>,
+    refreshed: SystemTime,
+}
+
+impl Default for TokenProviderState {
+    fn default() -> Self {
+        Self {
+            mme: None,
+            refreshed: SystemTime::UNIX_EPOCH,
+        }
+    }
+}
+
 pub struct TokenProvider<T: AnisetteProvider> {
     account: Arc<DebugMutex<AppleAccount<T>>>,
-    mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
-    mme_refreshed: DebugMutex<SystemTime>,
+    pub state: DebugMutex<TokenProviderState>,
+    update_state: Box<dyn Fn(&TokenProviderState) + Sync + Send>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -121,25 +136,26 @@ pub struct QuotaData {
 }
 
 impl<T: AnisetteProvider> TokenProvider<T> {
-    pub fn new(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
+    pub fn new(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>, state: TokenProviderState, update_state: Box<dyn Fn(&TokenProviderState) + Sync + Send>) -> Arc<Self> {
         Arc::new(Self {
             account,
             os_config,
-            mme_delegate: DebugMutex::new(None),
-            mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
+            state: DebugMutex::new(state),
+            update_state,
         })
     }
 
     pub async fn get_storage_info(&self) -> Result<QuotaData, PushError> {
         let token = self.get_mme_token("mmeAuthToken").await?;
 
-        let quota_url = self.mme_delegate.lock().await.as_ref().expect("no MMe?")
+        let quota_url = self.state.lock().await.mme.as_ref().expect("no MMe?")
             .config.get("com.apple.Dataclass.Quota").expect("No Quota?").as_dictionary().unwrap()
             .get("storageInfoURL").expect("no storage info url?").as_string().unwrap().to_string();
         
         let account = self.account.lock().await;
-        let dsid = account.spd.as_ref().unwrap().get("DsPrsId").expect("no dsid???s").as_unsigned_integer().unwrap().to_string();
-        let adsid = account.spd.as_ref().unwrap().get("adsid").expect("No adsid!").as_string().unwrap().to_string();
+        let a = account.persisted.as_ref().unwrap();
+        let dsid = a.dsid;
+        let adsid = a.adsid.clone();
 
         let anisette = account.anisette.clone();
         drop(account);
@@ -170,28 +186,29 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     }
 
     pub async fn get_gsa_email(&self) -> Option<String> {
-        self.account.lock().await.username.clone()
+        Some(self.account.lock().await.persisted.as_ref()?.username.clone())
     }
 
-    pub async fn refresh_mme(&self) -> Result<(), PushError> {
-        let mut mme = self.mme_delegate.lock().await;
+    pub async fn refresh_mme(&self, state: &mut TokenProviderState) -> Result<(), PushError> {
 
         self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
         let delegates = login_apple_delegates(&mut *self.account.lock().await, None, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
 
-        *mme = delegates.mobileme;
-        *self.mme_refreshed.lock().await = SystemTime::now();
+        state.mme = delegates.mobileme;
+        state.refreshed = SystemTime::now();
+        (self.update_state)(state);
 
         Ok(())
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
+        let mut state = self.state.lock().await;
         // refresh every week
-        if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
+        if state.mme.is_none() || SystemTime::now().duration_since(state.refreshed).unwrap() 
             > Duration::from_secs(60 * 60 * 24 * 7) {
-            self.refresh_mme().await?;
+            self.refresh_mme(&mut *state).await?;
         }
-        self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
+        state.mme.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
 }
 
@@ -202,7 +219,7 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(default)]
@@ -256,7 +273,7 @@ async fn build_setup_headers<T: AnisetteProvider>(account: &AppleAccount<T>, os_
     map.extend(base_headers);
 
     map.extend([
-        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.username.as_ref().unwrap().trim(), account.get_pet().expect("No pet b?"))))),
+        ("Authorization", format!("Basic {}", base64::encode(format!("{}:{}", account.persisted.as_ref().unwrap().username.trim(), account.get_pet().expect("No pet b?"))))),
         ("User-Agent", format!("iOS iPhone {} iPhone Setup Assistant", os_config.get_register_meta().software_version)),
         ("Cookie", "repairSteps=".to_string()),
         ("X-MMe-Country", "US".to_string()),
@@ -359,12 +376,11 @@ pub async fn request_update_account<T: AnisetteProvider>(account: &AppleAccount<
 
 pub async fn login_apple_delegates<T: AnisetteProvider>(account: &AppleAccount<T>, cookie: Option<&str>, os_config: &dyn OSConfig, delegates: &[LoginDelegate]) -> Result<DelegateResponses, PushError> {
     let Some(pet) = account.get_pet() else { panic!("No pet!") };
-    let Some(spd) = &account.spd else { panic!("No spd!") };
+    let Some(persist) = &account.persisted else { panic!("No spd!") };
 
-    debug!("Got spd {:?}", spd);
-    let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+    let adsid = persist.adsid.clone();
 
-    let username = account.username.as_ref().unwrap();
+    let username = persist.username.clone();
     
     // let request = AuthRequest {
     //     apple_id: username.to_string(),

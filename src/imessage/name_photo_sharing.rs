@@ -429,7 +429,7 @@ impl<P: AnisetteProvider> ProfilesClient<P> {
         Ok(())
     }
 
-    async fn get_my_record(&self) -> Result<Option<(QueryResult<IMessageRawNicknameRecord>, Vec<AssetGetResponse>)>, PushError> {
+    pub async fn get_my_record(&self) -> Result<Option<(QueryResult<IMessageRawNicknameRecord>, Vec<AssetGetResponse>)>, PushError> {
         let container = self.get_container().await?;
         let session = CloudKitSession::new();
         let (mut results, assets) = container.perform(&session, QueryRecordOperation::new(

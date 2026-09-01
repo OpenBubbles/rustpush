@@ -259,7 +259,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
             .send().await?;
         
         if resp.status().as_u16() == 401 {
-            self.token_provider.refresh_mme().await?;
+            self.token_provider.refresh_mme(&mut *self.token_provider.state.lock().await).await?;
         }
         
         let resp = resp.bytes().await?;
@@ -284,7 +284,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         }
 
         if resp.status().as_u16() == 401 {
-            self.token_provider.refresh_mme().await?;
+            self.token_provider.refresh_mme(&mut *self.token_provider.state.lock().await).await?;
         }
 
         let resp = resp.error_for_status()?.bytes().await?;

@@ -36,13 +36,13 @@ pub mod mmcsp {
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
+pub use icloud_auth::{DefaultAnisetteProvider, FetchedToken, PersistAccountData, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
 
 pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;
-pub use auth::{request_update_account, UpdateAccountFinish};
+pub use auth::{request_update_account, TokenProviderState, UpdateAccountFinish, MobileMeDelegateResponse};
 pub use mmcs::{FileContainer, prepare_put};
 pub use omnisette::AnisetteProvider;
 pub use imessage::messages::{TypingApp, SetTranscriptBackgroundMessage, UpdateProfileMessage, UpdateProfileSharingMessage, MessageInst, ShareProfileMessage, SharedPoster, ScheduleMode, PermanentDeleteMessage, OperatedChat, DeleteTarget, MoveToRecycleBinMessage, TextFormat, TextEffect, TextFlags, LinkMeta, LPLinkMetadata, LPSpecializationMetadata, ReactMessageType, ErrorMessage, Reaction, UnsendMessage, EditMessage, UpdateExtensionMessage, PartExtension, ReactMessage, ChangeParticipantMessage, LPImageMetadata, RichLinkImageAttachmentSubstitute, LPIconMetadata, AttachmentType, ExtensionApp, BalloonLayout, Balloon, ConversationData, Message, MessageType, Attachment, NormalMessage, RenameMessage, IconChangeMessage, MessageParts, MessagePart, MMCSFile, IndexedMessagePart};
