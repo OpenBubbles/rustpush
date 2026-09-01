@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::Deref, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
 use h3::client;
 use h3_quinn::Connection;
@@ -22,7 +22,7 @@ use hkdf::Hkdf;
 use uuid::Uuid;
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use prost::{Message, bytes::{Buf, BytesMut}};
+use prost::{Message, bytes::{Buf, Bytes, BytesMut}};
 use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, Payload}};
 use crate::facetime::facetimep::{ConversationInvitationPreference, ConversationLink, ConversationLinkLifetimeScope, ConversationMember, ConversationMessage, ConversationMessageType, ConversationParticipant, ConversationParticipantDidJoinContext, ConversationReport, EncryptedConversationMessage, Handle, HandleType};
 use avconferencep::{VcccMessage, VcccMessageAcknowledgment, VcCallInfoBlob, VcMediaNegotiationBlob, VcMediaNegotiationBlobAudioSettings, VcMediaNegotiationBlobBandwidthSettings, VcMediaNegotiationBlobMomentsSettings, VcMediaNegotiationBlobMultiwayAudioStream, VcMediaNegotiationBlobMultiwayVideoStream, VcMediaNegotiationBlobV2, VcMediaNegotiationBlobV2BandwidthSettings, VcMediaNegotiationBlobV2CameraSettingsU1, VcMediaNegotiationBlobV2CodecFeatures, VcMediaNegotiationBlobV2GeneralInfo, VcMediaNegotiationBlobV2MicrophoneSettingsU1, VcMediaNegotiationBlobV2MomentsSettings, VcMediaNegotiationBlobV2SettingsU1, VcMediaNegotiationBlobV2StreamGroup, VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures, VcMediaNegotiationBlobV2StreamGroupPayload, VcMediaNegotiationBlobV2StreamGroupStream, VcMediaNegotiationBlobV2VideoPayload, VcMediaNegotiationBlobVideoPayloadSettings, VcMediaNegotiationBlobVideoRuleCollection, VcMediaNegotiationBlobVideoSettings, VcMediaNegotiationFaceTimeSettings, VcccMessageWrapper};
@@ -56,6 +56,7 @@ struct StreamModifyOption {
     next: bool,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum AVSessionPayload {
     H265,
     H264,
@@ -615,6 +616,7 @@ pub struct AVSessionSSRC {
     // when importing a new AVC data.
     srtp_contexts: HashMap<u32, MultiMkiContext>,
     codec: Option<FTQualityZipper>,
+    fec_data: BTreeMap<u32, HashMap<u8, FECData>>,
 }
 
 enum SSRCState {
@@ -784,6 +786,7 @@ impl AVSessionState {
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
+                fec_data: BTreeMap::new(),
             });
         }
         map
@@ -1233,7 +1236,7 @@ impl RecvStatTracker {
         }
         let payload = AVSessionPayload::from_id(header.payload_type as u32).unwrap();
 
-       let result = if !header.extensions.is_empty() {
+        let result = if !header.extensions.is_empty() {
             let mut record_index = self.stats.records.read().unwrap();
             let stream_identifier = (ssrc.owner, ssrc.stream_index);
             if !record_index.contains_key(&stream_identifier) {
@@ -1273,7 +1276,7 @@ impl RecvStatTracker {
                     // info!("Audio data {data:?}");
                     if let Some(time) = data.current_send_timestamp {
                         self.stats.last_feedback.store(time, Ordering::Relaxed);
-                        self.stats.total_recv_count.fetch_add(1, Ordering::Relaxed);
+                        self.stats.last_feedback_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
                     }
 
                     let change_time = self.stats.frame_change_time.load(Ordering::Relaxed);
@@ -1289,6 +1292,10 @@ impl RecvStatTracker {
                 }
             }
         } else { None };
+
+        if payload.is_audio() {
+            self.stats.total_recv_count.fetch_add(1, Ordering::Relaxed);
+        }
 
         time_slice.expected_count += elapsed_packets as usize;
 
@@ -1412,6 +1419,7 @@ pub trait TimingTarget: Send + Sync {
 #[derive(Default)]
 struct IncomingFrameStats {
     last_feedback: AtomicU16,
+    last_feedback_time: AtomicU64,
     total_recv_count: AtomicU16,
     total_recv_bytes: AtomicU64,
     audio_burst_loss: AtomicU8,
@@ -1510,6 +1518,7 @@ impl IncomingFrameHandler {
                             std::mem::swap(existing, &mut ssrc);
                             existing.srtp_contexts = ssrc.srtp_contexts;
                             existing.codec = ssrc.codec;
+                            existing.fec_data = ssrc.fec_data;
                         } else {
                             ssrc_map.insert(id, ssrc);
                         }
@@ -1620,60 +1629,100 @@ impl IncomingFrameHandler {
                 };
                 let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
 
-                // info!("Result {:?}", encode_hex(&unmarshalled.payload));
+                if ssrc.fec_data.len() > 5 {
+                    ssrc.fec_data.pop_first();
+                }
 
-                let packets = match payload {
-                    AVSessionPayload::Red => {
-                        let mut segments = vec![];
-                        let mut bytes = &unmarshalled.payload[..];
-                        loop {
-                            let is_redundant = bytes[0] & 0x80 != 0;
-                            let mut header = unmarshalled.header.clone();
+                // info!("Result seq={} ts={} ssrc={} {:?}",
+                //     unmarshalled.header.sequence_number,
+                //     unmarshalled.header.timestamp,
+                //     unmarshalled.header.ssrc,
+                //     encode_hex(&unmarshalled.payload));
 
-                            if is_redundant {
-                                let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).unwrap();
-                                bytes = remaining;
+                let mut packets = vec![];
+                
+                if payload == AVSessionPayload::Red {
+                    let mut segments = vec![];
+                    let mut bytes = &unmarshalled.payload[..];
+                    loop {
+                        let is_redundant = bytes[0] & 0x80 != 0;
+                        let mut header = unmarshalled.header.clone();
 
-                                header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
-                                header.payload_type = redundant.header.payload_type;
-                                
-                                segments.push((header, redundant.block_len as usize));
-                            } else {
-                                let ((remaining, _), redundant) = RedHeader::from_bytes((bytes, 0)).unwrap();
-                                header.payload_type = redundant.payload_type;
-                                bytes = remaining;
-                                segments.push((header, 0));
-                                break;
-                            }
-                        }
-                        let mut result = vec![];
-                        for (mut header, mut len) in segments {
-                            if len == 0 {
-                                len = bytes.len();
-                            }
-                            if header.timestamp != unmarshalled.header.timestamp {
-                                let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
-                                let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
-                                let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
-                                header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
-                            }
+                        if is_redundant {
+                            let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).unwrap();
+                            bytes = remaining;
 
-                            // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
-                            result.push(Packet {
-                                header,
-                                payload: bytes[..len].to_vec().into(),
-                            });
+                            header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
+                            header.payload_type = redundant.header.payload_type;
                             
-                            bytes = &bytes[len..];
+                            segments.push((header, redundant.block_len as usize));
+                        } else {
+                            let ((remaining, _), redundant) = RedHeader::from_bytes((bytes, 0)).unwrap();
+                            header.payload_type = redundant.payload_type;
+                            bytes = remaining;
+                            segments.push((header, 0));
+                            break;
                         }
-                        result
-                    },
-                    _unk => vec![unmarshalled],
-                };
+                    }
+                    
+                    for (mut header, mut len) in segments {
+                        if len == 0 {
+                            len = bytes.len();
+                        }
+                        if header.timestamp != unmarshalled.header.timestamp {
+                            let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
+                            let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
+                            let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
+                            header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
+                        }
+
+                        // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
+                        packets.push(Packet {
+                            header,
+                            payload: bytes[..len].to_vec().into(),
+                        });
+                        
+                        bytes = &bytes[len..];
+                    }
+                } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
+                    let group = ssrc.fec_data.entry(header.timestamp).or_default()
+                        .entry(fec.group_id).or_insert_with(|| {
+                            let position = (if fec.is_data {
+                                fec.position
+                            } else {
+                                7
+                            } - fec.start_position) / fec.symbols_per_packet;
+                            let first_seq = header.sequence_number.wrapping_sub(position as u16);
+                            FECData::new(fec.symbols_per_packet, fec.start_position, first_seq)
+                        });
+                    group.ingest(fec, &unmarshalled.payload);
+                    if !fec.is_data {
+                        for missing in group.missing_idx() {
+                            let seq = group.start_seq.wrapping_add(missing);
+                            let Some(data) = group.recover(missing) else { break };
+                            packets.push(Packet {
+                                header: Header {
+                                    sequence_number: seq,
+                                    marker: fec.last_group && group.last_idx() == missing,
+                                    ..header.clone()
+                                },
+                                payload: data.into(),
+                            })
+                        }
+                    } else {
+                        packets.push(unmarshalled);
+                    }
+                } else {
+                    packets.push(unmarshalled);
+                }
 
                 for unmarshalled in packets {
                     let payload_type = unmarshalled.header.payload_type;
-                    let channel_type = ChannelType::from_payload(unmarshalled.header.payload_type);
+                    let Some(channel_type) = ChannelType::from_payload(payload_type) else {
+                        // can still happen because RED can unfold new payload types (13; Comfort Noise)
+                        warn!("No payload entry for {}", payload_type);
+                        continue
+                    };
                     if !ssrc.codec.as_ref().is_some_and(|i| i.payload_type == channel_type) {
                         ssrc.codec = Some(FTQualityZipper {
                             payload_type: channel_type,
@@ -2381,6 +2430,383 @@ impl FTVideoCameraStatus {
     }
 }
 
+const GF16_MUL: [[u8; 16]; 16] = [
+    [ 0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0],
+    [ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15],
+    [ 0,  2,  4,  6,  8, 10, 12, 14,  3,  1,  7,  5, 11,  9, 15, 13],
+    [ 0,  3,  6,  5, 12, 15, 10,  9, 11,  8, 13, 14,  7,  4,  1,  2],
+    [ 0,  4,  8, 12,  3,  7, 11, 15,  6,  2, 14, 10,  5,  1, 13,  9],
+    [ 0,  5, 10, 15,  7,  2, 13,  8, 14, 11,  4,  1,  9, 12,  3,  6],
+    [ 0,  6, 12, 10, 11, 13,  7,  1,  5,  3,  9, 15, 14,  8,  2,  4],
+    [ 0,  7, 14,  9, 15,  8,  1,  6, 13, 10,  3,  4,  2,  5, 12, 11],
+    [ 0,  8,  3, 11,  6, 14,  5, 13, 12,  4, 15,  7, 10,  2,  9,  1],
+    [ 0,  9,  1,  8,  2, 11,  3, 10,  4, 13,  5, 12,  6, 15,  7, 14],
+    [ 0, 10,  7, 13, 14,  4,  9,  3, 15,  5,  8,  2,  1, 11,  6, 12],
+    [ 0, 11,  5, 14, 10,  1, 15,  4,  7, 12,  2,  9, 13,  6,  8,  3],
+    [ 0, 12, 11,  7,  5,  9, 14,  2, 10,  6,  1, 13, 15,  3,  4,  8],
+    [ 0, 13,  9,  4,  1, 12,  8,  5,  2, 15, 11,  6,  3, 14, 10,  7],
+    [ 0, 14, 15,  1, 13,  3,  2, 12,  9,  7,  6,  8,  4, 10, 11,  5],
+    [ 0, 15, 13,  2,  9,  6,  4, 11,  1, 14, 12,  3,  8,  7,  5, 10],
+];
+
+const GF16_INV: [u8; 16] = [ 0,  1,  9, 14, 13, 11,  7,  6, 15,  2, 12,  5, 10,  4,  3,  8];
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Gf16 (u8);
+impl Gf16 {
+    #[inline]
+    fn new(x: u8) -> Self {
+        debug_assert!(x < 16);
+        Self(x)
+    }
+}
+
+impl Add for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self::Output {
+        Gf16(self.0 ^ rhs.0)
+    }
+}
+
+impl Mul for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self::Output {
+        Gf16(GF16_MUL[self.0 as usize][rhs.0 as usize])
+    }
+}
+
+impl Div for Gf16 {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self::Output {
+        self.mul(Self(GF16_INV[rhs.0 as usize]))
+    }
+}
+
+const FEC_PARITY_MATRIX: [[Gf16; 7]; 8] = [
+    [Gf16( 4), Gf16( 5), Gf16( 1), Gf16( 9), Gf16( 8), Gf16(15), Gf16(13)],
+    [Gf16( 1), Gf16( 8), Gf16( 8), Gf16(14), Gf16(11), Gf16(15), Gf16( 1)],
+    [Gf16( 4), Gf16( 4), Gf16( 9), Gf16( 1), Gf16( 6), Gf16( 4), Gf16( 2)],
+    [Gf16( 8), Gf16(14), Gf16( 6), Gf16( 8), Gf16( 2), Gf16(11), Gf16(13)],
+    [Gf16( 1), Gf16( 4), Gf16( 3), Gf16( 9), Gf16(10), Gf16( 5), Gf16( 5)],
+    [Gf16( 7), Gf16( 3), Gf16( 1), Gf16( 8), Gf16( 7), Gf16(12), Gf16( 9)],
+    [Gf16( 2), Gf16(12), Gf16(10), Gf16(12), Gf16(12), Gf16( 9), Gf16( 3)],
+    [Gf16(12), Gf16(13), Gf16(15), Gf16( 2), Gf16( 7), Gf16(14), Gf16(13)],
+];
+
+#[derive(Clone, Copy)]
+struct FECRow {
+    values: [Gf16; 15],
+    missing: u16,
+}
+
+impl FECRow {
+    fn create(start: u8, received: u16) -> Self {
+        Self {
+            values: [Default::default(); 15],
+            missing: 0x7fff & !((1u16 << start.min(8)) - 1) & !received,
+        }
+    }
+
+    fn set(&mut self, idx: usize, value: u8) {
+        self.values[idx] = Gf16::new(value);
+        self.missing &= !(1 << idx);
+    }
+
+    fn compute_parity(&mut self) {
+        let mut r = [Gf16::default(); 7];
+        for d in self.values[..8].iter().copied() {
+            let f = d + r[0];
+
+            r = [
+                r[1] + Gf16(12) * f,
+                r[2] + Gf16(13) * f,
+                r[3] + Gf16(15) * f,
+                r[4] + Gf16(2) * f,
+                r[5] + Gf16(7) * f,
+                r[6] + Gf16(14) * f,
+                       Gf16(13) * f,
+            ];
+        }
+        self.values[8..].copy_from_slice(&r);
+        self.missing &= 0xff;
+    }
+
+    fn known(&self, i: usize) -> bool {
+        (self.missing >> i) & 1 == 0
+    }
+
+    fn repair(&mut self) -> bool {
+        if self.missing & 0xff == 0 {
+            return true; // nothing erased -- the overwhelmingly common case
+        }
+        let lost: Vec<usize> = (0..8).filter(|&i| !self.known(i)).collect();
+        let eqs: Vec<usize> = (8..15).filter(|&j| self.known(j)).collect();
+        if eqs.len() < lost.len() {
+            return false;
+        }
+
+        // Augmented matrix, one row per erasure: coefficients then right-hand side.
+        let n = lost.len();
+        let mut m = [[Gf16(0); 9]; 7];
+        for (row, &j) in m.iter_mut().zip(&eqs) {
+            for (cell, &i) in row.iter_mut().zip(&lost) {
+                *cell = FEC_PARITY_MATRIX[i][j - 8];
+            }
+            row[n] = (0..8)
+                .filter(|&i| self.known(i))
+                .fold(self.values[j], |acc, i| acc + self.values[i] * FEC_PARITY_MATRIX[i][j - 8]);
+        }
+
+        for col in 0..n {
+            let pivot = (col..n).find(|&r| m[r][col].0 != 0);
+            let Some(pivot) = pivot else { return false };
+            m.swap(col, pivot);
+            let scale = m[col][col];
+            for c in col..=n {
+                m[col][c] = m[col][c] / scale;
+            }
+            for r in 0..n {
+                let f = m[r][col];
+                if r == col || f.0 == 0 {
+                    continue;
+                }
+                for c in col..=n {
+                    let t = m[col][c] * f;
+                    m[r][c] = m[r][c] + t;
+                }
+            }
+        }
+
+        for (r, &i) in lost.iter().enumerate() {
+            self.values[i] = m[r][n];
+            self.missing &= !(1 << i);
+        }
+        true
+    }
+}
+
+struct FECGroup {
+    rows: Vec<FECRow>,
+    symbols_per_packet: u8,
+    received: u16,
+}
+
+impl FECGroup {
+    fn new(symbols_per_packet: u8) -> Self {
+        Self {
+            rows: vec![],
+            symbols_per_packet,
+            received: 0
+        }
+    }
+
+    fn missing_data(&self) -> u16 {
+        if self.rows.is_empty() {
+            return 0xff
+        }
+        self.rows.last().unwrap().missing & 0xff
+    }
+
+    fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
+        let position = (header.position + if header.is_data { 0 } else { 8 }) as usize;
+        let mut nibbles = data.iter().flat_map(|&i| [i >> 4, i & 0xf]);
+
+        let row_count = (data.len() * 2 + self.symbols_per_packet as usize - 1) / 
+            self.symbols_per_packet as usize;
+
+
+        if self.rows.len() < row_count {
+            self.rows.resize(row_count, FECRow::create(header.start_position, self.received));
+        }
+
+        for row in &mut self.rows {
+            let mut idx = 0;
+            while idx < self.symbols_per_packet as usize {
+                let i = position + idx;
+                row.set(i, nibbles.next().unwrap_or_default());
+                self.received |= 1 << i;
+                idx += 1;
+            }
+        }
+    }
+
+    fn compute_parity(&mut self) {
+        for row in &mut self.rows {
+            row.compute_parity();
+        }
+    }
+
+    fn get_data(&self, start: u8) -> Vec<u8> {
+        let mut items = self.rows.iter().flat_map(|i| &i.values[start as usize..(start + self.symbols_per_packet) as usize]);
+        let mut result = Vec::with_capacity(self.rows.len() * self.symbols_per_packet as usize / 2);
+        while let Some(high) = items.next() {
+            let Some(low) = items.next() else { break };
+            result.push((high.0 << 4) | low.0);
+        }
+        result
+    }
+
+    fn recover(&mut self, start: u8) -> Option<Vec<u8>> {
+        for row in &mut self.rows {
+            if !row.repair() {
+                return None
+            }
+        }
+
+        Some(self.get_data(start))
+    }
+
+    fn validate(&self) {
+        for row in &self.rows {
+            let mut computed = *row;
+            computed.missing = 0;
+            computed.compute_parity();
+            for (idx, i) in row.values[8..].iter().enumerate() {
+                if (row.missing >> (8 + idx)) & 1 != 0 { continue }
+                assert_eq!(*i, computed.values[8 + idx]);
+            }
+        }
+    }
+}
+
+struct FECData {
+    data: FECGroup,
+    size: FECGroup,
+    start: u8,
+    start_seq: u16,
+}
+
+impl FECData {
+    fn new(symbols_per_packet: u8, start: u8, start_seq: u16) -> Self {
+        Self {
+            data: FECGroup::new(symbols_per_packet),
+            size: FECGroup::new(symbols_per_packet),
+            start,
+            start_seq,
+        }
+    }
+
+    fn last_idx(&self) -> u16 {
+        ((7 - self.start) / self.data.symbols_per_packet) as u16
+    }
+
+    fn recover(&mut self, idx: u16) -> Option<Vec<u8>> {
+        let position = self.start + idx as u8 * self.data.symbols_per_packet;
+        let mut data = self.data.recover(position)?;
+        let size = self.size.recover(position)?;
+        let size = u16::from_le_bytes(size[..2].try_into().unwrap());
+        data.resize(size as usize, 0);
+        Some(data)
+    }
+
+    fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
+        self.data.ingest(header, &data);
+        if let Some(parity) = &header.parity {
+            self.size.ingest(header, &parity.redundant_bits_for_payload_size.to_le_bytes());
+        } else {
+            self.size.ingest(header, &(data.len() as u16).to_le_bytes());
+        }
+    }
+
+    fn missing_idx(&self) -> Vec<u16> {
+        let missing = self.data.missing_data();
+        let mut result = vec![];
+        let mut start = self.start;
+        let mut idx = 0;
+        while start < 8 {
+            if missing & (1 << start) != 0 {
+                result.push(idx);
+            }
+            start += self.data.symbols_per_packet;
+            idx += 1;
+        }
+        result
+    }
+
+    fn get_parity<'t>(&'t mut self) -> impl Iterator<Item = (u8, u16, Vec<u8>)> + use<'t> {
+        self.data.compute_parity();
+        self.size.compute_parity();
+
+        (8..15)
+            .step_by(self.data.symbols_per_packet as usize)
+            .map(|row| (row - 8, 
+                    u16::from_le_bytes(self.size.get_data(row).try_into().unwrap()), 
+                    self.data.get_data(row)))
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FECParitySubheader {
+    pub redundant_bits_for_payload_size: u16,
+    pub parity_sequence_number: u16,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FECHeader {
+    pub version: u8,
+    pub symbols_per_packet: u8,
+    pub position: u8,
+    pub is_data: bool,
+    pub group_id: u8,
+    pub last_group: bool,
+    pub start_position: u8,
+    pub fec_percentage: u16,
+    pub parity: Option<FECParitySubheader>,
+}
+
+impl FECHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 4 && bytes.len() != 8 {
+            return None
+        }
+
+        let common = u32::from_be_bytes(bytes[..4].try_into().ok()?);
+        let parity = if bytes.len() == 8 {
+            Some(FECParitySubheader {
+                redundant_bits_for_payload_size: u16::from_be_bytes(bytes[4..6].try_into().ok()?),
+                parity_sequence_number: u16::from_be_bytes(bytes[6..8].try_into().ok()?),
+            })
+        } else {
+            None
+        };
+
+        Some(Self {
+            version: (common >> 30) as u8,
+            symbols_per_packet: ((common >> 27) & 0x7) as u8,
+            position: ((common >> 23) & 0xf) as u8,
+            is_data: common & 0x00400000 != 0,
+            group_id: ((common >> 15) & 0x7f) as u8,
+            last_group: common & 0x00004000 != 0,
+            start_position: ((common >> 10) & 0xf) as u8,
+            fec_percentage: (common & 0x3ff) as u16,
+            parity,
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let common = ((self.version as u32 & 0x3) << 30)
+            | ((self.symbols_per_packet as u32 & 0x7) << 27)
+            | ((self.position as u32 & 0xf) << 23)
+            | ((self.is_data as u32) << 22)
+            | ((self.group_id as u32 & 0x7f) << 15)
+            | ((self.last_group as u32) << 14)
+            | ((self.start_position as u32 & 0xf) << 10)
+            | self.fec_percentage as u32 & 0x3ff;
+        let mut result = common.to_be_bytes().to_vec();
+        if let Some(parity) = self.parity {
+            result.extend_from_slice(&parity.redundant_bits_for_payload_size.to_be_bytes());
+            result.extend_from_slice(&parity.parity_sequence_number.to_be_bytes());
+        }
+        result
+    }
+}
+
 // VCMediaControlInfoFaceTimeVideo
 #[derive(Debug, Default, Clone)]
 struct FTVideoControlData {
@@ -2390,7 +2816,7 @@ struct FTVideoControlData {
     ltr_timestamp: Option<u32>,
     total_packets_per_frame: Option<u16>,
     frame_sequence_number: Option<u16>,
-    fec_header: Option<Vec<u8>>,
+    fec_header: Option<FECHeader>,
     probe: Option<u32>,
 }
 
@@ -2411,7 +2837,8 @@ impl FTVideoControlData {
                 Some(u16::from_be_bytes(payload.drain(..2).collect::<Vec<_>>().try_into().unwrap()))
             } else { None },
             fec_header: if (profile & 0x4) != 0 {
-                Some(payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect())
+                let header = payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect::<Vec<_>>();
+                Some(FECHeader::from_bytes(&header).unwrap())
             } else { None },
             probe: if (profile & 0x8) != 0 {
                 Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
@@ -2431,11 +2858,47 @@ impl FTVideoControlData {
             self.ltr_timestamp.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
             if self.version == 2 { self.total_packets_per_frame.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default() } else { vec![] },
             if self.version == 2 { self.frame_sequence_number.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default() } else { vec![] },
-            self.fec_header.clone().unwrap_or_default(),
+            self.fec_header.as_ref().map(FECHeader::to_bytes).unwrap_or_default(),
             self.probe.map(|i| i.to_be_bytes().to_vec()).unwrap_or_default(),
         ].concat();
         (result, body)
     }
+}
+
+#[test]
+fn test_fec_header() {
+    let data = decode_hex("4bc04c64").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 1,
+        symbols_per_packet: 1,
+        position: 7,
+        is_data: true,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 100,
+        parity: None,
+    });
+    assert_eq!(header.to_bytes(), data);
+
+    let data = decode_hex("4a004c64081b02d6").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 1,
+        symbols_per_packet: 1,
+        position: 4,
+        is_data: false,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 100,
+        parity: Some(FECParitySubheader {
+            redundant_bits_for_payload_size: 0x081b,
+            parity_sequence_number: 0x02d6,
+        }),
+    });
+    assert_eq!(header.to_bytes(), data);
 }
 
 fn build_rvra1(width: u32, height: u32) -> [u8; 2] {
@@ -2570,15 +3033,17 @@ struct AVChannelHistory {
     history: VecDeque<(u16, GlobalLinkOutgoingPacket)>,
     last_frame: u16,
     last_probe: u16,
+    last_fec_seq: u16,
 }
 
 impl AVChannelHistory {
-    fn add_packet(&mut self, seq: u16, packet: GlobalLinkOutgoingPacket, frame: u16, probe: u16) {
+    fn add_packet(&mut self, seq: u16, packet: GlobalLinkOutgoingPacket, frame: u16, probe: u16, last_fec_seq: u16) {
         if let Some(back) = self.history.back() {
             assert_eq!(back.0, seq.wrapping_sub(1));
         }
         self.last_frame = frame;
         self.last_probe = probe;
+        self.last_fec_seq = last_fec_seq;
         self.history.push_back((seq, packet));
         if self.history.len() > 1000 {
             self.history.pop_front();
@@ -2620,12 +3085,31 @@ fn skip_frame_is_a_valid_annex_b_hevc_filler_nal() {
     assert_eq!(nals[0][nals[0].len() - 1], 0x80);
 }
 
+fn balanced_chunks<T>(
+    v: Vec<T>,
+    max_size: usize,
+) -> impl Iterator<Item = Vec<T>> {
+    assert!(max_size > 0);
+
+    let n = v.len();
+    let chunks = n.div_ceil(max_size);
+    let mut iter = v.into_iter();
+
+    (0..chunks).map(move |i| {
+        let remaining_chunks = chunks - i;
+        let size = iter.len().div_ceil(remaining_chunks);
+
+        iter.by_ref().take(size).collect()
+    })
+}
+
 pub struct VideoSender {
     hevc: HevcPayloader,
     context: Context,
     frame_number: u16,
     sequence_number: u16,
     probe_number: u16,
+    fec_number: u16,
     pending_desc: Option<DecoderConfiguration>,
     last_probe: Option<Instant>,
     pub ssrc: u32,
@@ -2673,31 +3157,33 @@ impl VideoSender {
             nal.splice(0..0, raw.clone());
         }
 
-        let mut payloads = self.hevc.payload(1024, &nal.into()).unwrap();
+        let mut payloads = self.hevc.payload(1024, &nal.into()).unwrap()
+            .into_iter().map(|i| (None, i)).collect::<Vec<(Option<FECHeader>, Bytes)>>();
 
         if let Some(DecoderConfiguration::ImageDescription(desc)) = &desc {
             let format = [
                 &[0x92, 0xe6, 0xc0, 0xa3][..],
                 &desc.encode()
             ].concat();
-            payloads.insert(0, format.into());
+            payloads.insert(0, (None, format.into()));
         }
 
         let time_since_last_probe = self.last_probe.map(|i| i.elapsed()).unwrap_or(Duration::from_hours(1));
         let mut probe_id = None;
-        if payloads.len() > 2 ||
+        if (payloads.len() > 2 ||
             (time_since_last_probe > Duration::from_secs(5) && payloads.len() > 1) ||
-            time_since_last_probe > Duration::from_secs(10) {
-            
+            time_since_last_probe > Duration::from_secs(10)) && self.to_participant.is_none() /* only probe in group calls */ {
+            // FEC is never done in groups, if that changes, this calculation needs to account for that.
 
             if payloads.len() < 2 {
                 // Generate Annex-B first, then pass it through the HEVC
                 // payloader. Directly placing Annex-B bytes in an RTP payload
                 // would incorrectly include the start code on the wire.
-                let target_payload_len = payloads[0].len().max(3);
+                let target_payload_len = payloads[0].1.len().max(3);
                 let mut fake_frame = vec![0; target_payload_len + 4];
                 generate_skip_frame(&mut fake_frame);
-                let fake_payloads = self.hevc.payload(1024, &fake_frame.into()).unwrap();
+                let fake_payloads = self.hevc.payload(1024, &fake_frame.into()).unwrap()
+                    .into_iter().map(|i| (None, i)).collect::<Vec<(Option<FECHeader>, Bytes)>>();
                 debug_assert_eq!(fake_payloads.len(), 1);
                 payloads.extend(fake_payloads);
                 info!("Inserting fake frame for probe!");
@@ -2710,7 +3196,7 @@ impl VideoSender {
             self.last_probe = Some(Instant::now());
         }
 
-        let payloads_len = payloads.len();
+        let mut payloads_len = payloads.len();
         let extension = FTVideoControlData {
             version: if self.to_participant.is_some() { 2 } else { 1 },
             camera_status: self.camera_source,
@@ -2720,9 +3206,79 @@ impl VideoSender {
             ..Default::default()
         };
 
-        let ext = extension.to_ext();
+        if payloads_len > 3 && self.to_participant.is_some() {
+            let symbols_per_packet: u8 = match payloads_len {
+                2 => 4,
+                3 | 4 => 2,
+                _ => 1,
+            };
+        
+            let nchunks = payloads.chunks(8 / symbols_per_packet as usize).len();
+            let payloads_copy = std::mem::take(&mut payloads);
+            for (chunk_idx, group) in balanced_chunks(payloads_copy, 8 / symbols_per_packet as usize).enumerate() {
+                let start = 8 - group.len() as u8 * symbols_per_packet;
+                let mut fec = FECData::new(symbols_per_packet, start, self.sequence_number);
+                let parity_packets: u8 = match payloads.len() {
+                    ..6 => 1,
+                    6.. => 2,
+                };
+                let group_len = group.len();
+                let last_group = chunk_idx + 1 == nchunks;
+                for (idx, mut packet) in group.into_iter().enumerate() {
+                    let header = FECHeader {
+                        version: 1,
+                        symbols_per_packet,
+                        position: start + idx as u8 * symbols_per_packet,
+                        is_data: true,
+                        group_id: chunk_idx as u8,
+                        last_group,
+                        start_position: start,
+                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
+                        parity: None,
+                    };
+
+                    fec.ingest(&header, &packet.1);
+                    packet.0 = Some(header);
+                    payloads.push(packet);
+                }
+
+                if last_group {
+                    payloads_len = payloads.len();
+                }
+                
+                for (position, size_red, data) in fec.get_parity().take(parity_packets as usize) {
+                    let header = FECHeader {
+                        version: 1,
+                        symbols_per_packet,
+                        position,
+                        is_data: false,
+                        group_id: chunk_idx as u8,
+                        last_group,
+                        start_position: start,
+                        fec_percentage: 100 * parity_packets as u16 / group_len as u16,
+                        parity: Some(FECParitySubheader {
+                            redundant_bits_for_payload_size: size_red,
+                            parity_sequence_number: self.fec_number,
+                        }),
+                    };
+
+                    self.fec_number = self.fec_number.wrapping_add(1);
+
+                    payloads.push((Some(header), data.into()));
+                }
+            }
+        }
+
         for (idx, payload) in payloads.into_iter().enumerate() {
             // info!("SEnding video payload {}", encode_hex(&payload));
+
+            let is_data = !payload.0.is_some_and(|i| !i.is_data);
+
+            let extension = FTVideoControlData {
+                fec_header: payload.0,
+                ..extension.clone()
+            };
+            let ext = extension.to_ext();
 
             let packet = Packet {
                 header: Header {
@@ -2731,7 +3287,7 @@ impl VideoSender {
                     extension: true,
                     marker: idx == payloads_len - 1,
                     payload_type: 100,
-                    sequence_number: self.sequence_number,
+                    sequence_number: self.sequence_number - if !is_data { 1 /* we already incremented, undo that. */ } else { 0 },
                     timestamp,
                     ssrc: self.ssrc,
                     csrc: vec![],
@@ -2742,7 +3298,7 @@ impl VideoSender {
                     }],
                     extensions_padding: 0,
                 },
-                payload,
+                payload: payload.1,
             };
 
             // info!("Sending header {:?}", packet.header);
@@ -2750,7 +3306,6 @@ impl VideoSender {
             let result = packet.marshal().unwrap();
 
             let encrypted = self.context.encrypt_rtp(&result).unwrap();
-            self.sequence_number = self.sequence_number.wrapping_add(1);
 
             // info!("SEnding video payload Encrypted {}", encode_hex(&encrypted));
 
@@ -2762,7 +3317,10 @@ impl VideoSender {
                 packet: encrypted,
             };
             
-            self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), self.frame_number, self.probe_number);
+            if is_data {
+                self.sequence_number = self.sequence_number.wrapping_add(1);
+                self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), self.frame_number, self.probe_number, self.fec_number);
+            }
             // if (1560u16..1561).contains(&self.sequence_number) {
             if false {
                 warn!("Dropping packet {}", self.sequence_number);
@@ -2777,6 +3335,8 @@ impl VideoSender {
         Ok(())
     }
 }
+
+const AFRC_LOG_INTERVAL_PACKETS: u16 = 50;
 
 pub struct AudioSender {
     context: Context,
@@ -2835,6 +3395,14 @@ impl AudioSender {
             let current_send = ((timestamp as u64 + 52676) * 16 / 375) as u16;
             stats.outgoing_send_time.store(current_send, Ordering::Relaxed);
 
+            let queue_sent = stats.last_feedback_time.load(Ordering::Relaxed);
+            let queue_delay = duration_since_epoch().as_millis() as u64 - queue_sent;
+            let queue_delay_1024 = if queue_sent == 0 {
+                0
+            } else {
+                (queue_delay * 128 / 125).clamp(1, u16::MAX as u64)
+            };
+
             let extension = FTAudioControlData {
                 version: 2,
                 total_kb_recv: (stats.total_recv_bytes.load(Ordering::Relaxed) / 1000) as u16,
@@ -2842,7 +3410,7 @@ impl AudioSender {
                 current_send_timestamp: Some(current_send),
                 audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
                 audio_received_packets: stats.total_recv_count.load(Ordering::Relaxed),
-                queuing_delay: Some(0),
+                queuing_delay: Some(queue_delay_1024 as u16),
                 q13_one_way_delay: Some(q13_timestamp_int),
                 video_burst_loss: Some(stats.video_burst_loss.swap(0, Ordering::Relaxed)),
                 video_packet_loss: Some(worst.0),
@@ -2853,7 +3421,9 @@ impl AudioSender {
                 ..Default::default()
             };
 
-            // info!("Sending AFRC {extension:?}");
+            if self.sequence_number % AFRC_LOG_INTERVAL_PACKETS == 0 {
+                info!("Sending AFRC {extension:?}");
+            }
             // to induce a quality slowdown
             // burst loss fine, q13_one_way_delay 3000
             // packet loss/frame size large.
@@ -2865,7 +3435,7 @@ impl AudioSender {
             //     current_send_timestamp: Some(((timestamp as u64 + 52676) * 16 / 375) as u16),
             //     audio_burst_loss: stats.audio_burst_loss.swap(0, Ordering::Relaxed),
             //     audio_received_packets: stats.total_recv_count.load(Ordering::Relaxed),
-            //     queuing_delay: Some(0),
+            //     queuing_delay: Some(1),
             //     q13_one_way_delay: Some(3000),
             //     video_burst_loss: Some(15),
             //     video_packet_loss: Some(5),
@@ -2919,7 +3489,7 @@ impl AudioSender {
             packet: encrypted,
         };
         
-        self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), 0, 0);
+        self.packet_buffer.lock().unwrap().add_packet(packet.header.sequence_number, p.clone(), 0, 0, 0);
         // if (1560u16..1562).contains(&payloader.sequence_number) {
         if false {
             warn!("Dropping packet {}", self.sequence_number);
@@ -3274,12 +3844,12 @@ impl AVSession {
 
         info!("Video send main ssrc {} extra {:?}", ssrc, extra_ssrcs);
 
-        let (sequence_number, frame_number, probe_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
+        let (sequence_number, frame_number, probe_number, fec_number) = self.ssrc_packet_buffer.lock().unwrap().get(&ssrc)
                 .and_then(|l| {
                     let lock = l.lock().unwrap();
-                    lock.history.back().map(|i| (i.0.wrapping_add(1), lock.last_frame.wrapping_add(1), lock.last_probe))
+                    lock.history.back().map(|i| (i.0.wrapping_add(1), lock.last_frame.wrapping_add(1), lock.last_probe, lock.last_fec_seq))
                 })
-                .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */));
+                .unwrap_or((1532, 990, 0 /* is this supposed to be 1? or zero? */, 0));
         
         VideoSender {
             hevc: Default::default(), 
@@ -3293,6 +3863,7 @@ impl AVSession {
             frame_number,
             sequence_number,
             probe_number,
+            fec_number,
             pending_desc: None,
 
             enabled_features: self.av_config.enabled_features.clone(),
@@ -4377,14 +4948,14 @@ pub enum ChannelType {
 }
 
 impl ChannelType {
-    fn from_payload(payload: u8) -> Self {
-        match payload {
+    fn from_payload(payload: u8) -> Option<Self> {
+        Some(match payload {
             100 => Self::H265,
             123 => Self::H264,
             104 => Self::Aac,
             108 => Self::Evs,
-            _unk => panic!("Unk ch {payload}"),
-        }
+            _unk => return None,
+        })
     }
 }
 
