@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap, HashSet, VecDeque}, fmt::Debug, net::
 
 use aes_gcm::{AeadInPlace, Aes256Gcm, Nonce, Tag, aead::Payload};
 use deku::{bitvec::BitStore, prelude::*};
-use h3::{client::{self, SendRequest}, quic::StreamId};
+use h3::{client::{self, SendRequest}, error::ConnectionError, quic::StreamId};
 use h3_quinn::Connection;
 use hkdf::{Hkdf, hmac::Hmac};
 use hkdf::hmac::Mac;
@@ -12,7 +12,7 @@ use log::{info, warn};
 use mio::{Events, Interest, Registry, Token};
 use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private, Public}, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
 use plist::Data;
-use quinn::{AsyncUdpSocket, EndpointConfig, Pod, TransportConfig, crypto::rustls::QuicClientConfig, default_runtime, udp::RecvMeta};
+use quinn::{AsyncUdpSocket, EndpointConfig, IdleTimeout, Pod, TransportConfig, crypto::rustls::QuicClientConfig, default_runtime, udp::RecvMeta};
 use rtc_media::io::sample_builder::SampleBuilder;
 use rtc_rtp::codec::h265::H265Packet;
 use rtc_shared::{TransportContext, TransportProtocol, marshal::Unmarshal};
@@ -29,6 +29,7 @@ use std::io::{Cursor, Read};
 use aes_gcm::KeyInit;
 use aes_gcm::aead::Aead;
 use sansio::Protocol;
+use backon::{ConstantBuilder, Retryable};
 use crate::{APSMessage, ids::link::qrp::{IdsqrProtoAllocBindStaleLink, IdsqrProtoMaterial, IdsqrProtoMaterialInfo, IdsqrProtoPeerPublishedStream, IdsqrProtoPutMaterialRequest, IdsqrProtoSessionInfoResponse, IdsqrProtoStatsRequest, IdsqrProtoSubscribedStream, IdsqrProtoUnAllocBindRequest, PsidsLinkHbhEncryptedPayload}, util::{BinaryReadExt, bin_deserialize, bin_serialize, decode_hex, duration_since_epoch, inflate}};
 
 use crate::{CompactECKey, DebugMutex, IdentityManager, MessageTarget, PushError, aps::get_message, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage}, link::qrp::IdsqrProtoH3Message, user::QueryOptions}, util::encode_hex};
@@ -46,8 +47,63 @@ struct LinkState {
 }
 
 struct ConnectedLink {
+    relay_addr: SocketAddr,
     quic: quinn::Connection,
     h3: SendRequest<h3_quinn::OpenStreams, rasn::prelude::OctetString>,
+}
+
+impl ConnectedLink {
+    pub async fn unalloc_bind(&mut self) -> Result<(), PushError> {
+        self.contact_qr("PUT", "UnAllocBind", &IdsqrProtoH3Message {
+            unallocbind_request: Some(IdsqrProtoUnAllocBindRequest {
+                reason: Some(1),
+                client_context_blob: None,
+            }),
+            ..Default::default()
+        }).await?;
+
+        // should connection close Application
+        // App error code 256
+        // reason "QR Disconnects"
+        Ok(())
+    }
+
+    pub async fn contact_qr(&mut self, method: &str, path: &str, message: &IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
+        let body = message.encode_to_vec();
+        
+        let txn_id: u32 = rand::random();
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("https://{}/QR/{}", self.relay_addr, path))
+            .header("version", "1.1")
+            .header("user-agent", "GFT/2.0")
+            .header("accept", "*/*")
+            .header("txn_id", txn_id.to_string())
+            .header("content-length", body.len().to_string())
+            .body(()).unwrap();
+
+        let mut stream = self.h3.send_request(req).await?;
+
+        stream.send_data(body.into()).await?;
+        stream.finish().await?;
+
+        
+        let mut total = vec![];
+        let resp = stream.recv_response().await?;
+        while let Some(mut chunk) = stream.recv_data().await? {
+            while chunk.has_remaining() {
+                let cnt = chunk.chunk().len();
+                total.extend_from_slice(chunk.chunk());
+                chunk.advance(cnt);
+            }
+        }
+
+        if !resp.status().is_success() {
+            warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
+        }
+
+        Ok(IdsqrProtoH3Message::decode(Cursor::new(total)).unwrap())
+    }
 }
 
 #[derive(Debug)]
@@ -1149,8 +1205,8 @@ impl QuickRelayAllocationsResponse {
         let qr_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from_octets(target_ip), self.relay_port));
 
         let mut transport_config = TransportConfig::default();
-        transport_config.max_idle_timeout(None);
-        transport_config.keep_alive_interval(Some(Duration::from_secs(60)));
+        transport_config.max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(35)).unwrap()));
+        transport_config.keep_alive_interval(Some(Duration::from_secs(15)));
 
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
@@ -1165,6 +1221,7 @@ impl QuickRelayAllocationsResponse {
         let (driver, send_request) = client::new(h3_conn).await?;
 
         Ok((driver, ConnectedLink {
+            relay_addr: qr_addr,
             quic: conn,
             h3: send_request
         }))
@@ -2316,12 +2373,13 @@ pub enum GlobalLinkChange {
     NewMaterial(IdsqrProtoMaterial),
     RequestedStreams(Vec<u32>),
     ActiveParticipants(Vec<u64>),
+    LinkFailed,
 }
 
 pub struct GlobalLink {
     pub session_id: Vec<u8>,
     pub relay_addr: SocketAddr,
-    connected: DebugMutex<ConnectedLink>,
+    connected: Arc<DebugMutex<ConnectedLink>>,
     pub identity: IdentityManager,
     pub handle: String,
     pub state: Arc<DebugMutex<GlobalLinkState>>,
@@ -2349,6 +2407,7 @@ pub struct GlobalLink {
 impl Drop for GlobalLink {
     fn drop(&mut self) {
         self.relay_split.messenger.send(MultiplexMessage::Finish);
+        info!("CLEANUP: LINK DROP");
     }
 }
 
@@ -2398,41 +2457,8 @@ impl GlobalLink {
         Ok(data.payload.into())
     }
 
-    pub async fn contact_qr(&self, method: &str, path: &str, message: IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
-        let body = message.encode_to_vec();
-        
-        let txn_id: u32 = rand::random();
-        let req = Request::builder()
-            .method(method)
-            .uri(format!("https://{}/QR/{}", self.relay_addr, path))
-            .header("version", "1.1")
-            .header("user-agent", "GFT/2.0")
-            .header("accept", "*/*")
-            .header("txn_id", txn_id.to_string())
-            .header("content-length", body.len().to_string())
-            .body(()).unwrap();
-
-        let mut stream = self.connected.lock().await.h3.send_request(req).await?;
-
-        stream.send_data(body.into()).await?;
-        stream.finish().await?;
-
-        
-        let mut total = vec![];
-        let resp = stream.recv_response().await?;
-        while let Some(mut chunk) = stream.recv_data().await? {
-            while chunk.has_remaining() {
-                let cnt = chunk.chunk().len();
-                total.extend_from_slice(chunk.chunk());
-                chunk.advance(cnt);
-            }
-        }
-
-        if !resp.status().is_success() {
-            warn!("QR request failed with status {} {}", resp.status().as_u16(), encode_hex(&total));
-        }
-
-        Ok(IdsqrProtoH3Message::decode(Cursor::new(total)).unwrap())
+    pub async fn contact_qr(&self, method: &str, path: &str, message: &IdsqrProtoH3Message) -> Result<IdsqrProtoH3Message, PushError> {
+        self.connected.lock().await.contact_qr(method, path, message).await
     }
 
     async fn handle_ids(&self, packet: GlobalPacket, ids: LinkMessage) -> Result<(), PushError> {
@@ -2557,7 +2583,7 @@ impl GlobalLink {
                 ..Default::default()
             };
 
-            self.contact_qr("PUT", "Material", body).await?;
+            self.contact_qr("PUT", "Material", &body).await?;
         }
 
         Ok(())
@@ -2643,7 +2669,7 @@ impl GlobalLink {
         info!("Got versions change {new_version}!");
         let mut state = self.state.lock().await;
         state.session_request_id += 1;
-        let resp = self.contact_qr("PUT", "SessionInfo", IdsqrProtoH3Message {
+        let resp = self.contact_qr("PUT", "SessionInfo", &IdsqrProtoH3Message {
             sessioninfo_request: Some(qrp::IdsqrProtoSessionInfoRequest {
                 request_id: Some(state.session_request_id),
                 ..Default::default()
@@ -2661,7 +2687,7 @@ impl GlobalLink {
         let mut state = self.state.lock().await;
         state.session_request_id += 1;
         info!("Link subscribing to streams {:?}", state.subscribed_streams);
-        let resp = self.contact_qr("PUT", "SessionInfo", IdsqrProtoH3Message {
+        let resp = self.contact_qr("PUT", "SessionInfo", &IdsqrProtoH3Message {
             sessioninfo_request: Some(qrp::IdsqrProtoSessionInfoRequest {
                 request_id: Some(state.session_request_id),
                 generation_counter: Some(state.session_generation),
@@ -2873,7 +2899,7 @@ impl GlobalLink {
     }
 
     async fn send_stats(&self) -> Result<(), PushError> {
-        let response = self.contact_qr("PUT", "Stats", IdsqrProtoH3Message {
+        let response = self.contact_qr("PUT", "Stats", &IdsqrProtoH3Message {
             stats_request: Some(IdsqrProtoStatsRequest {
                 client_timestamp_ntp: Some(get_ntp_short_ts()),
                 // we are theoretically supposed to set this but I really can't be bothered
@@ -2889,18 +2915,13 @@ impl GlobalLink {
     }
 
     pub async fn unalloc_bind(&self) -> Result<(), PushError> {
-        self.contact_qr("PUT", "UnAllocBind", IdsqrProtoH3Message {
-            unallocbind_request: Some(IdsqrProtoUnAllocBindRequest {
-                reason: Some(1),
-                client_context_blob: None,
-            }),
-            ..Default::default()
-        }).await?;
-
-        // should connection close Application
-        // App error code 256
-        // reason "QR Disconnects"
-
+        let link = self.connected.clone();
+        tokio::spawn(async move {
+            if let Err(e) = link.lock().await.unalloc_bind().await {
+                warn!("Failed to unbind! {e}");
+            }
+            warn!("Done unbinding!");
+        });
         Ok(())
     }
 
@@ -2952,6 +2973,7 @@ impl GlobalLink {
                 warn!("Got connection error, re-establishing link");
                 if let Err(e) = self.alloc_bind().await {
                     warn!("Failed to re-connect link {e}!");
+                    let _ = self.state_send.try_send(GlobalLinkChange::LinkFailed);
                 }
             },
             _ => {}
@@ -3040,7 +3062,7 @@ impl GlobalLink {
             ..Default::default()
         };
 
-        let resp = self.contact_qr("PUT", "AllocBind", body).await?;
+        let resp = self.contact_qr("PUT", "AllocBind", &body).await?;
 
         let r2 = resp.allocbind_response.unwrap();
 
@@ -3218,7 +3240,7 @@ impl GlobalLink {
             session_id: response.session_id.clone().into(),
             my_id: response.id,
             relay_addr: qr_addr,
-            connected: DebugMutex::new(connected),
+            connected: Arc::new(DebugMutex::new(connected)),
             identity: identity_manager,
             handle: handle.to_string(),
             state: Arc::new(DebugMutex::new(GlobalLinkState {
@@ -3279,29 +3301,38 @@ impl GlobalLink {
 
         let keepalive = Arc::downgrade(&me);
         tokio::spawn(async move {
+            let mut task = tokio::spawn(async move { connection.wait_idle().await });
             loop {
-                let e = connection.wait_idle().await;
+                let e = task.await.unwrap();
                 info!("H3 connection error: {e}");
                 let Some(upgrade) = keepalive.upgrade() else { break };
+                if matches!(e, ConnectionError::Timeout) {
+                    let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                    break;
+                }
                 upgrade.link_is_up.store(false, Ordering::Relaxed);
                 *upgrade.avc_pod.write().unwrap() = None;
                 info!("Reconnecting link!");
                 let mut sending_states = upgrade.participant_states.read().unwrap().clone();
-                let (c, connected) = match upgrade.state.lock().await.configuration.connect(
+                let (mut c, connected) = match upgrade.state.lock().await.configuration.connect(
                     &mut sending_states, 
                     upgrade.relay_split.clone(), 
                     upgrade.link_state.clone()
                 ).await {
                     Ok(i) => i,
                     Err(e) => {
-                        panic!("TODO it didn't work {e}");
+                        warn!("Reconnecting didn't work {e}");
+                        let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                        break;
                     }
                 };
                 *upgrade.participant_states.write().unwrap() = sending_states;
                 *upgrade.connected.lock().await = connected;
-                connection = c;
+                task = tokio::spawn(async move { c.wait_idle().await });
                 if let Err(e) = upgrade.alloc_bind().await {
                     warn!("Failed to re-connect link {e}!");
+                    let _ = upgrade.state_send.try_send(GlobalLinkChange::LinkFailed);
+                    break;
                 }
             }
             info!("LINK CLEANUP: H3 exit");

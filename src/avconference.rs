@@ -3523,6 +3523,7 @@ pub enum AVControlCommand {
     },
     SelectVideoBitrate(usize),
     ActiveParticipants(HashSet<u64>),
+    CallFailed,
 }
 
 pub struct AVSession {
@@ -3690,6 +3691,9 @@ impl AVSession {
                                 warn!("Initiated U1 True failed {e}");
                             }
                         }
+                    },
+                    GlobalLinkChange::LinkFailed => {
+                        session.call_failed().await;
                     }
                 }
             }
@@ -3914,8 +3918,17 @@ impl AVSession {
                 }
             }
         }
-        self.link.update_subscribed_streams().await?;
+        if let Err(e) = self.link.update_subscribed_streams().await {
+            warn!("Failed to update subscribed streams {e}!");
+            self.call_failed().await;
+            return Err(e);
+        }
         Ok(())
+    }
+
+    async fn call_failed(&self) {
+        // WARNING: no guarantee any lock will be free at this point
+        let _ = self.control_sender.try_send(AVControlCommand::CallFailed);
     }
 
     pub fn register_timing_target(&self, participant: u64, timing_target: Arc<dyn TimingTarget>) {
@@ -4053,7 +4066,11 @@ impl AVSession {
         let mut state = self.state.lock().await;
         let participant = state.encryption_states.entry(owner_id).or_default();
         participant.prekey = Some(item);
-        state.ensure_keys(owner_id, self).await?;
+        if let Err(e) = state.ensure_keys(owner_id, self).await {
+            warn!("Failed to handle prekey; failing connection! {e}");
+            self.call_failed().await;
+            return Err(e)
+        }
 
         Ok(())
     }
