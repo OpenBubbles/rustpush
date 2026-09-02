@@ -14,7 +14,7 @@ use rtc_shared::{marshal::{Marshal, Unmarshal}, time::SystemInstant};
 use crate::{facetime::{FTWireMessage, my_conv_participant}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use std::str::FromStr;
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
-use log::{debug, info, warn};
+use log::{debug, info, warn, error};
 use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha1, sign::Signer, symm::{Cipher, Crypter, Mode, decrypt, encrypt}};
 use sha2::Sha256;
 use aes_gcm::KeyInit;
@@ -1492,311 +1492,323 @@ impl IncomingFrameHandler {
         let mut counter: u32 = 0;
         let mut stat_tracker = RecvStatTracker::new(stats.clone(), audio);
         while let Ok(command) = channel.recv() {
-            let packets = match command {
-                IncomingFrameCommand::Packet(header, packet) => vec![(header, packet)],
-                IncomingFrameCommand::Keys(keys) => {
-                    let mut packets_process = vec![];
-                    for (id, mut ssrc) in keys {
-                        // Waiting for config
-                        for key in ssrc.mkms.iter().map(|i| {
-                            let mki: [u8; 2] = i.mki[..2].try_into().unwrap();
-                            Some(mki)
-                        }).chain(std::iter::once(None)) {
-                            if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((id, key), SSRCState::Valid) {
-                                packets_process.extend(item);
-                            }
-                            master_ssrc_map.insert(id, (id, false));
-                            for ssrc in &ssrc.group_ssrcs {
-                                master_ssrc_map.insert(*ssrc, (id, true));
-                                if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((*ssrc, key), SSRCState::Valid) {
+            if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let packets = match command {
+                    IncomingFrameCommand::Packet(header, packet) => vec![(header, packet)],
+                    IncomingFrameCommand::Keys(keys) => {
+                        let mut packets_process = vec![];
+                        for (id, mut ssrc) in keys {
+                            // Waiting for config
+                            for key in ssrc.mkms.iter().map(|i| {
+                                let mki: [u8; 2] = i.mki[..2].try_into().unwrap();
+                                Some(mki)
+                            }).chain(std::iter::once(None)) {
+                                if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((id, key), SSRCState::Valid) {
                                     packets_process.extend(item);
                                 }
+                                master_ssrc_map.insert(id, (id, false));
+                                for ssrc in &ssrc.group_ssrcs {
+                                    master_ssrc_map.insert(*ssrc, (id, true));
+                                    if let Some(SSRCState::Waiting(item, _)) = ssrc_state.insert((*ssrc, key), SSRCState::Valid) {
+                                        packets_process.extend(item);
+                                    }
+                                }
+                            }
+
+                            if let Some(existing) = ssrc_map.get_mut(&id) {
+                                std::mem::swap(existing, &mut ssrc);
+                                existing.srtp_contexts = ssrc.srtp_contexts;
+                                existing.codec = ssrc.codec;
+                                existing.fec_data = ssrc.fec_data;
+                            } else {
+                                ssrc_map.insert(id, ssrc);
+                            }
+                        }
+                        warn!("Got avc, replaying {} packets", packets_process.len());
+                        packets_process
+                    }
+                };
+                counter = counter.wrapping_add(1);
+                if counter % 100 == 0 {
+                    info!("Media probe state {:?}", stat_tracker.probe_states);
+                }
+                for (header, recv) in packets {
+                    let Some(payload) = AVSessionPayload::from_id(header.payload_type as u32) else {
+                        warn!("No payload entry for {}", header.payload_type);
+                        continue
+                    };
+                    let Some(participant) = recv.participant else {
+                        warn!("No participant; dropping entry!!");
+                        continue
+                    };
+
+                    let ssrc = master_ssrc_map.get(&header.ssrc);
+                    let mki: Option<[u8; 2]> = if let Some(&(_ssrc, is_group)) = ssrc {
+                        Some(if is_group {
+                            recv.data[recv.data.len() - 6..recv.data.len() - 6 + 2].try_into().unwrap()
+                        } else {
+                            let hmac_len = payload.tag_len();
+                            if header.sequence_number & 0x7f == 0 {
+                                recv.data[recv.data.len() - hmac_len - 6..recv.data.len() - hmac_len - 6 + 2].try_into().unwrap()
+                            } else {
+                                recv.data[recv.data.len() - hmac_len - 2..recv.data.len() - hmac_len - 2 + 2].try_into().unwrap()
+                            }
+                        })
+                    } else { None };
+
+                    let (ssrc, is_group, mki) = match ssrc_state.entry((header.ssrc, mki)).or_insert_with(|| SSRCState::Waiting(vec![], SystemTime::now() + Duration::from_secs(5))) {
+                        SSRCState::Dead => {
+                            warn!("Dropping dead ssrc {}!!, MKI {:?}", header.ssrc, mki);
+                            continue
+                        },
+                        SSRCState::Waiting(w, exp) => {
+                            if exp.elapsed().is_ok() {
+                                // we're dead
+                                ssrc_state.insert((header.ssrc, mki), SSRCState::Dead);
+                                continue
+                            }
+                            warn!("Waiting for SSRC {}, MKI {:?}", header.ssrc, mki);
+                            w.push((header, recv));
+                            continue
+                        },
+                        SSRCState::Valid => (ssrc_map.get_mut(&ssrc.unwrap().0).unwrap(), ssrc.unwrap().1, mki.unwrap()),
+                    };
+
+                    // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
+                    let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
+                        let jump = header.sequence_number.wrapping_sub(*prev_seq);
+                        if jump > 1 && jump < 256 {
+                            // we dropped packets
+                            let nack: BytesMut = TransportLayerNack {
+                                sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
+                                media_ssrc: header.ssrc,
+                                nacks: range_to_pair(*prev_seq + 1, jump - 1)
+                            }.marshal().unwrap();
+                            warn!("Sending NACK for {} packets at {}, idx {:?} {}", jump - 1, *prev_seq + 1, header, encode_hex(&recv.data));
+                            if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
+                                warn!("Failed to queue nack {e}");
                             }
                         }
 
-                        if let Some(existing) = ssrc_map.get_mut(&id) {
-                            std::mem::swap(existing, &mut ssrc);
-                            existing.srtp_contexts = ssrc.srtp_contexts;
-                            existing.codec = ssrc.codec;
-                            existing.fec_data = ssrc.fec_data;
-                        } else {
-                            ssrc_map.insert(id, ssrc);
+                        if jump > 1 && jump < 1500 {
+                            if audio {
+                                stats.audio_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                            } else {
+                                stats.video_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
+                            }
                         }
-                    }
-                    warn!("Got avc, replaying {} packets", packets_process.len());
-                    packets_process
-                }
-            };
-            counter = counter.wrapping_add(1);
-            if counter % 100 == 0 {
-                info!("Media probe state {:?}", stat_tracker.probe_states);
-            }
-            for (header, recv) in packets {
-                let Some(payload) = AVSessionPayload::from_id(header.payload_type as u32) else {
-                    warn!("No payload entry for {}", header.payload_type);
-                    continue
-                };
-                let Some(participant) = recv.participant else {
-                    warn!("No participant; dropping entry!!");
-                    continue
-                };
 
-                let ssrc = master_ssrc_map.get(&header.ssrc);
-                let mki: Option<[u8; 2]> = if let Some(&(_ssrc, is_group)) = ssrc {
-                    Some(if is_group {
-                        recv.data[recv.data.len() - 6..recv.data.len() - 6 + 2].try_into().unwrap()
+                        if jump < 1500 { // larger than this we presume it is sending packets in the past (wrapped around)
+                            *prev_seq = header.sequence_number;
+                            jump
+                        } else { 0 /* backwards; don't count */ }
                     } else {
-                        let hmac_len = payload.tag_len();
-                        if header.sequence_number & 0x7f == 0 {
-                            recv.data[recv.data.len() - hmac_len - 6..recv.data.len() - hmac_len - 6 + 2].try_into().unwrap()
-                        } else {
-                            recv.data[recv.data.len() - hmac_len - 2..recv.data.len() - hmac_len - 2 + 2].try_into().unwrap()
-                        }
-                    })
-                } else { None };
+                        ssrc_seq.insert(header.ssrc, header.sequence_number);
+                        1
+                    };
 
-                let (ssrc, is_group, mki) = match ssrc_state.entry((header.ssrc, mki)).or_insert_with(|| SSRCState::Waiting(vec![], SystemTime::now() + Duration::from_secs(5))) {
-                    SSRCState::Dead => {
-                        warn!("Dropping dead ssrc {}!!, MKI {:?}", header.ssrc, mki);
-                        continue
-                    },
-                    SSRCState::Waiting(w, exp) => {
-                        if exp.elapsed().is_ok() {
-                            // we're dead
-                            ssrc_state.insert((header.ssrc, mki), SSRCState::Dead);
+                    
+                    let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
+                    
+                    let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
+                        let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
+                        let key = mkm.get_key(header.ssrc);
+
+                        new_cipher(
+                            &key[..16], 
+                            &key[16..], 
+                            if is_group { ProtectionProfile::Aes128CmMkiNoAuth } else { payload.profile() }
+                        ).unwrap()
+                    });
+
+                    let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            info!("Error {e} {}", encode_hex(&recv.data));
                             continue
                         }
-                        warn!("Waiting for SSRC {}, MKI {:?}", header.ssrc, mki);
-                        w.push((header, recv));
-                        continue
-                    },
-                    SSRCState::Valid => (ssrc_map.get_mut(&ssrc.unwrap().0).unwrap(), ssrc.unwrap().1, mki.unwrap()),
-                };
+                    };
+                    let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
 
-                // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
-                let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
-                    let jump = header.sequence_number.wrapping_sub(*prev_seq);
-                    if jump > 1 && jump < 256 {
-                        // we dropped packets
-                        let nack: BytesMut = TransportLayerNack {
-                            sender_ssrc: *rtcp_sender.entry(header.ssrc).or_insert_with(|| rand::random()),
-                            media_ssrc: header.ssrc,
-                            nacks: range_to_pair(*prev_seq + 1, jump - 1)
-                        }.marshal().unwrap();
-                        warn!("Sending NACK for {} packets at {}, idx {:?} {}", jump - 1, *prev_seq + 1, header, encode_hex(&recv.data));
-                        if let Err(e) = control.try_send(AVInternalMessage::RtcpOutgoing(participant, nack)) {
-                            warn!("Failed to queue nack {e}");
-                        }
+                    if ssrc.fec_data.len() > 5 {
+                        ssrc.fec_data.pop_first();
                     }
 
-                    if jump > 1 && jump < 1500 {
-                        if audio {
-                            stats.audio_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
-                        } else {
-                            stats.video_burst_loss.fetch_max((jump as u8 - 1).min(15), Ordering::Relaxed);
-                        }
-                    }
+                    // info!("Result seq={} ts={} ssrc={} {:?}",
+                    //     unmarshalled.header.sequence_number,
+                    //     unmarshalled.header.timestamp,
+                    //     unmarshalled.header.ssrc,
+                    //     encode_hex(&unmarshalled.payload));
 
-                    if jump < 1500 { // larger than this we presume it is sending packets in the past (wrapped around)
-                        *prev_seq = header.sequence_number;
-                        jump
-                    } else { 0 /* backwards; don't count */ }
-                } else {
-                    ssrc_seq.insert(header.ssrc, header.sequence_number);
-                    1
-                };
-
-                
-                let video_meta = stat_tracker.track(&recv, &header, tracked_packets, &control, &ssrc);
-                
-                let context = ssrc.srtp_contexts.entry(header.ssrc).or_default().get_context_for_mki(mki, || {
-                    let mkm = ssrc.mkms.iter().find(|i| &i.mki[..mki.len()] == mki).unwrap();
-                    let key = mkm.get_key(header.ssrc);
-
-                    new_cipher(
-                        &key[..16], 
-                        &key[16..], 
-                        if is_group { ProtectionProfile::Aes128CmMkiNoAuth } else { payload.profile() }
-                    ).unwrap()
-                });
-
-                let mut result = match context.decrypt_rtp_with_header(&recv.data, &header) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        info!("Error {e} {}", encode_hex(&recv.data));
-                        continue
-                    }
-                };
-                let unmarshalled = rtc_rtp::Packet::unmarshal(&mut result).unwrap();
-
-                if ssrc.fec_data.len() > 5 {
-                    ssrc.fec_data.pop_first();
-                }
-
-                // info!("Result seq={} ts={} ssrc={} {:?}",
-                //     unmarshalled.header.sequence_number,
-                //     unmarshalled.header.timestamp,
-                //     unmarshalled.header.ssrc,
-                //     encode_hex(&unmarshalled.payload));
-
-                let mut packets = vec![];
-                
-                if payload == AVSessionPayload::Red {
-                    let mut segments = vec![];
-                    let mut bytes = &unmarshalled.payload[..];
-                    loop {
-                        let is_redundant = bytes[0] & 0x80 != 0;
-                        let mut header = unmarshalled.header.clone();
-
-                        if is_redundant {
-                            let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).unwrap();
-                            bytes = remaining;
-
-                            header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
-                            header.payload_type = redundant.header.payload_type;
-                            
-                            segments.push((header, redundant.block_len as usize));
-                        } else {
-                            let ((remaining, _), redundant) = RedHeader::from_bytes((bytes, 0)).unwrap();
-                            header.payload_type = redundant.payload_type;
-                            bytes = remaining;
-                            segments.push((header, 0));
-                            break;
-                        }
-                    }
+                    let mut packets = vec![];
                     
-                    for (mut header, mut len) in segments {
-                        if len == 0 {
-                            len = bytes.len();
-                        }
-                        if header.timestamp != unmarshalled.header.timestamp {
-                            let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
-                            let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
-                            let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
-                            header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
-                        }
+                    if payload == AVSessionPayload::Red {
+                        let mut segments = vec![];
+                        let mut bytes = &unmarshalled.payload[..];
+                        loop {
+                            let is_redundant = bytes[0] & 0x80 != 0;
+                            let mut header = unmarshalled.header.clone();
 
-                        // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
-                        packets.push(Packet {
-                            header,
-                            payload: bytes[..len].to_vec().into(),
-                        });
-                        
-                        bytes = &bytes[len..];
-                    }
-                } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
-                    let group = ssrc.fec_data.entry(header.timestamp).or_default()
-                        .entry(fec.group_id).or_insert_with(|| {
-                            let position = (if fec.is_data {
-                                fec.position
+                            if is_redundant {
+                                let ((remaining, _), redundant) = RedRedundantHeader::from_bytes((bytes, 0)).unwrap();
+                                bytes = remaining;
+
+                                header.timestamp = header.timestamp.wrapping_sub(redundant.timestamp_offset as u32);
+                                header.payload_type = redundant.header.payload_type;
+                                
+                                segments.push((header, redundant.block_len as usize));
                             } else {
-                                7
-                            } - fec.start_position) / fec.symbols_per_packet;
-                            let first_seq = header.sequence_number.wrapping_sub(position as u16);
-                            FECData::new(fec.symbols_per_packet, fec.start_position, first_seq)
-                        });
-                    group.ingest(fec, &unmarshalled.payload);
-                    if !fec.is_data {
-                        for missing in group.missing_idx() {
-                            let seq = group.start_seq.wrapping_add(missing);
-                            let Some(data) = group.recover(missing) else { break };
+                                let ((remaining, _), redundant) = RedHeader::from_bytes((bytes, 0)).unwrap();
+                                header.payload_type = redundant.payload_type;
+                                bytes = remaining;
+                                segments.push((header, 0));
+                                break;
+                            }
+                        }
+                        
+                        for (mut header, mut len) in segments {
+                            if len == 0 {
+                                len = bytes.len();
+                            }
+                            if header.timestamp != unmarshalled.header.timestamp {
+                                let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
+                                let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
+                                let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
+                                header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
+                            }
+
+                            // info!("Header RED {:?} {}", header, encode_hex(&bytes[..len]));
                             packets.push(Packet {
-                                header: Header {
-                                    sequence_number: seq,
-                                    marker: fec.last_group && group.last_idx() == missing,
-                                    ..header.clone()
-                                },
-                                payload: data.into(),
-                            })
+                                header,
+                                payload: bytes[..len].to_vec().into(),
+                            });
+                            
+                            bytes = &bytes[len..];
+                        }
+                    } else if let Some(fec) = video_meta.as_ref().and_then(|v| v.fec_header.as_ref()) {
+                        let group = ssrc.fec_data.entry(header.timestamp).or_default()
+                            .entry(fec.group_id).or_insert_with(|| {
+                                let position = (if fec.is_data {
+                                    fec.position
+                                } else {
+                                    7
+                                } - fec.start_position) / fec.symbols_per_packet;
+                                let first_seq = header.sequence_number.wrapping_sub(position as u16);
+                                FECData::new(fec.symbols_per_packet, fec.start_position, first_seq)
+                            });
+                        group.ingest(fec, &unmarshalled.payload);
+                        if !fec.is_data {
+                            for missing in group.missing_idx() {
+                                let seq = group.start_seq.wrapping_add(missing);
+                                let Some(data) = group.recover(missing) else { break };
+                                packets.push(Packet {
+                                    header: Header {
+                                        sequence_number: seq,
+                                        marker: fec.last_group && group.last_idx() == missing,
+                                        ..header.clone()
+                                    },
+                                    payload: data.into(),
+                                })
+                            }
+                        } else {
+                            packets.push(unmarshalled);
                         }
                     } else {
                         packets.push(unmarshalled);
                     }
-                } else {
-                    packets.push(unmarshalled);
-                }
 
-                for unmarshalled in packets {
-                    let payload_type = unmarshalled.header.payload_type;
-                    let Some(channel_type) = ChannelType::from_payload(payload_type) else {
-                        // can still happen because RED can unfold new payload types (13; Comfort Noise)
-                        warn!("No payload entry for {}", payload_type);
-                        continue
-                    };
-                    if !ssrc.codec.as_ref().is_some_and(|i| i.payload_type == channel_type) {
-                        ssrc.codec = Some(FTQualityZipper {
-                            payload_type: channel_type,
-                            ..Default::default()
-                        });
-                    }
-                    let Some(codec) = ssrc.codec.as_mut() else {
-                        warn!("No payload entry for {}", unmarshalled.header.payload_type);
-                        continue
-                    };
-                    let header_ssrc = unmarshalled.header.ssrc;
-
-                    codec.push(unmarshalled);
-                    
-                    while let Some((sample, orig_dropped)) = codec.pop() {
-                        let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
-                        if net_dropped > 0 {
-                            stat_tracker.register_loss(net_dropped as usize);
-                        }
-                        
-                        let mut data = &sample.data[..];
-                        // info!("Got sample {}", encode_hex(&data));
-                        if data.is_empty() {
-                            warn!("Got empty sample!");
-                            continue;
-                        }
-                        if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
-                            info!("mediainfo {:?}", config);
-                            incoming_handler.read().unwrap().handle(ChannelMessage {
-                                participant: ssrc.owner,
-                                stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
-                                r#type: channel_type,
-                                timestamp: header.timestamp,
-                                prev_dropped: 0,
-                                metadata: HashMap::new(),
-                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
-                                frame: ChannelFrame::Configuration(config),
+                    for unmarshalled in packets {
+                        let payload_type = unmarshalled.header.payload_type;
+                        let Some(channel_type) = ChannelType::from_payload(payload_type) else {
+                            // can still happen because RED can unfold new payload types (13; Comfort Noise)
+                            warn!("No payload entry for {}", payload_type);
+                            continue
+                        };
+                        if !ssrc.codec.as_ref().is_some_and(|i| i.payload_type == channel_type) {
+                            ssrc.codec = Some(FTQualityZipper {
+                                payload_type: channel_type,
+                                ..Default::default()
                             });
+                        }
+                        let Some(codec) = ssrc.codec.as_mut() else {
+                            warn!("No payload entry for {}", unmarshalled.header.payload_type);
+                            continue
+                        };
+                        let header_ssrc = unmarshalled.header.ssrc;
 
-                            // scan for next NAL
-                            if remaining.is_empty() {
+                        codec.push(unmarshalled);
+                        
+                        while let Some((sample, orig_dropped)) = codec.pop() {
+                            let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
+                            if net_dropped > 0 {
+                                stat_tracker.register_loss(net_dropped as usize);
+                            }
+                            
+                            let mut data = &sample.data[..];
+                            // info!("Got sample {}", encode_hex(&data));
+                            if data.is_empty() {
+                                warn!("Got empty sample!");
                                 continue;
                             }
-                            data = remaining;
-                        }
-                        // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
-                        let mut frame_meta = HashMap::new();
-                        let features = if is_group {
-                            match channel_type {
-                                ChannelType::H264 => Some(&*GROUP_H264_FEATURES),
-                                ChannelType::H265 => Some(&*GROUP_H265_FEATURES),
-                                ChannelType::Evs | ChannelType::Aac => None,
-                            }
-                        } else { ssrc.features.get(&payload_type) };
-                        if let Some(features) = features {
-                            let (decoded, meta) = features.parse_frame(&data);
-                            data = decoded;
-                            frame_meta = meta;
-                            // info!("sample {}", encode_hex(&data));
-                        }
+                            if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
+                                info!("mediainfo {:?}", config);
+                                incoming_handler.read().unwrap().handle(ChannelMessage {
+                                    participant: ssrc.owner,
+                                    stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                    r#type: channel_type,
+                                    timestamp: header.timestamp,
+                                    prev_dropped: 0,
+                                    metadata: HashMap::new(),
+                                    camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                    frame: ChannelFrame::Configuration(config),
+                                });
 
-                        // info!("Handling packetd");
-                        incoming_handler.read().unwrap().handle(ChannelMessage {
-                            participant: ssrc.owner,
-                            // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
-                            stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
-                            r#type: channel_type,
-                            timestamp: sample.packet_timestamp,
-                            prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
-                            metadata: frame_meta,
-                            camera_meta: video_meta.as_ref().map(|i| i.camera_status),
-                            frame: ChannelFrame::Sample(data.to_vec()),
-                        });
+                                // scan for next NAL
+                                if remaining.is_empty() {
+                                    continue;
+                                }
+                                data = remaining;
+                            }
+                            // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
+                            let mut frame_meta = HashMap::new();
+                            let features = if is_group {
+                                match channel_type {
+                                    ChannelType::H264 => Some(&*GROUP_H264_FEATURES),
+                                    ChannelType::H265 => Some(&*GROUP_H265_FEATURES),
+                                    ChannelType::Evs | ChannelType::Aac => None,
+                                }
+                            } else { ssrc.features.get(&payload_type) };
+                            if let Some(features) = features {
+                                let (decoded, meta) = features.parse_frame(&data);
+                                data = decoded;
+                                frame_meta = meta;
+                                // info!("sample {}", encode_hex(&data));
+                            }
+
+                            // info!("Handling packetd");
+                            incoming_handler.read().unwrap().handle(ChannelMessage {
+                                participant: ssrc.owner,
+                                // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
+                                stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                r#type: channel_type,
+                                timestamp: sample.packet_timestamp,
+                                prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
+                                metadata: frame_meta,
+                                camera_meta: video_meta.as_ref().map(|i| i.camera_status),
+                                frame: ChannelFrame::Sample(data.to_vec()),
+                            });
+                        }
                     }
+                }
+            })) {
+                // the GlobalLink parser state for stacked packets is atrocious - 
+                // garbage sometimes goes in, panics sometimes come out.
+                if let Some(message) = e.downcast_ref::<&str>() {
+                    error!("recv panic: {message}");
+                } else if let Some(message) = e.downcast_ref::<String>() {
+                    error!("recv panic: {message}");
+                } else {
+                    error!("recv panic with non-string payload");
                 }
             }
         }
