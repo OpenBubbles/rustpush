@@ -3337,7 +3337,9 @@ impl VideoSender {
             if false {
                 warn!("Dropping packet {}", self.sequence_number);
             } else {
-                self.link.send(&p)?;
+                if let Err(e) = self.link.send(&p) {
+                    warn!("Failed to send vidoe packet {e}!");
+                }
             }
             
         }
