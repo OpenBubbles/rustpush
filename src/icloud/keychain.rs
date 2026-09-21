@@ -1107,6 +1107,7 @@ pub const KEYCHAIN_ZONES: &[&str] = &[
 pub struct EscrowMetadata {
     pub serial: String,
     pub build: String,
+    #[serde(default)]
     pub passcode_generation: u32,
     #[serde(rename = "com.apple.securebackup.timestamp")]
     pub timestamp: String,
