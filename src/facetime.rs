@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
-use crate::{avconference::{AVConfig, AVSession, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
+use crate::{avconference::{AVConfig, AVSession, IncomingFrameHandler, QuickRelayMkmMaterial, QuickRelayPreKey, QuickRelaySkmMaterial}, facetime::facetimep::{ConversationActivity, ConversationActivityContext, ConversationActivityMetadata, ConversationActivitySceneAssociationBehavior, ConversationActivitySession}, ids::link::{GlobalLinkChange, GlobalLinkOutgoingPacket, QuickRelayAllocationsResponse, qrp::{self, IdsqrProtoMaterial}}, util::{bin_deserialize, bin_serialize, decode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, link::{GlobalLink, GlobalPacket, LinkType}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, deflate, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, inflate, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 // static HAS_JOINED: AtomicBool = AtomicBool::new(false);
@@ -150,7 +150,9 @@ fn send_for_message(sender: String, message: ConversationMessage, context: Optio
         scheduled_ms: None,
         queue_id: None,
         relay: None,
-        extras: Default::default(),
+        extras: Dictionary::from_iter([
+            ("cc", Value::Integer(context.unwrap_or(message.r#type() as u64).into()))
+        ]),
     }
 }
 
@@ -314,7 +316,7 @@ const UNIX_TO_2001: Duration = Duration::from_millis(978307200000);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(untagged)]
-enum ParticipantID {
+pub enum ParticipantID {
     Signed(i64),
     Unsigned(u64),
 }
@@ -710,6 +712,98 @@ impl FTClient {
         
         Ok(link)
     }
+
+    // Not needed for screen sharing, will use later when adding SharePlay.
+    // pub async fn add_activity(&self, guid: &str) -> Result<(), PushError> {
+    //     let mut message = ConversationMessage::default();
+    //     message.set_type(ConversationMessageType::AddActivitySession);
+    //     let create_time = duration_since_epoch().as_secs_f64();
+
+    //     #[derive(Serialize)]
+    //     #[serde(rename_all = "camelCase")]
+    //     struct ScreenShareContext {
+    //         sharer_handle_value: String,
+    //         current_remote_attributes: RemoteAttributes,
+    //     }
+
+    //     #[derive(Serialize)]
+    //     #[serde(rename_all = "camelCase")]
+    //     struct RemoteAttributes {
+    //         device_family: u64,
+    //         device_home_button_type: u64,
+    //         style: u64,
+    //         display_scale: f64,
+    //         scale_factor: f64,
+    //         system_root_layer_transform: String,
+    //         corner_radius: f64,
+    //         original_width: f64,
+    //         original_height: f64,
+    //         is_windowed: bool,
+    //     }
+
+    //     let mut state = self.state.write().await;
+    //     let session = state.sessions.get_mut(guid).expect("No session found!");
+    //     let my_handle = session.my_handles.first().expect("No handle").clone();
+
+    //     let handle = handle_from_ids(&my_handle);
+
+    //     let context = plist_to_bin(&ScreenShareContext {
+    //         sharer_handle_value: handle.value.clone(),
+    //         current_remote_attributes: RemoteAttributes {
+    //             device_family: 2,
+    //             device_home_button_type: 2,
+    //             style: 1,
+    //             display_scale: 2.0,
+    //             scale_factor: 1.0,
+    //             // Literally the string, not a null: it is how an unset transform is encoded.
+    //             system_root_layer_transform: "$null".to_string(),
+    //             corner_radius: 0.0,
+    //             original_width: 0.0,
+    //             original_height: 0.0,
+    //             is_windowed: false,
+    //         },
+    //     })?;
+    //     message.conversation_group_uuid_string = guid.to_string();
+
+    //     message.activity_sessions.push(ConversationActivitySession {
+    //         identifier_uuid_string: Uuid::new_v4().to_string().to_uppercase(),
+    //         activity: Some(ConversationActivity {
+    //             identifier_uuid_string: Uuid::new_v4().to_string().to_uppercase(),
+    //             application_context: context,
+    //             bundle_identifier: "com.apple.TelephonyUtilities".to_owned(),
+    //             activity_identifier: "com.apple.FaceTime.ScreenSharing".to_owned(),
+    //             activity_context: Some(ConversationActivityContext {
+    //                 context_identifier: "CPGroupActivityScreenSharingContext".to_owned(),
+    //                 action_description: "Share Screen".to_owned(),
+    //                 ongoing_description: "Sharing Screen".to_owned(),
+    //                 completed_description: "Shared Screen".to_owned(),
+    //             }),
+    //             originator_handle: Some(handle.clone()),
+    //             updated_date_epoch_time: create_time,
+    //             activity_metadata: Some(ConversationActivityMetadata {
+    //                 supports_continuation_on_tv: Some(false),
+    //                 title: Some("Screen Sharing".to_string()),
+    //                 subtitle: Some(handle.value.to_string()),
+    //                 preferred_broadcasting_attributes: Some(0),
+    //                 scene_association_behavior: Some(ConversationActivitySceneAssociationBehavior {
+    //                     // true for interaction
+    //                     should_associate_scene: Some(false),
+    //                     ..Default::default()
+    //                 }),
+    //                 lifetime_policy: Some(2),
+    //                 ..Default::default()
+    //             }),
+    //             is_system_activity: Some(false),
+    //             timestamp_as_time_interval_since_reference_date: Some(create_time - 978307200.0 /* apple 2001 epoch */),
+    //             ..Default::default()
+    //         }),
+    //         creation_date_epoch_time: create_time,
+    //     });
+
+    //     self.message_session(my_handle, message, session, None).await?;
+        
+    //     Ok(())
+    // }
 
     pub async fn upgrade_to_video(&self, guid: &str, request: bool) -> Result<(), PushError> {
         let mut state = self.state.write().await;

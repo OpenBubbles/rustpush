@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque}, fmt::{Debug, Display}, io::Cursor, net::{IpAddr, SocketAddr, SocketAddrV4}, ops::{Add, Deref, Div, Mul}, sync::{Arc, LazyLock, RwLockWriteGuard, Weak, atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}, usize};
 use quinn::crypto::rustls::QuicClientConfig;
 use h3::client;
 use h3_quinn::Connection;
@@ -62,6 +62,7 @@ enum AVSessionPayload {
     H264,
     Evs,
     Aac,
+    Aac48,
     Red,
 }
 
@@ -71,6 +72,7 @@ impl AVSessionPayload {
             100 => Self::H265,
             123 => Self::H264,
             104 => Self::Aac,
+            101 => Self::Aac48,
             108 => Self::Evs,
             20 => Self::Red,
             _unk => return None
@@ -94,7 +96,7 @@ impl AVSessionPayload {
     }
 
     fn is_audio(&self) -> bool {
-        matches!(self, Self::Aac | Self::Evs | Self::Red)
+        matches!(self, Self::Aac | Self::Aac48 | Self::Evs | Self::Red)
     }
 
 }
@@ -102,43 +104,26 @@ impl AVSessionPayload {
 enum AVSessionCodec {
     H265(SampleBuilder<H265Packet>),
     H264(SampleBuilder<H264Packet>),
-    Evs(SampleBuilder<AudioDepacketizer>),
-    Aac(SampleBuilder<AudioDepacketizer>),
+    Audio(SampleBuilder<AudioDepacketizer>),
 }
 
 impl AVSessionCodec {
-    // 1   came   camera video
-    // 2   micr   microphone audio
-    // 3   scre   screen-share video
-    // 4   sysa   system audio, probably screen-share/system sound
-    // 5   camw   camera video, alternate/weaker/one-to-one? uses cipher suite 1
-    // 6   micw   microphone audio paired with camw
-    // 7   capt   caption / capture metadata
-    // 11  siri   Siri audio
-    // 12  ftxt   FaceTime text? video-ish, 420f, deviceClass-gated
-    // 13  fdat   FaceTime data metadata, subtype mmji, deviceClass-gated
-    // 14  bdat   data metadata, subtype faav, deviceClass-gated
-    fn from_payload(payload: u8) -> Option<Self> {
+    fn from_payload(payload: u8, clock_rate: u32) -> Option<Self> {
         Some(match payload {
             100 => Self::H265(SampleBuilder::new(
                 200,          // max_late in sequence numbers
                 H265Packet::default(),
-                24_000,     // RTP video clock
+                clock_rate,     // RTP video clock
             ).with_max_time_delay(Duration::from_millis(300))),
             123 => Self::H264(SampleBuilder::new(
                 200,
                 H264Packet::default(),
-                24_000,
+                clock_rate,
             ).with_max_time_delay(Duration::from_millis(300))),
-            104 => Self::Aac(SampleBuilder::new(
+            108 | 104 | 101 => Self::Audio(SampleBuilder::new(
                 5,
                 AudioDepacketizer,
-                24_000,
-            )),
-            108 => Self::Evs(SampleBuilder::new(
-                5,
-                AudioDepacketizer,
-                24_000,
+                clock_rate,
             )),
             _unk => return None
         })
@@ -148,8 +133,7 @@ impl AVSessionCodec {
         match self {
             Self::H265(c) => c.push(packet),
             Self::H264(c) => c.push(packet),
-            Self::Evs(c) => c.push(packet),
-            Self::Aac(c) => c.push(packet),
+            Self::Audio(c) => c.push(packet),
         }
     }
 
@@ -157,8 +141,7 @@ impl AVSessionCodec {
         match self {
             Self::H265(c) => c.pop(),
             Self::H264(c) => c.pop(),
-            Self::Evs(c) => c.pop(),
-            Self::Aac(c) => c.pop(),
+            Self::Audio(c) => c.pop(),
         }
     }
 
@@ -166,8 +149,7 @@ impl AVSessionCodec {
         match self {
             Self::H265(c) => c.flush(),
             Self::H264(c) => c.flush(),
-            Self::Evs(c) => c.flush(),
-            Self::Aac(c) => c.flush(),
+            Self::Audio(c) => c.flush(),
         }
     }
 }
@@ -298,6 +280,54 @@ pub struct QTImageDescription {
     pub color_table_id: i16,
 }
 
+#[derive(Default)]
+pub struct ImgDescTracker {
+    vps: Option<Vec<u8>>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+}
+
+impl ImgDescTracker {
+    pub fn nal(&mut self, nal: &[u8]) {
+        let r#type = (nal[0] >> 1) & 0x3f;
+        match r#type {
+            32 => self.vps = Some(nal.to_vec()),
+            33 => self.sps = Some(nal.to_vec()),
+            34 => self.pps = Some(nal.to_vec()),
+            _ => return
+        }
+    }
+
+    fn nals(&self) -> Vec<u8> {
+        [
+            &[0, 0, 0, 1][..],
+            self.vps.as_ref().unwrap(),
+            &[0, 0, 0, 1][..],
+            self.sps.as_ref().unwrap(),
+            &[0, 0, 0, 1][..],
+            self.pps.as_ref().unwrap(),
+        ].concat()
+    }
+
+    fn desc(&self, width: u16, height: u16) -> Result<ImageDescription, PushError> {
+        ImageDescription::new_hevc(
+            self.vps.as_ref().unwrap(), 
+            self.sps.as_ref().unwrap(), 
+            self.pps.as_ref().unwrap(), 
+            width, 
+            height
+        )
+    }
+
+    pub fn decoder_config(&self, raw: bool, width: u16, height: u16) -> DecoderConfiguration {
+        if raw {
+            DecoderConfiguration::Raw(self.nals(), ChannelType::H265)
+        } else {
+            DecoderConfiguration::ImageDescription(self.desc(width, height).unwrap())
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ImageDescriptionType {
     H264(AvccDescription),
@@ -385,7 +415,7 @@ impl ImageDescription {
         ).collect()
     }
 
-    pub fn from_annex_b_hevc(annex: &[u8]) -> Result<Self, PushError> {
+    pub fn from_annex_b_hevc(annex: &[u8], width: u16, height: u16) -> Result<Self, PushError> {
         let mut vps = None;
         let mut sps = None;
         let mut pps = None;
@@ -400,13 +430,15 @@ impl ImageDescription {
                 _ => continue
             }
         }
-        Self::new_hevc(vps.unwrap(), sps.unwrap(), pps.unwrap())
+        Self::new_hevc(vps.unwrap(), sps.unwrap(), pps.unwrap(), width, height)
     }
 
     pub fn new_hevc(
         vps: &[u8],
         sps: &[u8],
         pps: &[u8],
+        width: u16,
+        height: u16,
     ) -> Result<Self, PushError> {
         let mut compressor_name = [0; 32];
         compressor_name[..5].copy_from_slice(b"\x04HEVC");
@@ -439,8 +471,8 @@ impl ImageDescription {
                 vendor: [0; 4],
                 temporal_quality: 512,
                 spatial_quality: 512,
-                width: 1920,
-                height: 1080,
+                width,
+                height,
                 horizontal_resolution: 0x0048_0000,
                 vertical_resolution: 0x0048_0000,
                 data_size: 0,
@@ -489,17 +521,17 @@ struct FTQualityZipper {
 }
 
 impl FTQualityZipper {
-    fn push(&mut self, packet: Packet) {
+    fn push(&mut self, packet: Packet, clock_rate: u32) {
         let packet_ssrc = packet.header.ssrc;
         let had_ssrc_builder = self.ssrc_codecs.contains_key(&packet_ssrc);
         if self.current_ssrc == 0 {
             self.current_ssrc = packet_ssrc;
         }
         self.ssrc_codecs.entry(packet_ssrc)
-            .or_insert_with(|| (None, AVSessionCodec::from_payload(packet.header.payload_type).unwrap()));
+            .or_insert_with(|| (None, AVSessionCodec::from_payload(packet.header.payload_type, clock_rate).unwrap()));
 
         if packet_ssrc != self.current_ssrc {
-            let force_switch = packet.header.timestamp > self.current_ssrc_timestamp + 2400;
+            let force_switch = packet.header.timestamp > self.current_ssrc_timestamp + clock_rate / 10 /* 100ms */;
             let clean_switch = {
                 let codec = self.ssrc_codecs.get_mut(&packet_ssrc).unwrap();
                 let candidate_start = match codec.0 {
@@ -509,14 +541,14 @@ impl FTQualityZipper {
                     _ => packet.header.timestamp,
                 };
                 codec.0 = Some(candidate_start);
-                candidate_start.wrapping_sub(self.current_ssrc_timestamp) < 1500 /* 15fps */
+                candidate_start.wrapping_sub(self.current_ssrc_timestamp) < clock_rate / 15 /* 15fps */
             };
 
             if force_switch || clean_switch {
                 if had_ssrc_builder {
                     // Start this activation at the switching packet, without buffered residue.
                     self.ssrc_codecs.get_mut(&packet_ssrc).unwrap().1 =
-                        AVSessionCodec::from_payload(packet.header.payload_type).unwrap();
+                        AVSessionCodec::from_payload(packet.header.payload_type, clock_rate).unwrap();
                 }
 
                 if force_switch || self.mark_fail > 0 {
@@ -589,7 +621,7 @@ impl FTQualityZipper {
                             _ => unreachable!(),
                         }
                     }),
-                    ChannelType::Evs | ChannelType::Aac => true,
+                    ChannelType::Evs | ChannelType::Aac | ChannelType::Aac48 => true,
                 };
                 if !is_idr {
                     info!("Not an IDR, so registering dropped frames!");
@@ -604,11 +636,66 @@ impl FTQualityZipper {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct StreamId {
+    pub participant: u64,
+    pub stream_index: u32,
+}
+
+impl StreamId {
+    // 1   came   camera video
+    // 2   micr   microphone audio
+    // 3   scre   screen-share video
+    // 4   sysa   system audio, probably screen-share/system sound
+    // 5   camw   camera video, alternate/weaker/one-to-one? uses cipher suite 1
+    // 6   micw   microphone audio paired with camw
+    // 7   capt   caption / capture metadata
+    // 11  siri   Siri audio
+    // 12  ftxt   FaceTime text? video-ish, 420f, deviceClass-gated
+    // 13  fdat   FaceTime data metadata, subtype mmji, deviceClass-gated
+    // 14  bdat   data metadata, subtype faav, deviceClass-gated
+
+    pub fn group_identifier(&self) -> &'static [u8; 4] {
+        match self.stream_index {
+            1 => b"came",
+            2 => b"micr",
+            3 => b"scre",
+            4 => b"sysa",
+            5 => b"camw",
+            6 => b"micw",
+            7 => b"capt",
+            11 => b"siri",
+            12 => b"ftxt",
+            13 => b"fdat",
+            14 => b"bdat",
+            _ => b"unkn",
+        }
+    }
+
+    // make sure to ADD NEW RATES to clock-conversion
+    pub fn clock_rate(&self) -> u32 {
+        match self.stream_index {
+            3 | 4 => 48_000, // Screen video/audio
+            5 => 90_000, // WebRTC Video
+            6 => 48_000, // WebRTC Audio
+            _ => 24_000,
+        }
+    }
+    
+    pub fn clock_conversion(&self) -> (u64, u64) {
+        match self.clock_rate() {
+            24_000 => (125, 3),
+            48_000 => (125, 6),
+            90_000 => (100, 9),
+            _ => panic!("Unknown conversion!")
+        }
+    }
+}
 
 pub struct AVSessionSSRC {
-    owner: u64,
-    stream_index: u32,
+    id: StreamId,
     features: HashMap<u8, EnabledAVFeatures>,
+    group_features: HashMap<u8, EnabledAVFeatures>,
     mkms: Vec<QuickRelayMkmMaterial>,
     group_ssrcs: Vec<u32>, // stream-specific SSRCs
 
@@ -680,8 +767,8 @@ pub struct AVSessionState {
     prekey: EcKey<Private>,
     outgoing_ctrl_counters: HashMap<u64, u64>,
     video_enabled: bool,
-    video_streams: Vec<Option<u32>>,
-    audio_streams: Vec<Option<u32>>,
+    screen_enabled: bool,
+    active_streams: HashMap<u32, Vec<u32>>,
     last_stream_change: Instant,
     last_probe: Instant,
     last_quality_bump: Instant,
@@ -750,6 +837,7 @@ impl AVSessionState {
 
         let encryption_state = self.encryption_states.entry(p).or_default();
         encryption_state.stream_groups = v2.stream_groups.into_iter().map(|mut i| {
+            normalize_streams(i.stream_group(), i.streams.iter_mut());
             i.streams.sort_by_key(|s| s.stream_id());
             (i.stream_group(), StreamGroup {
                 current: encryption_state.stream_groups.get(&i.stream_group())
@@ -758,6 +846,7 @@ impl AVSessionState {
                 config: i,
             })
         }).collect();
+        encryption_state.desired_groups = HashSet::from_iter([1, 2]);
         Ok(())
     }
 
@@ -773,16 +862,27 @@ impl AVSessionState {
             let Some(u1) = &group.settings_u1 else { continue };
             
             map.insert(u1.rtp_ssrc(), AVSessionSSRC {
-                owner: p,
-                stream_index: group.stream_group(),
+                id: StreamId {
+                    participant: p,
+                    stream_index: group.stream_group(),
+                },
                 mkms: encryption_state.mkm.clone(),
                 features: u1.encode_decode_features.iter()
                     .filter_map(|f| {
                         let features = EnabledAVFeatures::from_bytes(&f.encode_decode_features()[..2]);
-                        let negotiated = if f.rtp_payload() == 100 { &config.supported_features } else { &config.h264_supported }.negotiate(&features);
+                        let group_config = config.stream_groups.get(&group.stream_group())?.features.as_ref()?;
+                        let negotiated = if f.rtp_payload() == 100 { &group_config.h265.supported } else { &group_config.h264.supported }.negotiate(&features);
                         info!("SSRC features {} payload {} features {} negotiated {}", u1.rtp_ssrc(), f.rtp_payload(), features, negotiated);
                         Some((f.rtp_payload() as u8, negotiated))
                     }).collect(),
+                group_features: config.stream_groups.get(&group.stream_group())
+                    .and_then(|i| {
+                        let features = i.group_features.as_ref()?;
+                        Some(HashMap::from_iter([
+                            (100, features.h265.enabled.clone()),
+                            (123, features.h264.enabled.clone()),
+                        ]))
+                    }).unwrap_or_default(),
                 group_ssrcs: group.streams.iter().map(|i| i.rtp_ssrc()).collect(),
                 srtp_contexts: HashMap::new(),
                 codec: None,
@@ -933,6 +1033,7 @@ pub struct ParticipantEncryptionState {
     has_sent_keys: bool,
     ctrl_enc_counter: u8,
     stream_groups: HashMap<u32, StreamGroup>,
+    desired_groups: HashSet<u32>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -1073,34 +1174,34 @@ struct ProbeState {
 
     first_packet: Instant,
     last_packet: Instant,
-    first_timestamp: u32,
-    last_timestamp: u32,
+    first_timestamp: u64,
+    last_timestamp: u64,
 }
 
 impl ProbeState {
-    fn new(recv: &GlobalPacket, header: &Header) -> ProbeState {
+    fn new(recv: &GlobalPacket, header: &Header, conversion: (u64, u64)) -> ProbeState {
         ProbeState {
             total_bytes: recv.data.len(),
             first_packet_bytes: recv.data.len(),
             first_packet: recv.time_parsed,
             last_packet: recv.time_parsed,
-            first_timestamp: header.timestamp,
-            last_timestamp: header.timestamp,
+            first_timestamp: header.timestamp as u64 * conversion.0 / conversion.1,
+            last_timestamp: header.timestamp as u64 * conversion.0 / conversion.1,
 
             link_start_byte: recv.current_idx,
             link_end_byte: recv.current_idx,
         }
     }
 
-    fn update(&mut self, recv: &GlobalPacket, header: &Header) {
+    fn update(&mut self, recv: &GlobalPacket, header: &Header, conversion: (u64, u64)) {
         if recv.time_parsed < self.first_packet {
             self.first_packet_bytes = recv.data.len();
             self.first_packet = recv.time_parsed;
         }
         self.last_packet = self.last_packet.max(recv.time_parsed);
         self.total_bytes += recv.data.len();
-        self.first_timestamp = self.first_timestamp.min(header.timestamp);
-        self.last_timestamp = self.last_timestamp.max(header.timestamp);
+        self.first_timestamp = self.first_timestamp.min(header.timestamp as u64 * conversion.0 / conversion.1);
+        self.last_timestamp = self.last_timestamp.max(header.timestamp as u64 * conversion.0 / conversion.1);
 
         self.link_end_byte = recv.current_idx;
     }
@@ -1132,8 +1233,7 @@ impl ProbeState {
         if window == 0 || measured_bytes == 0 {
             return None
         }
-        let micros = window * 125 / 3; // 24khz to us.
-        let bytes_per_sec = measured_bytes * 1000000 / micros as usize;
+        let bytes_per_sec = measured_bytes * 1000000 / window as usize;
         Some(bytes_per_sec)
     }
 }
@@ -1201,15 +1301,17 @@ impl RecvStatTracker {
     fn track(&mut self, recv: &GlobalPacket, header: &Header, elapsed_packets: u16, callback: &tokio::sync::mpsc::Sender<AVInternalMessage>, ssrc: &AVSessionSSRC) -> Option<FTVideoControlData> {
         self.stats.total_recv_bytes.fetch_add(recv.packet_size as u64, Ordering::Relaxed);
 
+        let (mul, div) = ssrc.id.clock_conversion();
+
         if let Some(probe) = recv.probe_id {
             let item = self.probe_states.entry(header.ssrc).or_default();
             while item.len() > 10 {
                 item.pop_first();
             }
             if let Some(probe) = item.get_mut(&probe) {
-                probe.update(&recv, &header);
+                probe.update(&recv, &header, (mul, div));
             } else {
-                item.insert(probe, ProbeState::new(&recv, &header));
+                item.insert(probe, ProbeState::new(&recv, &header, (mul, div)));
             }
         }
 
@@ -1223,7 +1325,7 @@ impl RecvStatTracker {
             self.last_bucket = time_slice_bucket;
         }
         if let Some(probe) = &mut time_slice.probe {
-            probe.update(&recv, &header);
+            probe.update(&recv, &header, (mul, div));
         } else {
             time_slice.probe = Some(ProbeState {
                 first_packet: self.start_time + Duration::from_secs(time_slice_abs_bucket.as_secs()),
@@ -1231,25 +1333,24 @@ impl RecvStatTracker {
                 // include this packet len in the item
                 first_packet_bytes: 0,
                 link_start_byte: recv.current_idx - recv.data.len(),
-                ..ProbeState::new(&recv, &header)
+                ..ProbeState::new(&recv, &header, (mul, div))
             });
         }
         let payload = AVSessionPayload::from_id(header.payload_type as u32).unwrap();
 
         let result = if !header.extensions.is_empty() {
             let mut record_index = self.stats.records.read().unwrap();
-            let stream_identifier = (ssrc.owner, ssrc.stream_index);
-            if !record_index.contains_key(&stream_identifier) {
+            if !record_index.contains_key(&ssrc.id) {
                 drop(record_index);
                 let mut write = self.stats.records.write().unwrap();
-                write.insert(stream_identifier, std::array::from_fn(|_| IncomingFrameRecord::default()));
+                write.insert(ssrc.id, std::array::from_fn(|_| IncomingFrameRecord::default()));
                 record_index = RwLockWriteGuard::downgrade(write);
             }
             match payload {
                 AVSessionPayload::H265 | AVSessionPayload::H264 => {
-                    let data = FTVideoControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec());
+                    let data = FTVideoControlData::from_ext(header.extension_profile, &header.extensions[0].payload);
                     if let FTVideoControlData { total_packets_per_frame: Some(packets), frame_sequence_number: Some(sequence) , .. } = data {
-                        let slot = &record_index[&stream_identifier][sequence as usize & 0x7f];
+                        let slot = &record_index[&ssrc.id][sequence as usize & 0x7f];
 
                         // this code is not thread-safe. Video must be decoded on the same thread.
                         // if several threads swap this sequence at the same time, they can sub before the
@@ -1260,7 +1361,8 @@ impl RecvStatTracker {
                             slot.start_time.store(duration_since_epoch().as_millis() as u64, Ordering::Relaxed);
                             slot.total.store(packets as u8, Ordering::Relaxed);
                             slot.lost.store(packets as u8 - 1, Ordering::Relaxed);
-                            slot.present_time.store(header.timestamp, Ordering::Relaxed);
+                            
+                            slot.present_time.store(header.timestamp as u64 * mul / div, Ordering::Relaxed);
                         } else {
                             let item = slot.lost.load(Ordering::Relaxed);
                             if item > 0 {
@@ -1271,7 +1373,7 @@ impl RecvStatTracker {
                     // info!("Control data {data:?}");
                     Some(data)
                 },
-                AVSessionPayload::Aac | AVSessionPayload::Evs | AVSessionPayload::Red => {
+                AVSessionPayload::Aac | AVSessionPayload::Aac48 | AVSessionPayload::Evs | AVSessionPayload::Red => {
                     let data = FTAudioControlData::from_ext(header.extension_profile, header.extensions[0].payload.to_vec());
                     // info!("Audio data {data:?}");
                     if let Some(time) = data.current_send_timestamp {
@@ -1323,10 +1425,10 @@ impl RecvStatTracker {
 
         
         if payload.is_audio() {
-            let initial_recv_time = self.initial_recv_time.entry(ssrc.owner).or_insert(recv.time_parsed);
+            let initial_recv_time = self.initial_recv_time.entry(ssrc.id.participant).or_insert(recv.time_parsed);
         
-            let send_time = (header.timestamp as u64 * 125 / 3) as f64 / 1_000_000.0; // micros to s
-            let initial_send_time = self.initial_send_time.entry(ssrc.owner).or_insert(send_time);
+            let send_time = (header.timestamp as u64 * mul / div) as f64 / 1_000_000.0; // micros to s
+            let initial_send_time = self.initial_send_time.entry(ssrc.id.participant).or_insert(send_time);
             let recv_elapsed = recv.time_parsed.duration_since(*initial_recv_time).as_secs_f64();
             let send_elapsed = send_time - *initial_send_time;
 
@@ -1407,13 +1509,13 @@ impl MultiMkiContext {
 struct IncomingFrameRecord {
     frame: AtomicU16,
     start_time: AtomicU64,
-    present_time: AtomicU32,
+    present_time: AtomicU64,
     total: AtomicU8,
     lost: AtomicU8,
 }
 
 pub trait TimingTarget: Send + Sync {
-    fn presentation_for(&self, timestamp: u32) -> Instant;
+    fn presentation_for(&self, timestamp_us: u64) -> Instant;
 }
 
 #[derive(Default)]
@@ -1425,7 +1527,7 @@ struct IncomingFrameStats {
     audio_burst_loss: AtomicU8,
     video_burst_loss: AtomicU8,
     // right now only used for U1 mode, but for non-u1 mode use a rwlock hashmap or dashmap
-    records: std::sync::RwLock<HashMap<(u64, u32), [IncomingFrameRecord; 128]>>,
+    records: std::sync::RwLock<HashMap<StreamId, [IncomingFrameRecord; 128]>>,
     timing_targets: std::sync::RwLock<HashMap<u64, Arc<dyn TimingTarget>>>,
     
     short_q13_lag: AtomicU64,
@@ -1671,7 +1773,9 @@ impl IncomingFrameHandler {
                                 len = bytes.len();
                             }
                             if header.timestamp != unmarshalled.header.timestamp {
-                                let packet_time_len = (AudioParser(&bytes[..len]).count() * 480) as u32;
+                                let packets_per_second = if header.payload_type == 101 { 100 /* 10ms packet */ } else { 50 /* 20ms packet */ };
+                                let ticks_per_packet = ssrc.id.clock_rate() / packets_per_second;
+                                let packet_time_len = AudioParser(&bytes[..len]).count() as u32 * ticks_per_packet;
                                 let timestamp_delta = unmarshalled.header.timestamp.wrapping_sub(header.timestamp);
                                 let seq_delta = ((timestamp_delta + (packet_time_len / 2)) / packet_time_len).max(1) as u16;
                                 header.sequence_number = header.sequence_number.wrapping_sub(seq_delta);
@@ -1736,7 +1840,7 @@ impl IncomingFrameHandler {
                         };
                         let header_ssrc = unmarshalled.header.ssrc;
 
-                        codec.push(unmarshalled);
+                        codec.push(unmarshalled, ssrc.id.clock_rate());
                         
                         while let Some((sample, orig_dropped)) = codec.pop() {
                             let net_dropped = orig_dropped.saturating_sub(sample.prev_padding_packets);
@@ -1753,8 +1857,8 @@ impl IncomingFrameHandler {
                             if let Some((remaining, config)) = DecoderConfiguration::parse(data, channel_type) {
                                 info!("mediainfo {:?}", config);
                                 incoming_handler.read().unwrap().handle(ChannelMessage {
-                                    participant: ssrc.owner,
-                                    stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                    stream: ssrc.id,
+                                    control_stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
                                     r#type: channel_type,
                                     timestamp: header.timestamp,
                                     prev_dropped: 0,
@@ -1771,25 +1875,41 @@ impl IncomingFrameHandler {
                             }
                             // info!("Smaple before {} {} {}", encode_hex(&data), sample.prev_dropped_packets, recv.packet_id);
                             let mut frame_meta = HashMap::new();
-                            let features = if is_group {
-                                match channel_type {
-                                    ChannelType::H264 => Some(&*GROUP_H264_FEATURES),
-                                    ChannelType::H265 => Some(&*GROUP_H265_FEATURES),
-                                    ChannelType::Evs | ChannelType::Aac => None,
-                                }
-                            } else { ssrc.features.get(&payload_type) };
+                            let features = if is_group { ssrc.group_features.get(&payload_type) } else { ssrc.features.get(&payload_type) };
+
+                            let mut decoder_result = vec![];
                             if let Some(features) = features {
-                                let (decoded, meta) = features.parse_frame(&data);
-                                data = decoded;
-                                frame_meta = meta;
+                                for mut nal in AnnexB::new(data) {
+                                    let has_footer = match channel_type {
+                                        ChannelType::H264 => {
+                                            let nal_type = nal[0] & 0x1f;
+                                            (1..=5).contains(&nal_type)
+                                        },
+                                        ChannelType::H265 => {
+                                            let nal_type = (nal[0] >> 1) & 0x3f;
+                                            nal_type < 32
+                                        },
+                                        _ => false
+                                    };
+
+                                    if has_footer {
+                                        let (decoded, meta) = features.parse_frame(&nal);
+                                        frame_meta = meta;
+                                        nal = decoded;
+                                    }
+
+                                    decoder_result.extend_from_slice(&[0, 0, 0, 1]);
+                                    decoder_result.extend_from_slice(nal);
+                                }
+                                data = &decoder_result;
                                 // info!("sample {}", encode_hex(&data));
                             }
 
                             // info!("Handling packetd");
                             incoming_handler.read().unwrap().handle(ChannelMessage {
-                                participant: ssrc.owner,
+                                stream: ssrc.id,
                                 // maybe this if isn't nessesary, it's possible if not likely stream ID sent in u1 mode is ssrc & 0xffff.
-                                stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
+                                control_stream_id: if is_group { header_ssrc & 0xffff } else { 0 },
                                 r#type: channel_type,
                                 timestamp: sample.packet_timestamp,
                                 prev_dropped: sample.prev_dropped_packets.saturating_sub(sample.prev_padding_packets),
@@ -2100,7 +2220,7 @@ impl ParticipantEncryptionState {
     fn get_desired_groups(&self) -> Vec<&StreamGroup> {
         if self.stream_groups.is_empty() { return vec![] }
 
-        vec![self.stream_groups.get(&1).expect("No Video?"), self.stream_groups.get(&2).expect("No Audio?")]
+        self.desired_groups.iter().filter_map(|i| self.stream_groups.get(i)).collect()
     }
 
     fn get_desired_streams(&self) -> Vec<u32> {
@@ -2194,21 +2314,21 @@ pub struct VCGenerateKeyFrame {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum DeviceOrientation {
+pub enum VideoRotation {
     #[default]
-    Portrait,
-    PortraitUpsideDown,
-    LandscapeLeft,
-    LandscapeRight,
+    Rotate90Deg,
+    RotateMinus90Deg,
+    Rotate180Deg,
+    NoRotation,
 }
 
-impl DeviceOrientation {
+impl VideoRotation {
     fn from_num(num: u8) -> Self {
         match num {
-            0 => Self::Portrait,
-            1 => Self::PortraitUpsideDown,
-            2 => Self::LandscapeLeft,
-            3 => Self::LandscapeRight,
+            0 => Self::Rotate90Deg,
+            1 => Self::RotateMinus90Deg,
+            2 => Self::Rotate180Deg,
+            3 => Self::NoRotation,
             _ => panic!()
         }
     }
@@ -2216,20 +2336,20 @@ impl DeviceOrientation {
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let string = std::str::from_utf8(bytes).ok()?;
         Some(match string {
-            "0" => Self::Portrait,
-            "1" => Self::PortraitUpsideDown,
-            "2" => Self::LandscapeLeft,
-            "3" => Self::LandscapeRight,
+            "0" => Self::Rotate90Deg,
+            "1" => Self::RotateMinus90Deg,
+            "2" => Self::Rotate180Deg,
+            "3" => Self::NoRotation,
             _ => return None
         })
     }
 
     fn to_bytes(&self) -> &'static [u8] {
         match self {
-            Self::Portrait => b"0",
-            Self::PortraitUpsideDown => b"1",
-            Self::LandscapeLeft => b"2",
-            Self::LandscapeRight => b"3",
+            Self::Rotate90Deg => b"0",
+            Self::RotateMinus90Deg => b"1",
+            Self::Rotate180Deg => b"2",
+            Self::NoRotation => b"3",
         }
     }
 }
@@ -2244,7 +2364,7 @@ pub enum VCControlData {
     GenerateKeyFrame(VCGenerateKeyFrame),
     FetchStreamGroupState,
     OneToOneEnabledState(bool),
-    DeviceOrientation(DeviceOrientation),
+    DeviceOrientation(VideoRotation),
 }
 
 impl VCControlData {
@@ -2263,7 +2383,7 @@ impl VCControlData {
             "VCSessionMessageTopicGenerateKeyFrame" => Self::GenerateKeyFrame(plist::from_bytes(message.payload()).ok()?),
             "VCSessionMessageTopicFetchStreamGroupsState" => Self::FetchStreamGroupState,
             "VCSessionMessageTopicOneToOneEnabledState" => Self::OneToOneEnabledState(message.payload() == b"VCSessionMessageOneToOneEnabled"),
-            "VCSessionMessageTopicDeviceOrientation" => Self::DeviceOrientation(DeviceOrientation::from_bytes(message.payload())?),
+            "VCSessionMessageTopicDeviceOrientation" => Self::DeviceOrientation(VideoRotation::from_bytes(message.payload())?),
             _unk => return None
         };
         Some(msg)
@@ -2418,7 +2538,7 @@ fn test_audio_ctrl() {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FTVideoCameraStatus {
-    pub orientation: DeviceOrientation,
+    pub orientation: VideoRotation,
     pub is_mirrored: bool,
     pub is_back: bool, // back camera, not front
     pub source: u8,
@@ -2427,7 +2547,7 @@ pub struct FTVideoCameraStatus {
 impl FTVideoCameraStatus {
     fn decode(status: u8) -> Self {
         Self {
-            orientation: DeviceOrientation::from_num(status & 0x3),
+            orientation: VideoRotation::from_num(status & 0x3),
             is_mirrored: status & 0x4 != 0,
             is_back: status & 0x8 != 0,
             source: status >> 4 & 0x3,
@@ -2692,6 +2812,7 @@ struct FECData {
     size: FECGroup,
     start: u8,
     start_seq: u16,
+    packet_sizes: Option<Vec<u16>>,
 }
 
 impl FECData {
@@ -2701,6 +2822,7 @@ impl FECData {
             size: FECGroup::new(symbols_per_packet),
             start,
             start_seq,
+            packet_sizes: None,
         }
     }
 
@@ -2711,18 +2833,28 @@ impl FECData {
     fn recover(&mut self, idx: u16) -> Option<Vec<u8>> {
         let position = self.start + idx as u8 * self.data.symbols_per_packet;
         let mut data = self.data.recover(position)?;
-        let size = self.size.recover(position)?;
-        let size = u16::from_le_bytes(size[..2].try_into().unwrap());
+        let size = if let Some(packet_sizes) = &self.packet_sizes {
+            packet_sizes[idx as usize]
+        } else {
+            let size = self.size.recover(position)?;
+            u16::from_le_bytes(size[..2].try_into().unwrap())
+        };
         data.resize(size as usize, 0);
         Some(data)
     }
 
     fn ingest(&mut self, header: &FECHeader, data: &[u8]) {
         self.data.ingest(header, &data);
-        if let Some(parity) = &header.parity {
-            self.size.ingest(header, &parity.redundant_bits_for_payload_size.to_le_bytes());
-        } else {
-            self.size.ingest(header, &(data.len() as u16).to_le_bytes());
+        match &header.parity {
+            Some(FECParitySubheader::V0 { media_packet_lengths }) => {
+                self.packet_sizes = Some(media_packet_lengths.clone());
+            },
+            Some(FECParitySubheader::V1 { redundant_bits_for_payload_size, parity_sequence_number }) => {
+                self.size.ingest(header, &redundant_bits_for_payload_size.to_le_bytes());
+            },
+            None => {
+                self.size.ingest(header, &(data.len() as u16).to_le_bytes());
+            }
         }
     }
 
@@ -2753,13 +2885,18 @@ impl FECData {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct FECParitySubheader {
-    pub redundant_bits_for_payload_size: u16,
-    pub parity_sequence_number: u16,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FECParitySubheader {
+    V1 {
+        redundant_bits_for_payload_size: u16,
+        parity_sequence_number: u16,
+    },
+    V0 {
+        media_packet_lengths: Vec<u16>,
+    },
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FECHeader {
     pub version: u8,
     pub symbols_per_packet: u8,
@@ -2774,49 +2911,117 @@ pub struct FECHeader {
 
 impl FECHeader {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 4 && bytes.len() != 8 {
+        if bytes.len() < 4 {
             return None
         }
 
         let common = u32::from_be_bytes(bytes[..4].try_into().ok()?);
-        let parity = if bytes.len() == 8 {
-            Some(FECParitySubheader {
+        let version = (common >> 30) as u8;
+
+        let (position, is_data, group_id, last_group, start_position, fec_percentage) = match version {
+            0 => (
+                ((common >> 24) & 0x7) as u8,
+                common & 0x00800000 != 0,
+                ((common >> 16) & 0x7f) as u8,
+                common & 0x00008000 != 0,
+                ((common >> 11) & 0x7) as u8,
+                (common & 0x7ff) as u16,
+            ),
+            1 => (
+                ((common >> 23) & 0xf) as u8,
+                common & 0x00400000 != 0,
+                ((common >> 15) & 0x7f) as u8,
+                common & 0x00004000 != 0,
+                ((common >> 10) & 0xf) as u8,
+                (common & 0x3ff) as u16,
+            ),
+            _ => return None,
+        };
+
+        let parity = match (version, is_data) {
+            (0, true) if bytes.len() == 4 => None,
+            (0, false) if bytes.len() >= 8 => {
+                let count = u16::from_be_bytes(bytes[4..6].try_into().ok()?) as usize;
+                let unpadded_len = 6usize.checked_add(count.checked_mul(2)?)?;
+                let padded_len = unpadded_len.checked_add(3)? & !3;
+                if bytes.len() != padded_len {
+                    return None
+                }
+
+                let media_packet_lengths = bytes[6..unpadded_len]
+                    .chunks_exact(2)
+                    .map(|length| u16::from_be_bytes(length.try_into().unwrap()))
+                    .collect();
+                Some(FECParitySubheader::V0 { media_packet_lengths })
+            },
+            (1, true) if bytes.len() == 4 => None,
+            (1, false) if bytes.len() == 8 => Some(FECParitySubheader::V1 {
                 redundant_bits_for_payload_size: u16::from_be_bytes(bytes[4..6].try_into().ok()?),
                 parity_sequence_number: u16::from_be_bytes(bytes[6..8].try_into().ok()?),
-            })
-        } else {
-            None
+            }),
+            _ => return None,
         };
 
         Some(Self {
-            version: (common >> 30) as u8,
+            version,
             symbols_per_packet: ((common >> 27) & 0x7) as u8,
-            position: ((common >> 23) & 0xf) as u8,
-            is_data: common & 0x00400000 != 0,
-            group_id: ((common >> 15) & 0x7f) as u8,
-            last_group: common & 0x00004000 != 0,
-            start_position: ((common >> 10) & 0xf) as u8,
-            fec_percentage: (common & 0x3ff) as u16,
+            position,
+            is_data,
+            group_id,
+            last_group,
+            start_position,
+            fec_percentage,
             parity,
         })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let common = ((self.version as u32 & 0x3) << 30)
-            | ((self.symbols_per_packet as u32 & 0x7) << 27)
-            | ((self.position as u32 & 0xf) << 23)
-            | ((self.is_data as u32) << 22)
-            | ((self.group_id as u32 & 0x7f) << 15)
-            | ((self.last_group as u32) << 14)
-            | ((self.start_position as u32 & 0xf) << 10)
-            | self.fec_percentage as u32 & 0x3ff;
+        let common = match self.version {
+            0 => ((self.symbols_per_packet as u32 & 0x7) << 27)
+                | ((self.position as u32 & 0x7) << 24)
+                | ((self.is_data as u32) << 23)
+                | ((self.group_id as u32 & 0x7f) << 16)
+                | ((self.last_group as u32) << 15)
+                | ((self.start_position as u32 & 0x7) << 11)
+                | self.fec_percentage as u32 & 0x7ff,
+            1 => (1 << 30)
+                | ((self.symbols_per_packet as u32 & 0x7) << 27)
+                | ((self.position as u32 & 0xf) << 23)
+                | ((self.is_data as u32) << 22)
+                | ((self.group_id as u32 & 0x7f) << 15)
+                | ((self.last_group as u32) << 14)
+                | ((self.start_position as u32 & 0xf) << 10)
+                | self.fec_percentage as u32 & 0x3ff,
+            _ => panic!("Unsupported FEC header version {}", self.version),
+        };
         let mut result = common.to_be_bytes().to_vec();
-        if let Some(parity) = self.parity {
-            result.extend_from_slice(&parity.redundant_bits_for_payload_size.to_be_bytes());
-            result.extend_from_slice(&parity.parity_sequence_number.to_be_bytes());
+
+        match (self.version, self.is_data, &self.parity) {
+            (0, true, None) | (1, true, None) => {},
+            (0, false, Some(FECParitySubheader::V0 { media_packet_lengths })) => {
+                let count = u16::try_from(media_packet_lengths.len()).expect("Too many V0 FEC media packet lengths");
+                result.extend_from_slice(&count.to_be_bytes());
+                for length in media_packet_lengths {
+                    result.extend_from_slice(&length.to_be_bytes());
+                }
+                while result.len() % 4 != 0 {
+                    result.push(0);
+                }
+            },
+            (1, false, Some(FECParitySubheader::V1 { redundant_bits_for_payload_size, parity_sequence_number })) => {
+                result.extend_from_slice(&redundant_bits_for_payload_size.to_be_bytes());
+                result.extend_from_slice(&parity_sequence_number.to_be_bytes());
+            },
+            _ => panic!("FEC parity subheader does not match header version and packet type"),
         }
         result
     }
+}
+
+#[test]
+fn decode_ft_ctrl() {
+    let i = FTVideoControlData::from_ext(37641, b"\0\x01?\x14\0\x04\xf9\x02");
+    panic!("{i:?}");
 }
 
 // VCMediaControlInfoFaceTimeVideo
@@ -2833,8 +3038,9 @@ struct FTVideoControlData {
 }
 
 impl FTVideoControlData {
-    fn from_ext(profile: u16, mut payload: Vec<u8>) -> Self {
+    fn from_ext(profile: u16, data: &[u8]) -> Self {
         let version = (profile >> 14) as u8;
+        let mut payload = data.to_vec();
         Self {
             version,
             camera_status: FTVideoCameraStatus::decode((profile >> 8) as u8 & 0x3f),
@@ -2850,7 +3056,13 @@ impl FTVideoControlData {
             } else { None },
             fec_header: if (profile & 0x4) != 0 {
                 let header = payload.drain(..payload.len() - if profile & 0x8 != 0 { 4 } else { 0 }).collect::<Vec<_>>();
-                Some(FECHeader::from_bytes(&header).unwrap())
+                // Sometimes this returns None in group calls, need to figure out why, we don't use FEC
+                // in groups anyways.
+                let result = FECHeader::from_bytes(&header);
+                if result.is_none() {
+                    warn!("Failed to parse FEC header {}{}", encode_hex(&profile.to_be_bytes()), encode_hex(&data));
+                }
+                result
             } else { None },
             probe: if (profile & 0x8) != 0 {
                 Some(u32::from_be_bytes(payload.drain(..4).collect::<Vec<_>>().try_into().unwrap()))
@@ -2879,6 +3091,45 @@ impl FTVideoControlData {
 
 #[test]
 fn test_fec_header() {
+    let data = decode_hex("0880985d").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 0,
+        symbols_per_packet: 1,
+        position: 0,
+        is_data: true,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 93,
+        parity: None,
+    });
+    assert_eq!(header.to_bytes(), data);
+
+    let data = decode_hex("0800985d0005005b005d005d005d005c").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header, FECHeader {
+        version: 0,
+        symbols_per_packet: 1,
+        position: 0,
+        is_data: false,
+        group_id: 0,
+        last_group: true,
+        start_position: 3,
+        fec_percentage: 93,
+        parity: Some(FECParitySubheader::V0 {
+            media_packet_lengths: vec![91, 93, 93, 93, 92],
+        }),
+    });
+    assert_eq!(header.to_bytes(), data);
+
+    let data = decode_hex("0800985d0004005b005d005d005d0000").unwrap();
+    let header = FECHeader::from_bytes(&data).unwrap();
+    assert_eq!(header.parity, Some(FECParitySubheader::V0 {
+        media_packet_lengths: vec![91, 93, 93, 93],
+    }));
+    assert_eq!(header.to_bytes(), data);
+
     let data = decode_hex("4bc04c64").unwrap();
     let header = FECHeader::from_bytes(&data).unwrap();
     assert_eq!(header, FECHeader {
@@ -2905,7 +3156,7 @@ fn test_fec_header() {
         last_group: true,
         start_position: 3,
         fec_percentage: 100,
-        parity: Some(FECParitySubheader {
+        parity: Some(FECParitySubheader::V1 {
             redundant_bits_for_payload_size: 0x081b,
             parity_sequence_number: 0x02d6,
         }),
@@ -2913,10 +3164,27 @@ fn test_fec_header() {
     assert_eq!(header.to_bytes(), data);
 }
 
-fn build_rvra1(width: u32, height: u32) -> [u8; 2] {
+fn build_rvra1(width: u16, height: u16) -> [u8; 2] {
     let width = (width / 8) as u8;
     let height = (height / 8) as u8;
     [width, height]
+}
+
+// VRAE is RVRA1 but more precise for screen sharing.
+fn build_vrae(width: u16, height: u16) -> Vec<u8> {
+    [
+        width.to_be_bytes(),
+        height.to_be_bytes(),
+    ].concat()
+}
+
+fn build_sw(offset_x: i16, offset_y: i16, width: u16, height: u16) -> Vec<u8> {
+    [
+        offset_x.to_be_bytes(),
+        offset_y.to_be_bytes(),
+        width.to_be_bytes(),
+        height.to_be_bytes(),
+    ].concat()
 }
 
 fn apple_image_description_payload(data: &[u8]) -> Option<(usize, &[u8])> {
@@ -3126,43 +3394,66 @@ pub struct VideoSender {
     last_probe: Option<Instant>,
     pub ssrc: u32,
     pub secondary_streams: Vec<u16>,
+    group: u32,
     
     // all of these cannot be mended with u1 switching.
     enabled_features: EnabledAVFeatures,
+    group_features: EnabledAVFeatures,
     to_participant: Option<i64>,
     
     link: Arc<GlobalLink>,
     packet_buffer: Arc<std::sync::Mutex<AVChannelHistory>>,
     pub camera_source: FTVideoCameraStatus,
+
+    width: u16,
+    height: u16,
 }
 
 impl VideoSender {
-    pub fn send_video_frame(&mut self, frame: ChannelFrame, timestamp: u32) -> Result<(), PushError> {
-        let mut nal = match frame {
-            ChannelFrame::Configuration(desc) => {
-                self.pending_desc = Some(desc);
-                return Ok(())
-            }
-            ChannelFrame::Sample(mut nal) => {
-                if self.to_participant.is_some() {
-                    self.enabled_features.add_footer(&mut nal, HashMap::from_iter([
-                        // ("RVRA1", build_rvra1(1920, 1080).to_vec()),
-                        ("CH1", vec![0x00, 0x00]),
-                        ("CR", vec![0x65, 0x43, 0x00, 0x00]),
-                        ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
-                    ]));
-                } else {
-                    GROUP_H265_FEATURES.add_footer(&mut nal, HashMap::from_iter([
-                        // FIX GROUP RESOLUTION
-                        ("RVRA1", build_rvra1(1920, 1080).to_vec()),
-                        ("CH1", vec![0x00, 0x00]),
-                        ("CR", vec![0x00, 0x00, 0x00, 0x00]),
-                        ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
-                    ]));
+    pub fn send_video_frame(&mut self, frame: Vec<ChannelFrame>, timestamp: u32) -> Result<(), PushError> {
+        let mut nal = vec![];
+
+        for frame in frame {
+            let result = match frame {
+                ChannelFrame::Configuration(desc) => {
+                    self.pending_desc = Some(desc);
+                    continue
                 }
-                nal
-            }
-        };
+                ChannelFrame::Sample(mut nal) => {
+                    let r#type = (nal[0] >> 1) & 0x3f;
+                    if r#type < 32 {
+                        if self.to_participant.is_some() {
+                            self.enabled_features.add_footer(&mut nal, HashMap::from_iter([
+                                // ("RVRA1", build_rvra1(self.width, self.height).to_vec()),
+                                ("CH1", vec![0x00, 0x00]),
+                                ("CR", vec![0x65, 0x43, 0x00, 0x00]),
+                                ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
+
+                                ("SW", build_sw(0, 0, self.width, self.height)),
+                            ]));
+                        } else {
+                            self.group_features.add_footer(&mut nal, HashMap::from_iter([
+                                // FIX GROUP RESOLUTION
+                                ("RVRA1", build_rvra1(self.width, self.height).to_vec()),
+                                ("CH1", vec![0x00, 0x00]),
+                                ("CR", vec![0x00, 0x00, 0x00, 0x00]),
+                                ("FA", vec![0x3e, 0x3e, 0xc0, 0xc0]),
+
+                                ("VRAE", build_vrae(self.width, self.height)),
+                                ("SW", build_sw(0, 0, self.width, self.height)),
+                            ]));
+                        }
+                    }
+                    nal
+                }
+            };
+
+            nal.extend_from_slice(&[0, 0, 0, 1]);
+            nal.extend_from_slice(&result);
+        }
+
+        if nal.is_empty() { return Ok(()) }
+
         let desc = self.pending_desc.take();
 
         if let Some(DecoderConfiguration::Raw(raw, _)) = &desc {
@@ -3210,7 +3501,9 @@ impl VideoSender {
 
         let mut payloads_len = payloads.len();
         let extension = FTVideoControlData {
-            version: if self.to_participant.is_some() { 2 } else { 1 },
+            // Techincally this should use media_control_info_version in U1, won't work for old clients
+            // TODO old
+            version: if self.to_participant.is_some() || self.group == 3 { 2 } else { 1 },
             camera_status: self.camera_source,
             ltr_bits: if desc.is_some() { 1 } else { 0 },
             total_packets_per_frame: Some(payloads.len() as u16),
@@ -3218,7 +3511,7 @@ impl VideoSender {
             ..Default::default()
         };
 
-        if payloads_len > 3 && self.to_participant.is_some() {
+        if payloads_len > 3 && self.to_participant.is_some() && self.group == 1 {
             let symbols_per_packet: u8 = match payloads_len {
                 2 => 4,
                 3 | 4 => 2,
@@ -3259,6 +3552,7 @@ impl VideoSender {
                 }
                 
                 for (position, size_red, data) in fec.get_parity().take(parity_packets as usize) {
+                    // Group requires V0, except ftxt stream which is always v1
                     let header = FECHeader {
                         version: 1,
                         symbols_per_packet,
@@ -3268,7 +3562,7 @@ impl VideoSender {
                         last_group,
                         start_position: start,
                         fec_percentage: 100 * parity_packets as u16 / group_len as u16,
-                        parity: Some(FECParitySubheader {
+                        parity: Some(FECParitySubheader::V1 {
                             redundant_bits_for_payload_size: size_red,
                             parity_sequence_number: self.fec_number,
                         }),
@@ -3284,7 +3578,7 @@ impl VideoSender {
         for (idx, payload) in payloads.into_iter().enumerate() {
             // info!("SEnding video payload {}", encode_hex(&payload));
 
-            let is_data = !payload.0.is_some_and(|i| !i.is_data);
+            let is_data = !payload.0.as_ref().is_some_and(|i| !i.is_data);
 
             let extension = FTVideoControlData {
                 fec_header: payload.0,
@@ -3519,10 +3813,7 @@ pub enum AVControlCommand {
         participant: i64,
         data: VCControlData,
     },
-    SelectStreams {
-        video_streams: Vec<Option<u32>>,
-        audio_streams: Vec<Option<u32>>,
-    },
+    SelectStreams(Option<HashMap<u32, Vec<u32>>>),
     SelectVideoBitrate(usize),
     ActiveParticipants(HashSet<u64>),
     CallFailed,
@@ -3576,8 +3867,8 @@ impl AVSession {
                 my_skm: QuickRelaySkmMaterial::create(id as u64),
                 outgoing_ctrl_counters: HashMap::new(),
                 video_enabled: video_enabled,
-                video_streams: vec![],
-                audio_streams: vec![],
+                screen_enabled: false,
+                active_streams: HashMap::new(),
                 last_stream_change: start_now - Duration::from_secs(30),
                 last_probe: start_now - Duration::from_secs(45), /* probe in 15 seconds if no one else gets involved */
                 last_quality_bump: start_now,
@@ -3651,24 +3942,20 @@ impl AVSession {
                         }
                     },
                     GlobalLinkChange::RequestedStreams(streams) => {
-                        let video_streams = streams.iter().filter_map(|&stream| {
-                            let Some(stream) = session.av_config.video_streams.values().find(|s| get_stream_id(&s) == stream) else {
-                                return None
-                            };
-                            Some(Some(stream.stream_index()))
-                        }).collect::<Vec<_>>();
-
-                        let audio_streams = streams.iter().filter_map(|&stream| {
-                            let Some(stream) = session.av_config.audio_streams.values().find(|s| get_stream_id(&s) == stream) else {
-                                return None
-                            };
-                            Some(Some(stream.stream_index()))
-                        }).collect::<Vec<_>>();
-                        session.state.lock().await.video_streams = video_streams.clone();
-                        session.state.lock().await.audio_streams = audio_streams.clone();
+                        let map: HashMap<u32, Vec<u32>> = session.av_config.stream_groups.iter().filter_map(|(group, config)| {
+                            let streams = config.streams.values()
+                                .filter(|s| streams.contains(&get_stream_id(&s)))
+                                .map(|i| i.stream_index()).collect::<Vec<_>>();
+                            if streams.is_empty() {
+                                None
+                            } else {
+                                Some((*group, streams))
+                            }
+                        }).collect();
+                        session.state.lock().await.active_streams = map.clone();
                         // group only
                         if !session.u1.load(Ordering::Relaxed) {
-                            let _ = session.control_sender.try_send(AVControlCommand::SelectStreams { video_streams, audio_streams });
+                            let _ = session.control_sender.try_send(AVControlCommand::SelectStreams(Some(map)));
                         }
                     },
                     GlobalLinkChange::ActiveParticipants(participants) => {
@@ -3678,7 +3965,7 @@ impl AVSession {
                         let old_participants = lock.active_participants.clone();
                         if lock.active_participants != set {
                             // remove removed participants
-                            session.frame_handler.stats.records.write().unwrap().retain(|a, _| set.contains(&a.0));
+                            session.frame_handler.stats.records.write().unwrap().retain(|a, _| set.contains(&a.participant));
                             session.frame_handler.stats.timing_targets.write().unwrap().retain(|a, _| set.contains(a));
                             lock.active_participants = set.clone();
                             let _ = session.control_sender.try_send(AVControlCommand::ActiveParticipants(set.clone()));
@@ -3740,15 +4027,21 @@ impl AVSession {
         }
     }
 
+    pub async fn publish_state(&self) {
+        if self.u1.load(Ordering::Relaxed) {
+            let _ = self.control_sender.try_send(AVControlCommand::SelectStreams(None));
+            let state = self.state.lock().await;
+            let _ = self.control_sender.try_send(AVControlCommand::SelectVideoBitrate(BITRATE_TABLE[state.current_video_bitrate] * 1000));
+        } else {
+            let state = self.state.lock().await;
+            let _ = self.control_sender.try_send(AVControlCommand::SelectStreams(Some(state.active_streams.clone())));
+        }
+    }
+
     async fn update_u1(&self, u1: bool) -> Result<(), PushError> {
         info!("Setting U1 state to {u1}");
         self.u1.store(u1, Ordering::Relaxed);
-        if u1 {
-            let _ = self.control_sender.try_send(AVControlCommand::SelectStreams { video_streams: vec![None], audio_streams: vec![None] });
-        } else {
-            let state = self.state.lock().await;
-            let _ = self.control_sender.try_send(AVControlCommand::SelectStreams { video_streams: state.video_streams.clone(), audio_streams: state.audio_streams.clone() });
-        }
+        self.publish_state().await;
         self.link.set_relay_mode(!u1).await;
         self.update_subscribed_streams().await?;
         Ok(())
@@ -3761,13 +4054,23 @@ impl AVSession {
         self.send_stream_groups_state(None).await
     }
 
+    pub async fn set_screen_enabled(&self, screen: bool) -> Result<(), PushError> {
+        let mut data = self.state.lock().await;
+        data.screen_enabled = screen;
+        drop(data);
+        self.send_stream_groups_state(None).await
+    }
+
     async fn send_stream_groups_state(&self, to: Option<u64>) -> Result<(), PushError> {
         let data = self.state.lock().await;
         let video = data.video_enabled;
+        let screen = data.screen_enabled;
         let participants = data.active_participants.clone();
         drop(data);
         info!("Sending stream group state!");
         let send = |item| {
+            // SCREEN 3, 130
+            // SCREEN AUDIO 4, 131
             self.send_control_message(item, VCControlData::StreamGroupState(HashMap::from_iter([
                 (136, 0),
                 (128, if video { 1 } else { 2 }),
@@ -3778,16 +4081,17 @@ impl AVSession {
                 (133, 0),
                 (1, if video { 1 } else { 2 }),
                 (2, 1),
-                (3, 0),
+                (3, if screen { 1 } else { 0 }),
                 (134, 0),
-                (4, 0),
+                // disable screen audio when screen sharing
+                (4, if screen { 2 } else { 0 }),
                 (5, if video { 1 } else { 2 }),
-                (130, 0),
+                (130, if screen { 1 } else { 0 }),
                 (6, 1),
                 (135, 0),
                 (7, 0),
                 (8, 0),
-                (131, 0),
+                (131, if screen { 2 } else { 0 }),
                 (9, 0),
             ])))
         };
@@ -3801,13 +4105,15 @@ impl AVSession {
         Ok(())
     }
 
-    pub async fn create_audio_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> AudioSender {
+    pub async fn create_audio_sender(&self, group: u32, stream: Option<u32>, extra_streams: &[u32]) -> AudioSender {
         let state = self.state.lock().await;
+
+        let group_config = self.av_config.stream_groups.get(&group).expect("Group not found!");
         
-        let group_stream = stream.map(|i| self.av_config.audio_streams.get(&i).unwrap());
-        let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.audio_ssrc);
+        let group_stream = stream.map(|i| group_config.streams.get(&i).unwrap());
+        let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(group_config.u1_ssrc);
         
-        let extra_ssrcs = extra_streams.iter().filter_map(|&i| self.av_config.audio_streams.get(&i))
+        let extra_ssrcs = extra_streams.iter().filter_map(|&i| group_config.streams.get(&i))
             .map(|i| i.rtp_ssrc() as u16).collect::<Vec<_>>();
 
         let audio_key = state.my_mkm.get_key(ssrc);
@@ -3839,13 +4145,15 @@ impl AVSession {
         }
     }
 
-    pub async fn create_video_sender(&self, stream: Option<u32>, extra_streams: &[u32]) -> VideoSender {
+    pub async fn create_video_sender(&self, group: u32, stream: Option<u32>, extra_streams: &[u32], width: u16, height: u16) -> VideoSender {
         let state = self.state.lock().await;
-        
-        let group_stream = stream.map(|i| self.av_config.video_streams.get(&i).unwrap());
-        let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(self.av_config.video_ssrc);
 
-        let extra_ssrcs = extra_streams.iter().filter_map(|&i| self.av_config.video_streams.get(&i))
+        let group_config = self.av_config.stream_groups.get(&group).expect("Group not found!");
+        
+        let group_stream = stream.map(|i| group_config.streams.get(&i).unwrap());
+        let ssrc = group_stream.map(|i| i.rtp_ssrc()).unwrap_or(group_config.u1_ssrc);
+
+        let extra_ssrcs = extra_streams.iter().filter_map(|&i| group_config.streams.get(&i))
             .flat_map(|i| {
                 if i.repaired_max_network_bitrate_v2() != 0 || i.repaired_max_network_bitrate() != 0 {
                     vec![i.rtp_ssrc(), i.rtp_ssrc() + 1]
@@ -3884,15 +4192,25 @@ impl AVSession {
             fec_number,
             pending_desc: None,
 
-            enabled_features: self.av_config.enabled_features.clone(),
+            // TODO techincally should negotiate this with the other's AVC
+            enabled_features: group_config.features.as_ref().unwrap().h265.enabled.clone(),
+            group_features: group_config.group_features.as_ref().unwrap().h265.enabled.clone(),
             ssrc,
             secondary_streams: extra_ssrcs,
             to_participant: if group_stream.is_none() { Some(*state.active_participants.iter().next().unwrap() as i64) } else { None },
 
+            group,
+
             link: self.link.clone(),
             last_probe: None,
-            camera_source: Default::default(),
+            camera_source: FTVideoCameraStatus {
+                source: if group == 3 { 1 } else { 0 },
+                ..Default::default()
+            },
             packet_buffer: self.ssrc_packet_buffer.lock().unwrap().entry(ssrc).or_default().clone(),
+
+            width,
+            height,
         }
     }
 
@@ -4284,6 +4602,33 @@ impl AVSession {
 
                         if let Some(item) = VCControlData::parse_data(&item) {
                             info!("Got control message {item:?}");
+
+                            if let VCControlData::StreamGroupState(state) = &item {
+                                let mut lock = self.state.lock().await;
+                                let encryption_state = lock.encryption_states.entry(id as u64).or_default();
+
+                                let mut changed = false;
+                                let check = [3, 4];
+                                for group in check {
+                                    let has = encryption_state.desired_groups.contains(&group);
+                                    let avail = state.get(&group) == Some(&1);
+                                    if has && !avail {
+                                        encryption_state.desired_groups.remove(&group);
+                                    }
+                                    if !has && avail {
+                                        encryption_state.desired_groups.insert(group);
+                                    }
+                                    changed = true;
+                                }
+
+                                drop(lock);
+                                if changed && !self.u1.load(Ordering::Relaxed) {
+                                    if let Err(e) = self.update_subscribed_streams().await {
+                                        warn!("Failed to update subscribe streams!");
+                                    }
+                                }
+                            }
+
                             match item {
                                 VCControlData::FetchStreamGroupState => {
                                     self.send_stream_groups_state(Some(id as u64)).await?;
@@ -4927,11 +5272,11 @@ impl DecoderConfiguration {
         None
     }
 
-    pub fn from_annex_b_hevc(annex_b: &[u8], raw: bool) -> Self {
+    pub fn from_annex_b_hevc(annex_b: &[u8], raw: bool, width: u16, height: u16) -> Self {
         if raw {
             Self::Raw(annex_b.to_vec(), ChannelType::H265)
         } else {
-            Self::ImageDescription(ImageDescription::from_annex_b_hevc(annex_b).unwrap())
+            Self::ImageDescription(ImageDescription::from_annex_b_hevc(annex_b, width, height).unwrap())
         }
     }
 
@@ -4976,6 +5321,7 @@ pub enum ChannelType {
     H264,
     Evs,
     Aac,
+    Aac48,
 }
 
 impl ChannelType {
@@ -4985,6 +5331,7 @@ impl ChannelType {
             123 => Self::H264,
             104 => Self::Aac,
             108 => Self::Evs,
+            101 => Self::Aac48,
             _unk => return None,
         })
     }
@@ -4992,8 +5339,8 @@ impl ChannelType {
 
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
-    pub participant: u64,
-    pub stream_id: u32,
+    pub stream: StreamId,
+    pub control_stream_id: u32,
     pub r#type: ChannelType,
     pub frame: ChannelFrame,
     pub prev_dropped: u16,
@@ -5024,7 +5371,7 @@ fn generate_ssrc() -> u32 {
 
 #[test]
 fn test_features() {
-    let panic = EnabledAVFeatures::from_bytes(&[0xed, 0x0f]);
+    let panic = EnabledAVFeatures::from_bytes(&[0xff, 0x0f]);
     panic!("test {panic}");
 }
 
@@ -5040,17 +5387,135 @@ fn init_streams(streams: &[VcMediaNegotiationBlobV2StreamGroupStream]) -> HashMa
 }
 
 #[derive(Clone)]
+struct AVFeatureGroup {
+    enabled: EnabledAVFeatures,
+    supported: EnabledAVFeatures,
+}
+
+impl AVFeatureGroup {
+    fn to_bytes(&self) -> Vec<u8> {
+        [
+            self.enabled.to_bytes(),
+            self.supported.to_bytes()
+        ].concat()
+    }
+}
+
+#[derive(Clone)]
+struct AVVideoConfigFeatures {
+    h265: AVFeatureGroup,
+    h264: AVFeatureGroup,
+}
+
+fn normalize_streams<'a>(group: u32, streams: impl Iterator<Item = &'a mut VcMediaNegotiationBlobV2StreamGroupStream>) {
+    let stream_3_map: HashMap<u32, u32, _> = HashMap::from([
+        (0, 366_666),
+        (8, 1_100_000),
+        (9, 2_200_000),
+        (10, 3_300_000),
+        (11, 4_400_000),
+    ]);
+    for stream in streams {
+        if group == 3 {
+            if stream.max_network_bitrate_v2.is_none() {
+                stream.max_network_bitrate_v2 = stream_3_map.get(&stream.stream_index()).copied();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AVStreamGroupConfig {
+    u1_ssrc: u32,
+    features: Option<AVVideoConfigFeatures>,
+    group_features: Option<AVVideoConfigFeatures>,
+    pub streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
+
+    raw_streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
+
+    incomplete: VcMediaNegotiationBlobV2StreamGroup,
+}
+
+impl AVStreamGroupConfig {
+    fn new(mut group: VcMediaNegotiationBlobV2StreamGroup, features: Option<AVVideoConfigFeatures>, group_features: Option<AVVideoConfigFeatures>) -> Self {
+        let payloads = std::mem::take(&mut group.streams);
+        
+        let u1_ssrc = generate_ssrc();
+        if let Some(u1) = &mut group.settings_u1 {
+            u1.rtp_ssrc = Some(u1_ssrc);
+            for feature in &mut u1.encode_decode_features {
+                match feature.rtp_payload.as_ref().unwrap() {
+                    126 | 123 => {
+                        feature.encode_decode_features = features.as_ref().map(|i| i.h264.to_bytes());
+                    },
+                    100 => {
+                        feature.encode_decode_features = features.as_ref().map(|i| i.h265.to_bytes());
+                    },
+                    _ => panic!("Unknown decode feature payload!"),
+                }
+            }
+        }
+
+        let mut streams = init_streams(&payloads);
+        let raw_streams = streams.clone();
+
+        normalize_streams(group.stream_group(), streams.values_mut());
+
+        Self {
+            u1_ssrc,
+            features,
+            group_features,
+            raw_streams,
+            streams,
+            incomplete: group,
+        }
+    }
+
+    fn config(&self) -> VcMediaNegotiationBlobV2StreamGroup {
+        VcMediaNegotiationBlobV2StreamGroup {
+            streams: self.raw_streams.values().cloned().collect(),
+            ..self.incomplete.clone()
+        }
+    }
+}
+
+// To the best of my knowledge, for V2 blobs, this is hardcoded as
+// FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;
+static GROUP_H265_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
+    &FEATURES[0], // RVRA1
+    &FEATURES[3], // CR
+    &FEATURES[4], // CF
+    &FEATURES[2], // CH1
+    &FEATURES[5], // FA
+]));
+
+// FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;
+static GROUP_H264_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
+    &AVFeature { feature: "EMP", size: 0x0 },
+    &FEATURES[0], // RVRA1
+    &AVFeature { feature: "AS", size: 0x0 },
+    &FEATURES[3], // CR
+    &FEATURES[2], // CH1
+    &FEATURES[5], // FA
+]));
+
+// To the best of my knowledge, for V2 blobs, this is hardcoded as
+// FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;
+static GROUP_SCREEN_H265_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
+    &FEATURES[1], // VRAE
+    &FEATURES[11], // SW
+]));
+
+// FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;
+static GROUP_SCREEN_H264_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
+    &FEATURES[11], // SW
+]));
+
+#[derive(Clone)]
 pub struct AVConfig {
     session: String,
     start_time: u64,
-    video_ssrc: u32,
-    audio_ssrc: u32,
-    pub video_streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
-    pub audio_streams: HashMap<u32, VcMediaNegotiationBlobV2StreamGroupStream>,
-    enabled_features: EnabledAVFeatures,
-    supported_features: EnabledAVFeatures,
-    h264_features: EnabledAVFeatures,
-    h264_supported: EnabledAVFeatures,
+    pub stream_groups: HashMap<u32, AVStreamGroupConfig>,
 }
 
 impl AVConfig {
@@ -5058,86 +5523,259 @@ impl AVConfig {
         Self {
             session: Uuid::new_v4().to_string().to_uppercase(),
             start_time: duration_since_epoch().as_millis() as u64,
-            video_ssrc: generate_ssrc(),
-            audio_ssrc: generate_ssrc(),
-            video_streams: init_streams(&[
-                // this means h.264 only
-                // payload_spec_or_payloads: Some(1),
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(1014562129),
-                    // repaired_max_network_bitrate: Some(78640),
-                    stream_index: Some(0),
-                    max_network_bitrate_v2: Some(32000),
-                    payload_spec_or_payloads: Some(2),
-                    // repaired_max_network_bitrate_v2: Some(78640),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(2123964153),
-                    stream_index: Some(1),
-                    max_network_bitrate_v2: Some(60800),
-                    payload_spec_or_payloads: Some(2),
-                    // repaired_max_network_bitrate_v2: Some(136240),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(478364846),
-                    stream_index: Some(2),
-                    max_network_bitrate_v2: Some(110800),
-                    payload_spec_or_payloads: Some(2),
-                    // repaired_max_network_bitrate_v2: Some(236240),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(2140118365),
-                    stream_index: Some(3),
-                    max_network_bitrate_v2: Some(220400),
-                    // repaired_max_network_bitrate_v2: Some(470080),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(1363890893),
-                    stream_index: Some(4),
-                    max_network_bitrate_v2: Some(440800),
-                    // repaired_max_network_bitrate_v2: Some(922720),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(730812412),
-                    stream_index: Some(5),
-                    max_network_bitrate_v2: Some(876800),
-                    ..Default::default()
-                },
+            stream_groups: HashMap::from_iter([
+                (1, AVStreamGroupConfig::new(
+                    VcMediaNegotiationBlobV2StreamGroup {
+                        stream_group: Some(1),
+                        payloads: vec![
+                            // H264 (by array index)
+                            VcMediaNegotiationBlobV2StreamGroupPayload {
+                                rtcp_flags: Some(4),
+                                ..Default::default()
+                            },
+                            // H265
+                            VcMediaNegotiationBlobV2StreamGroupPayload {
+                                rtcp_flags: Some(4),
+                                ..Default::default()
+                            }
+                        ],
+                        streams: vec![
+                            // this means h.264 only
+                            // payload_spec_or_payloads: Some(1),
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(1014562129),
+                                // repaired_max_network_bitrate: Some(78640),
+                                stream_index: Some(0),
+                                max_network_bitrate_v2: Some(32000),
+                                payload_spec_or_payloads: Some(2),
+                                // repaired_max_network_bitrate_v2: Some(78640),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(2123964153),
+                                stream_index: Some(1),
+                                max_network_bitrate_v2: Some(60800),
+                                payload_spec_or_payloads: Some(2),
+                                // repaired_max_network_bitrate_v2: Some(136240),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(478364846),
+                                stream_index: Some(2),
+                                max_network_bitrate_v2: Some(110800),
+                                payload_spec_or_payloads: Some(2),
+                                // repaired_max_network_bitrate_v2: Some(236240),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(2140118365),
+                                stream_index: Some(3),
+                                max_network_bitrate_v2: Some(220400),
+                                // repaired_max_network_bitrate_v2: Some(470080),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(1363890893),
+                                stream_index: Some(4),
+                                max_network_bitrate_v2: Some(440800),
+                                // repaired_max_network_bitrate_v2: Some(922720),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(730812412),
+                                stream_index: Some(5),
+                                max_network_bitrate_v2: Some(876800),
+                                ..Default::default()
+                            },
+                        ],
+                        settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                            encode_decode_features: vec![
+                                VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                    rtp_payload: Some(123), // h.264'
+                                    ..Default::default()
+                                },
+                                VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                    rtp_payload: Some(100), // hevc
+                                    ..Default::default()
+                                },
+                            ],
+                            ..Default::default()
+                        }),
+                    },
+                    Some(AVVideoConfigFeatures {
+                        h265: AVFeatureGroup {
+                            enabled: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;"),
+                            supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
+                        },
+                        h264: AVFeatureGroup {
+                            enabled: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;"),
+                            supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
+                        },
+                    }),
+                    Some(AVVideoConfigFeatures {
+                        h265: AVFeatureGroup {
+                            enabled: GROUP_H265_FEATURES.clone(),
+                            supported: GROUP_H265_FEATURES.clone(),
+                        },
+                        h264: AVFeatureGroup {
+                            enabled: GROUP_H264_FEATURES.clone(),
+                            supported: GROUP_H264_FEATURES.clone(),
+                        },
+                    }),
+                )),
+                (2, AVStreamGroupConfig::new(
+                    VcMediaNegotiationBlobV2StreamGroup {
+                        stream_group: Some(2),
+                        payloads: vec![
+                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(108), ..Default::default() },
+                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(13), ..Default::default() },
+                            VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(104), ..Default::default() },
+                        ],
+                        streams: vec![
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(2704322536),
+                                stream_index: Some(0),
+                                max_network_bitrate_v2: Some(31334),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                // rtp_ssrc: Some(890728963),
+                                stream_index: Some(1),
+                                max_network_bitrate_v2: Some(73400),
+                                ..Default::default()
+                            },
+                        ],
+                        settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                            encode_decode_features: vec![],
+                            ..Default::default()
+                        }),
+                    }, 
+                    None, 
+                    None
+                )),
+                (3, AVStreamGroupConfig::new(
+                    VcMediaNegotiationBlobV2StreamGroup {
+                        stream_group: Some(3),
+                        payloads: vec![
+                            VcMediaNegotiationBlobV2StreamGroupPayload {
+                                rtcp_flags: Some(4),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupPayload {
+                                rtcp_flags: Some(4),
+                                ..Default::default()
+                            },
+                        ],
+                        streams: vec![
+                            // max network bitrate fields added, these are not present
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                payload_spec_or_payloads: Some(2),
+                                stream_index: Some(0),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                payload_spec_or_payloads: Some(2),
+                                stream_index: Some(8),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                payload_spec_or_payloads: Some(2),
+                                stream_index: Some(9),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                payload_spec_or_payloads: Some(2),
+                                stream_index: Some(10),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                payload_spec_or_payloads: Some(2),
+                                stream_index: Some(11),
+                                ..Default::default()
+                            },
+                        ],
+                        settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                            encode_decode_features: vec![
+                                VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                    rtp_payload: Some(126), // h264/alt
+                                    ..Default::default()
+                                },
+                                VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                    rtp_payload: Some(123), // h264
+                                    ..Default::default()
+                                },
+                                VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
+                                    rtp_payload: Some(100),  // hevc
+                                    ..Default::default()
+                                },
+                            ],
+                            ..Default::default()
+                        }),
+                    },
+                    Some(AVVideoConfigFeatures {
+                        h265: AVFeatureGroup {
+                            enabled: EnabledAVFeatures::from_str("FLS2;SW;"),
+                            supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
+                        },
+                        h264: AVFeatureGroup {
+                            enabled: EnabledAVFeatures::from_str("FLS2;SW;"),
+                            supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
+                        },
+                    }),
+                    Some(AVVideoConfigFeatures {
+                        h265: AVFeatureGroup {
+                            enabled: GROUP_SCREEN_H265_FEATURES.clone(),
+                            supported: GROUP_SCREEN_H265_FEATURES.clone(),
+                        },
+                        h264: AVFeatureGroup {
+                            enabled: GROUP_SCREEN_H264_FEATURES.clone(),
+                            supported: GROUP_SCREEN_H264_FEATURES.clone(),
+                        },
+                    }),
+                )),
+                (4, AVStreamGroupConfig::new(
+                    VcMediaNegotiationBlobV2StreamGroup {
+                        stream_group: Some(4),
+                        payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
+                            rtp_payload: Some(101),
+                            p_time: Some(40),
+                            ..Default::default()
+                        }],
+                        streams: vec![
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                stream_index: Some(0),
+                                max_network_bitrate_v2: Some(73800),
+                                ..Default::default()
+                            },
+                            VcMediaNegotiationBlobV2StreamGroupStream {
+                                stream_index: Some(1),
+                                max_network_bitrate_v2: Some(153200),
+                                ..Default::default()
+                            },
+                        ],
+                        settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
+                            encode_decode_features: vec![],
+                            ..Default::default()
+                        }),
+                    },
+                    None,
+                    None,
+                ))
             ]),
-            audio_streams: init_streams(&[
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(2704322536),
-                    stream_index: Some(0),
-                    max_network_bitrate_v2: Some(31334),
-                    ..Default::default()
-                },
-                VcMediaNegotiationBlobV2StreamGroupStream {
-                    // rtp_ssrc: Some(890728963),
-                    stream_index: Some(1),
-                    max_network_bitrate_v2: Some(73400),
-                    ..Default::default()
-                },
-            ]),
-            enabled_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;CF;FA;"),
-            supported_features: EnabledAVFeatures::from_str("FLS2;VRAE;CH1;CR;CF;FA;POS;HTS;EOD;RR;QP;SW;"),
-            h264_features: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;"),
-            h264_supported: EnabledAVFeatures::from_str("FLS2;CH1;CR;FA;POS;HTS;EOD;RR;QP;SW;"),
         }
     }
 
     // MUST NOT USE RANDOMIZATION/Time, any mismatch between link avc and IDS avc will cause lack of stream.
     pub fn avc_data(&self) -> AVCData {
         // FLS2;RVRA1;CH1;CR;CF;FA; - macos features
-        let mut video_features = self.enabled_features.to_bytes().to_vec();
-        video_features.extend_from_slice(&self.supported_features.to_bytes());
+        let video_group = self.stream_groups.get(&1).unwrap();
+        let audio_group = self.stream_groups.get(&2).unwrap();
+        let h265_features = video_group.features.as_ref().unwrap().h265.to_bytes();
+        let h264_features = video_group.features.as_ref().unwrap().h264.to_bytes();
 
-        let mut h264_features = self.h264_features.to_bytes().to_vec();
-        h264_features.extend_from_slice(&self.h264_supported.to_bytes());
+        let screen_group = self.stream_groups.get(&3).unwrap();
+        let scr_h265 = screen_group.features.as_ref().unwrap().h265.to_bytes();
+        let scr_h264 = screen_group.features.as_ref().unwrap().h264.to_bytes();
 
 
         let now = Duration::from_millis(self.start_time);
@@ -5145,7 +5783,7 @@ impl AVConfig {
         let ntp_time = ((now.as_secs() + 2_208_988_800) << 32)
         | (((now.subsec_nanos() as u128) << 32) / 1_000_000_000) as u64;
 
-        let media = VcMediaNegotiationBlobV2 {
+        let mut media = VcMediaNegotiationBlobV2 {
             general_info: Some(VcMediaNegotiationBlobV2GeneralInfo {
                 ntp_time: Some(ntp_time),
                 cname: None,
@@ -5161,10 +5799,10 @@ impl AVConfig {
             }),
             codec_support: Some(VcMediaNegotiationBlobV2CodecFeatures {
                 audio_features: None,
-                video_features: Some(video_features.clone()),
+                video_features: Some(h265_features.clone()),
             }),
             microphone_u1: Some(VcMediaNegotiationBlobV2MicrophoneSettingsU1 {
-                rtp_ssrc: Some(self.audio_ssrc),
+                rtp_ssrc: Some(audio_group.u1_ssrc),
                 // flag 1  -> payload 104  AAC-ish
                 // flag 2  -> payload 108  EVS
                 // flag 4  -> payload 13   DTX/CN
@@ -5175,7 +5813,7 @@ impl AVConfig {
                 cipher_suites: Some(5),
             }),
             camera_u1: Some(VcMediaNegotiationBlobV2CameraSettingsU1 {
-                rtp_ssrc: Some(self.video_ssrc),
+                rtp_ssrc: Some(video_group.u1_ssrc),
                 payloads: vec![
                     VcMediaNegotiationBlobV2VideoPayload {
                         video_payload: None,
@@ -5190,7 +5828,7 @@ impl AVConfig {
                         parameter_set: Some(14),
                         encode_formats: Some(311492966),
                         decode_formats: Some(104005632),
-                        encode_decode_features: Some(video_features.clone()),
+                        encode_decode_features: Some(h265_features.clone()),
                         preferred_decode_format: Some(0),
                     },
                 ],
@@ -5230,136 +5868,6 @@ impl AVConfig {
                     settings_u1: None,
                 },
                 VcMediaNegotiationBlobV2StreamGroup {
-                    stream_group: Some(3),
-                    payloads: vec![
-                        VcMediaNegotiationBlobV2StreamGroupPayload {
-                            rtcp_flags: Some(4),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupPayload {
-                            rtcp_flags: Some(4),
-                            ..Default::default()
-                        },
-                    ],
-                    streams: vec![
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            payload_spec_or_payloads: Some(1),
-                            rtp_ssrc: Some(1409061878),
-                            stream_index: Some(0),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            payload_spec_or_payloads: Some(1),
-                            rtp_ssrc: Some(3893587782),
-                            stream_index: Some(8),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            payload_spec_or_payloads: Some(1),
-                            rtp_ssrc: Some(3560702437),
-                            stream_index: Some(9),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            payload_spec_or_payloads: Some(1),
-                            rtp_ssrc: Some(4263985395),
-                            stream_index: Some(10),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            payload_spec_or_payloads: Some(1),
-                            rtp_ssrc: Some(1600051301),
-                            stream_index: Some(11),
-                            ..Default::default()
-                        },
-                    ],
-                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
-                        rtp_ssrc: Some(925355770),
-                        encode_decode_features: vec![
-                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
-                                rtp_payload: Some(126), // h264/alt
-                                encode_decode_features: Some(vec![0x00, 0x08, 0xed, 0x0f]),
-                            },
-                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
-                                rtp_payload: Some(123), // h264
-                                encode_decode_features: Some(vec![0x00, 0x08, 0xed, 0x0f]),
-                            },
-                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
-                                rtp_payload: Some(100),  // hevc
-                                encode_decode_features: Some(vec![0x02, 0x08, 0xff, 0x0f]),
-                            },
-                        ],
-                    }),
-                },
-                VcMediaNegotiationBlobV2StreamGroup {
-                    stream_group: Some(2),
-                    payloads: vec![
-                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(108), ..Default::default() },
-                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(13), ..Default::default() },
-                        VcMediaNegotiationBlobV2StreamGroupPayload { rtp_payload: Some(104), ..Default::default() },
-                    ],
-                    streams: self.audio_streams.values().cloned().collect(),
-                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
-                        rtp_ssrc: Some(self.audio_ssrc),
-                        encode_decode_features: vec![],
-                    }),
-                },
-                VcMediaNegotiationBlobV2StreamGroup {
-                    stream_group: Some(4),
-                    payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
-                        rtp_payload: Some(101),
-                        p_time: Some(40),
-                        ..Default::default()
-                    }],
-                    streams: vec![
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            rtp_ssrc: Some(3755905642),
-                            stream_index: Some(0),
-                            max_network_bitrate_v2: Some(73800),
-                            ..Default::default()
-                        },
-                        VcMediaNegotiationBlobV2StreamGroupStream {
-                            rtp_ssrc: Some(1043709230),
-                            stream_index: Some(1),
-                            max_network_bitrate_v2: Some(153200),
-                            ..Default::default()
-                        },
-                    ],
-                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
-                        rtp_ssrc: Some(2287042244),
-                        encode_decode_features: vec![],
-                    }),
-                },
-                VcMediaNegotiationBlobV2StreamGroup {
-                    stream_group: Some(1),
-                    payloads: vec![
-                        // H264 (by array index)
-                        VcMediaNegotiationBlobV2StreamGroupPayload {
-                            rtcp_flags: Some(4),
-                            ..Default::default()
-                        },
-                        // H265
-                        VcMediaNegotiationBlobV2StreamGroupPayload {
-                            rtcp_flags: Some(4),
-                            ..Default::default()
-                        }
-                    ],
-                    streams: self.video_streams.values().cloned().collect(),
-                    settings_u1: Some(VcMediaNegotiationBlobV2SettingsU1 {
-                        rtp_ssrc: Some(self.video_ssrc),
-                        encode_decode_features: vec![
-                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
-                                rtp_payload: Some(123), // h.264
-                                encode_decode_features: Some(h264_features.clone()),
-                            },
-                            VcMediaNegotiationBlobV2StreamGroupEncodeDecodeFeatures {
-                                rtp_payload: Some(100), // hevc
-                                encode_decode_features: Some(video_features.clone()),
-                            },
-                        ],
-                    }),
-                },
-                VcMediaNegotiationBlobV2StreamGroup {
                     stream_group: Some(5),
                     payloads: vec![VcMediaNegotiationBlobV2StreamGroupPayload {
                         rtcp_flags: Some(6),
@@ -5389,13 +5897,14 @@ impl AVConfig {
                 },
             ],
         };
+        media.stream_groups.extend(self.stream_groups.iter().map(|i| i.1.config()));
 
         // video streams SSRC out of sync here.
         let mediav1 = VcMediaNegotiationBlob {
             allow_dynamic_max_bitrate: Some(true),
             allows_contents_change_with_aspect_preservation: Some(true),
             audio_settings: Some(VcMediaNegotiationBlobAudioSettings {
-                rtp_ssrc: Some(self.audio_ssrc),
+                rtp_ssrc: Some(4834782),
                 audio_unit_model: Some(67072),
                 support_flags: Some(1),
                 payload_flags: Some(3711),
@@ -5403,7 +5912,7 @@ impl AVConfig {
                 use_sbr: Some(true),
             }),
             video_settings: Some(VcMediaNegotiationBlobVideoSettings {
-                rtp_ssrc: Some(self.video_ssrc),
+                rtp_ssrc: Some(4834783),
                 allow_rtcpfb: Some(false),
                 video_payload_collections: vec![
                     VcMediaNegotiationBlobVideoPayloadSettings {
@@ -5705,8 +6214,7 @@ static FEATURES: &[AVFeature] = &[
     AVFeature { feature: "CH1", size: 0x2 },
     AVFeature { feature: "CR", size: 0x4 },
     AVFeature { feature: "CF", size: 0x0 },
-    // foveation area.
-    AVFeature { feature: "FA", size: 0x4 },
+    AVFeature { feature: "FA", size: 0x4 },  // foveation area.
     AVFeature { feature: "POS", size: 0x3 },
     AVFeature { feature: "HTS", size: 0x8 },
     AVFeature { feature: "EOD", size: 0x0 },
@@ -5716,26 +6224,6 @@ static FEATURES: &[AVFeature] = &[
     AVFeature { feature: "MLS", size: 0x0 },
     AVFeature { feature: "POSE", size: 0x6 },
 ];
-
-// To the best of my knowledge, for V2 blobs, this is hardcoded as
-// FLS;RVRA1:0;PR;LF:-1;CR:1;CF:2;CH1:3;FA:4;
-static GROUP_H265_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
-    &FEATURES[0], // RVRA1
-    &FEATURES[3], // CR
-    &FEATURES[4], // CF
-    &FEATURES[2], // CH1
-    &FEATURES[5], // FA
-]));
-
-// FLS;RVRA1:1;AS:2;MS:-1;LTR;CABAC;CR:3;LF:-1;PR;CH1:4;FA:5;
-static GROUP_H264_FEATURES: LazyLock<EnabledAVFeatures> = LazyLock::new(|| EnabledAVFeatures(vec![
-    &AVFeature { feature: "EMP", size: 0x0 },
-    &FEATURES[0], // RVRA1
-    &AVFeature { feature: "AS", size: 0x0 },
-    &FEATURES[3], // CR
-    &FEATURES[2], // CH1
-    &FEATURES[5], // FA
-]));
 
 #[test]
 fn test_feature() {

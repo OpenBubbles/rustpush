@@ -152,16 +152,27 @@ message ConversationActivity {
     double updatedDateEpochTime = 9;
     string fallbackApplicationName = 10;
     ConversationActivityMetadata activityMetadata = 11;
-    bool isSystemActivity = 12;
+    optional bool isSystemActivity = 12;
+    optional double timestampAsTimeIntervalSinceReferenceDate = 13;
+    optional Handle fromHandle = 14;
+}
+
+message ConversationActivitySceneAssociationBehavior {
+    optional string targetContentIdentifier = 1;
+    optional bool shouldAssociateScene = 2;
+    optional string preferredSceneSessionRole = 3;
 }
 
 message ConversationActivityMetadata {
-    string fallbackURL = 1;
-    bool supportsContinuationOnTV = 2;
-    string title = 3;
-    string subtitle = 4;
-    bytes image = 5;
-    uint32 preferredBroadcastingAttributes = 6;
+    optional string fallbackURL = 1;
+    optional bool supportsContinuationOnTV = 2;
+    optional string title = 3;
+    optional string subtitle = 4;
+    optional bytes image = 5;
+    optional uint32 preferredBroadcastingAttributes = 6;
+    optional ConversationActivitySceneAssociationBehavior sceneAssociationBehavior = 7;
+    optional bool supportsActivityPreviews = 8;
+    optional uint32 lifetimePolicy = 9;
 }
 
 message ConversationActivitySession {
