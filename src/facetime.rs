@@ -1589,11 +1589,6 @@ impl FTClient {
             match (command, context, participant_meta, &received) {
                 (207, Some(context), Some(avc_data), FTWireMessage { participant_id_key: Some(participant), .. }) => {
                     info!("Someone joined!");
-                    // TODO remove this
-                    // if HAS_JOINED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    //     info!("Already set!");
-                    //     return Ok(None);
-                    // }
 
                     let participant = *participant;
                     let decoded_context = ConversationParticipantDidJoinContext::decode(&mut Cursor::new(context))?;
@@ -1613,7 +1608,10 @@ impl FTClient {
                         session.start_time = Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
                     }
 
-                    session.is_ringing_inaccurate = message.r#type() == ConversationMessageType::Invitation;
+                    let ring = (message.r#type() == ConversationMessageType::Invitation && sender != target) || 
+                            (message.r#type() == ConversationMessageType::Unknown && session.participants.is_empty() /* no one else has joined */);
+
+                    session.is_ringing_inaccurate = ring;
 
                     session.unpack_members(&decoded_context.members);
                     // warn active_participants IS EMPTY HERE
@@ -1648,7 +1646,7 @@ impl FTClient {
                         guid,
                         participant: participant.into(),
                         handle: sender.clone(),
-                        ring: message.r#type() == ConversationMessageType::Invitation && sender != target,
+                        ring,
                     })
                 },
                 (209, Some(context), meta, _) => {
