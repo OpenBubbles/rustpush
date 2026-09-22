@@ -18,6 +18,7 @@ use rtc_rtp::codec::h265::H265Packet;
 use rtc_shared::{TransportContext, TransportProtocol, marshal::Unmarshal};
 use rtc_srtp::{context::Context, protection_profile::ProtectionProfile};
 use rustls::pki_types::{CertificateDer, IpAddr, Ipv4Addr, ServerName, UnixTime};
+use rustls_psk::{ClientConfig, KeyLogFile, RootCertStore, client::PresharedKeySet, crypto::PresharedKey};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use rtc_stun::{attributes::{ATTR_ERROR_CODE, AttrType, RawAttribute}, integrity::MessageIntegrity, message::{BINDING_REQUEST, BINDING_SUCCESS, CLASS_INDICATION, Getter, METHOD_APPLE_ERROR, METHOD_DATA, MessageType, Method, Setter, TransactionId}, xoraddr::XorMappedAddress};
@@ -103,57 +104,6 @@ impl ConnectedLink {
         }
 
         Ok(IdsqrProtoH3Message::decode(Cursor::new(total)).unwrap())
-    }
-}
-
-#[derive(Debug)]
-struct NoCertificateVerification;
-use rustls_psk::{
-    CertificateError, ClientConfig, Error, KeyLogFile, SignatureScheme, client::{PresharedKeySet, danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}}, crypto::PresharedKey
-};
-
-impl ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &rustls_psk::DigitallySignedStruct,
-        ) -> Result<rustls_psk::client::danger::HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &rustls_psk::DigitallySignedStruct,
-        ) -> Result<rustls_psk::client::danger::HandshakeSignatureValid, Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-        ]
     }
 }
 
@@ -1133,8 +1083,7 @@ impl QuickRelayAllocationsResponse {
         state: Arc<std::sync::RwLock<LinkState>>,
     ) -> Result<(h3::client::Connection<h3_quinn::Connection, Bytes>, ConnectedLink), PushError> {
         let mut client_crypto: ClientConfig = rustls_psk::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
 
         let salt: [u8; 12] = rand::random();
@@ -1162,7 +1111,7 @@ impl QuickRelayAllocationsResponse {
 
         client_crypto.preshared_keys.keys(&server_name).unwrap();
         client_crypto.alpn_protocols = vec!["h3".into()];
-        client_crypto.key_log = Arc::new(KeyLogFile::new());
+        // client_crypto.key_log = Arc::new(KeyLogFile::new());
 
         let hbh_info = [
             b"QR-HBH-KDF",

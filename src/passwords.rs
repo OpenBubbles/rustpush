@@ -11,7 +11,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 use crate::{cloudkit::{CloudKitNotifWatcher, CloudKitSession, DeleteRecordOperation, SaveRecordOperation, UserQueryOperation, ZoneDeleteOperation, handle_to_alias, pcs_keys_for_record, record_identifier}, cloudkit_proto::CloudKitEncryptor, keychain::{SECURITYD_CONTAINER, SivKey}, passwords::passwordsp::{SharingInternetPassword, SharingItem, SharingPrivateKey}, util::{DebugMutex, DebugRwLock, base64_decode, duration_since_epoch, encode_hex}};
-use crate::{APSConnection, APSMessage, IdentityManager, aps::APSInterestToken, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitShare, FetchRecordChangesOperation, FetchZoneChangesOperation, NO_ASSETS, create_share, get_participant_id}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, keychain::{KeychainClientState, SavedKeychainZone, decrypt_entry}, pcs::{PCSPrivateKey, PCSService}, util::{bin_deserialize, bin_serialize, date_deserialize, date_deserialize_opt, date_serialize, date_serialize_opt, date_to_ms, ec_key_from_apple, ec_key_to_apple, ms_to_date, proto_deserialize, proto_serialize, bin_serialize_opt_vec, bin_deserialize_opt_vec}};
+use crate::{APSConnection, APSMessage, IdentityManager, aps::APSInterestToken, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitShare, FetchRecordChangesOperation, FetchZoneChangesOperation, NO_ASSETS, create_share, get_participant_id}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, keychain::{KeychainClientState, SavedKeychainZone, decrypt_entry}, pcs::{PCSPrivateKey, PCSService}, util::{bin_deserialize, bin_serialize, date_deserialize, bin_serialize_opt, bin_deserialize_opt, date_deserialize_opt, date_serialize, date_serialize_opt, date_to_ms, ec_key_from_apple, ec_key_to_apple, ms_to_date, proto_deserialize, proto_serialize, bin_serialize_opt_vec, bin_deserialize_opt_vec}};
 
 use crate::{PushError, keychain::KeychainClient};
 
@@ -39,8 +39,8 @@ pub struct PasswordState {
     #[serde(serialize_with="bin_serialize_opt_vec", deserialize_with="bin_deserialize_opt_vec")]
     shared_zone_continuation_token: Option<Vec<u8>>,
     pub invite_groups: HashMap<String, ShareInviteContentData>,
-    #[serde(default)]
-    pub token_registered: bool,
+    #[serde(serialize_with="bin_serialize_opt", deserialize_with="bin_deserialize_opt")]
+    pub my_token_registered: Option<[u8; 32]>,
 }
 
 fn zone_identifier_key(id: &RecordZoneIdentifier) -> String {
@@ -1157,7 +1157,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
 
     async fn prepare_watch(&self, connection: &APSConnection) -> Result<(), PushError> {
         let mut state = self.state.write().await;
-        if state.token_registered { return Ok(()) }
+        if state.my_token_registered != Some(connection.get_token().await) { return Ok(()) }
 
         let container = self.get_container().await?;
         let shared_container = self.get_shared_container().await?;
@@ -1169,7 +1169,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         let keychain = self.keychain.get_security_container().await?;
         keychain.register_token(&connection).await?;
 
-        state.token_registered = true;
+        state.my_token_registered = Some(connection.get_token().await);
         (self.update_state)(&state);
         Ok(())
     }
