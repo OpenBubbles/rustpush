@@ -1208,10 +1208,14 @@ pub struct APSConnectionResource {
 const APNS_PORT: u16 = 5223;
 
 async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>, Option<APSPackedDecoder>), PushError> {
-    let certs = rustls_pemfile::certs(&mut Cursor::new(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")))?;
-
     let mut root_store = RootCertStore::empty();
-    root_store.add(CertificateDer::from_slice(&certs.into_iter().nth(0).unwrap()))?;
+    for der in [
+        include_bytes!("../certs/root/AppleIncRootCertificate.cer").as_slice(),
+        include_bytes!("../certs/root/AppleRootCA-G2.cer").as_slice(),
+        include_bytes!("../certs/root/AppleRootCA-G3.cer").as_slice(),
+    ] {
+        root_store.add(CertificateDer::from_slice(der))?;
+    }
     let mut config: ClientConfig = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();

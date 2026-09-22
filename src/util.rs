@@ -221,24 +221,18 @@ fn build_proxy() -> Client {
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     // return build_proxy();
-    let certificates = vec![
-        Certificate::from_pem(include_bytes!("../certs/root/profileidentity.ess.apple.com.cert")).unwrap(),
-        Certificate::from_pem(include_bytes!("../certs/root/init.ess.apple.com.cert")).unwrap(),
-    ];
     let mut headers = HeaderMap::new();
     headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
 
 
-    let mut builder = reqwest::Client::builder()
+    reqwest::Client::builder()
         .use_rustls_tls()
         .default_headers(headers.clone())
-        .http1_title_case_headers();
-
-    for certificate in certificates.into_iter() {
-        builder = builder.add_root_certificate(certificate);
-    }
-
-    builder.build().unwrap()
+        .http1_title_case_headers()
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleIncRootCertificate.cer")).unwrap())
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G2.cer")).unwrap())
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G3.cer")).unwrap())
+        .build().unwrap()
 });
 
 pub static CARRIER_REQWEST: LazyLock<Client> = LazyLock::new(|| {
