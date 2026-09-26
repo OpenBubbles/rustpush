@@ -2016,6 +2016,19 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     }
 
     pub async fn perform_operations<Op: CloudKitOp>(&self, session: &CloudKitSession, ops: &[Op], isolation_level: IsolationLevel) -> Result<Vec<Result<Op::Response, PushError>>, PushError> {
+        let mut retries = 0;
+        loop {
+            match self.perform_operations_inner(session, ops, isolation_level).await {
+                Err(PushError::TooManyRequests(Some(retry))) if retries < 3 => {
+                    tokio::time::sleep(Duration::from_secs(retry as u64)).await;
+                    retries += 1;
+                },
+                _t => return _t
+            }
+        }
+    }
+
+    pub async fn perform_operations_inner<Op: CloudKitOp>(&self, session: &CloudKitSession, ops: &[Op], isolation_level: IsolationLevel) -> Result<Vec<Result<Op::Response, PushError>>, PushError> {
         let request_uuids = (0..ops.len()).map(|_| Uuid::new_v4().to_string().to_uppercase()).collect::<Vec<_>>();
         let request = ops.iter().enumerate().map(|(idx, op)| self.build_request(op, self.client.config.as_ref(), idx == 0, idx == ops.len() - 1, request_uuids[idx].clone(), isolation_level)).collect::<Vec<_>>().concat();
 
@@ -2031,8 +2044,9 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
         if response.status().as_u16() == 401 {
             self.client.token_provider.refresh_mme(&mut *self.client.token_provider.state.lock().await).await?;
         }
-        if response.status().as_u16() == 429 {
-            return Err(PushError::TooManyRequests);
+        if response.status().as_u16() == 429 || response.status().as_u16() == 503 {
+            let retry_after = response.headers().get("retry-after").map(|i| i.to_str().unwrap().parse::<u32>().unwrap());
+            return Err(PushError::TooManyRequests(Some(retry_after.unwrap_or(1))));
         }
         
         let token: Vec<u8> = response.bytes().await?

@@ -6,6 +6,7 @@ use log::{debug, error, info, warn};
 use openssl::{sha::{self, sha256}, symm::{Cipher, Crypter}};
 use plist::{Data, Dictionary, Value};
 use regex::Regex;
+use typed_arena::Arena;
 use uuid::Uuid;
 use rand::Rng;
 use xml::{reader, writer::XmlEvent, EmitterConfig, EventReader, EventWriter};
@@ -224,10 +225,9 @@ impl MessageParts {
                         .attr("name", &attachment.name)
                         .attr("width", "0")
                         .attr("height", "0")
-                        .attr("datasize", &filesize)
+                        .attr("datasize", &filesize) // i think this is wrong for attachments with several variants (MMCS vec), but it is what it is.
                         .attr("mime-type", &attachment.mime)
                         .attr("uti-type", &attachment.uti_type)
-                        .attr("file-size", &filesize)
                         .attr("message-part", &part_idx);
                     let ext = part.ext.as_ref().map(|e| e.to_dict()).unwrap_or_else( || HashMap::new());
                     for (key, val) in &ext {
@@ -250,22 +250,28 @@ impl MessageParts {
                             };
                             writer.write(
                                 element
+                                    .attr("file-size", &data.len().to_string())
                                     .attr("inline-attachment", num)
                             ).unwrap();
 
                             inline_attachment_num += 1;
                         }
                         AttachmentType::MMCS(mmcs) => {
-                            writer.write(
-                                element
-                                    .attr("mmcs-signature-hex", &encode_hex(&mmcs.signature))
-                                    .attr("mmcs-url", &mmcs.url)
-                                    .attr("mmcs-owner", &mmcs.object)
-                                    .attr("decryption-key", &encode_hex(&[
+                            let strings = Arena::<String>::new();
+                            for (idx, mmcs) in mmcs.iter().enumerate() {
+                                let suffix = if idx == 0 { "".to_owned() } else { format!("-{idx}") };
+                                element = element
+                                    .attr(strings.alloc(format!("mmcs-signature-hex{suffix}")).as_str(), strings.alloc(encode_hex(&mmcs.signature)))
+                                    .attr(strings.alloc(format!("mmcs-url{suffix}")).as_str(), &mmcs.url)
+                                    .attr(strings.alloc(format!("mmcs-owner{suffix}")).as_str(), &mmcs.object)
+                                    .attr(strings.alloc(format!("decryption-key{suffix}")).as_str(), strings.alloc(encode_hex(&[
                                         vec![0x00],
                                         mmcs.key.clone()
-                                    ].concat()))
-                            ).unwrap();
+                                    ].concat())))
+                                    .attr(strings.alloc(format!("file-size{suffix}")).as_str(), strings.alloc(mmcs.size.to_string()));
+                            }
+
+                            writer.write(element).unwrap();
                         }
                     }
                 },
@@ -458,15 +464,18 @@ impl MessageParts {
                                             continue
                                         })
                                     } else {
-                                        let sig = decode_hex(&get_attr("mmcs-signature-hex", None)).unwrap();
-                                        let key = decode_hex(&get_attr("decryption-key", None)).unwrap();
-                                        AttachmentType::MMCS(MMCSFile {
-                                            signature: sig.clone(), // chop off first byte because it's not actually the signature
-                                            object: get_attr("mmcs-owner", None),
-                                            url: get_attr("mmcs-url", None),
-                                            key: key[1..].to_vec(),
-                                            size: get_attr("file-size", None).parse().unwrap()
-                                        })
+                                        AttachmentType::MMCS((0..).map_while(|idx| {
+                                            let suffix = if idx == 0 { "".to_owned() } else { format!("-{idx}") };
+                                            let url = get_attr(&format!("mmcs-url{}", suffix), Some("none"));
+                                            if &url == "none" { return None }
+                                            Some(MMCSFile {
+                                                signature: decode_hex(&get_attr(&format!("mmcs-signature-hex{suffix}"), None)).unwrap(), // chop off first byte because it's not actually the signature
+                                                object: get_attr(&format!("mmcs-owner{suffix}"), None),
+                                                url,
+                                                key: decode_hex(&get_attr(&format!("decryption-key{suffix}"), None)).unwrap()[1..].to_vec(),
+                                                size: get_attr(&format!("file-size{suffix}"), None).parse().unwrap()
+                                            })
+                                        }).collect())
                                     },
                                     part: attributes.iter().find(|attr| attr.name.to_string() == "message-part").map(|item| item.value.parse().unwrap()).unwrap_or(0),
                                     uti_type: get_attr("uti-type", Some("public.data")),
@@ -1184,7 +1193,7 @@ struct MMCSUploadResponse {
 }
 
 #[repr(C)]
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct MMCSFile {
     #[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")]
     pub signature: Vec<u8>,
@@ -1397,7 +1406,7 @@ impl MMCSFile {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum AttachmentType {
     Inline(#[serde(serialize_with = "bin_serialize", deserialize_with = "bin_deserialize")] Vec<u8>),
-    MMCS(MMCSFile)
+    MMCS(Vec<MMCSFile>)
 }
 
 fn normalize_sms_handle(handle: &str) -> String {
@@ -1426,7 +1435,7 @@ impl Attachment {
     pub async fn new_mmcs(apns: &APSConnectionResource, prepared: &AttachmentPreparedPut, reader: impl Read + Send + Sync, mime: &str, uti: &str, name: &str, progress: impl FnMut(usize, usize) + Send + Sync) -> Result<Attachment, PushError> {
         let mmcs = MMCSFile::new(apns, prepared, reader, progress).await?;
         Ok(Attachment {
-            a_type: AttachmentType::MMCS(mmcs),
+            a_type: AttachmentType::MMCS(vec![mmcs]),
             part: 0,
             uti_type: uti.to_string(),
             mime: mime.to_string(),
@@ -1438,7 +1447,7 @@ impl Attachment {
     pub fn get_size(&self) -> usize {
         match &self.a_type {
             AttachmentType::Inline(data) => data.len(),
-            AttachmentType::MMCS(mmcs) => mmcs.size
+            AttachmentType::MMCS(mmcs) => mmcs.iter().fold(0, |a, i| a + i.size),
         }
     }
 
@@ -1449,7 +1458,9 @@ impl Attachment {
                 Ok(())
             },
             AttachmentType::MMCS(mmcs) => {
-                mmcs.get_attachment(apns, writer, progress).await
+                // biggest file is the main one
+                let main = mmcs.iter().max_by_key(|m| m.size).unwrap();
+                main.get_attachment(apns, writer, progress).await
             }
         }
     }

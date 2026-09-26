@@ -20,7 +20,7 @@ use openssl::sha::sha256;
 use openssl::sign::Signer;
 use plist::{Data, Value};
 use prost::Message;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{de, ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
 use cloudkit_proto::RecordIdentifier;
 use tokio::sync::Mutex;
@@ -35,7 +35,7 @@ use bitflags::bitflags;
 
 use crate::keychain::KeychainClient;
 use crate::util::{base64_decode, bin_deserialize, bin_serialize, bin_deserialize_opt_vec, proto_serialize_opt, proto_deserialize_opt, bin_serialize_opt_vec, coder_encode_flattened, decode_hex, encode_hex, gzip, plist_to_bin, ungzip, NSAttributedString, NSDictionaryTypedCoder, NSNumber, NSString, StreamTypedCoder};
-use crate::{Attachment, AttachmentType, FileContainer};
+use crate::{Attachment, AttachmentType, FileContainer, MMCSFile};
 use cloudkit_proto::CloudKitEncryptor;
 use crate::{cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer}, PushError};
 
@@ -484,57 +484,244 @@ impl Default for NumOrString {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-#[serde(rename_all = "kebab-case")]
+/// The five keys that repeat once per stored file, in the order they are written.
+const MMCS_FILE_KEYS: [&str; 5] = ["mmcs-signature-hex", "mmcs-owner", "mmcs-url", "decryption-key", "file-size"];
+
+fn mmcs_suffix(idx: usize) -> String {
+    if idx == 0 { String::new() } else { format!("-{idx}") }
+}
+
+/// Splits one of [MMCS_FILE_KEYS] into its stem and the file it belongs to. Index 0 is unsuffixed.
+fn split_mmcs_key(key: &str) -> Option<(&'static str, usize)> {
+    MMCS_FILE_KEYS.into_iter().find_map(|stem| {
+        let rest = key.strip_prefix(stem)?;
+        if rest.is_empty() { return Some((stem, 0)) }
+        Some((stem, rest.strip_prefix('-')?.parse().ok()?))
+    })
+}
+
+/// An attachment's user info -- the same dict iMessage writes as the attributes of a message's
+/// `FILE` element, which is where the key names and encodings come from.
+///
+/// One attachment can be stored as several files (the same image at several qualities), and Apple
+/// numbers them inside this one flat dict instead of nesting: file 0 takes the bare keys and every
+/// file after it suffixes them `-1`, `-2`, and so on. [MMCS_FILE_KEYS] are the keys that repeat.
+/// [files] holds them decoded, and the `Serialize`/`Deserialize` impls below are the only place that
+/// numbering is dealt with.
+#[derive(Debug, Clone, Default)]
 pub struct MMCSAttachmentMeta {
     // MMCS attachments
-    pub mmcs_signature_hex: Option<String>,
-    pub mmcs_owner: Option<String>,
-    pub mmcs_url: Option<String>,
-    pub decryption_key: Option<String>,
+    pub files: Vec<MMCSFile>,
 
     // inline attachments
     pub inline_attachment: Option<String>,
     pub message_part: Option<String>,
 
+    /// Inline attachments only: they have no MMCS file to take a size from. When [files] is not
+    /// empty the bare `file-size` belongs to `files[0]` and this stays `None`.
     pub file_size: Option<NumOrString>,
     pub uti_type: Option<String>,
     pub mime_type: Option<String>,
     pub name: Option<String>,
 }
 
+impl Serialize for MMCSAttachmentMeta {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut len = self.files.len() * MMCS_FILE_KEYS.len()
+            + self.inline_attachment.is_some() as usize
+            + self.message_part.is_some() as usize
+            + self.uti_type.is_some() as usize
+            + self.mime_type.is_some() as usize
+            + self.name.is_some() as usize;
+        if self.files.is_empty() && self.file_size.is_some() { len += 1 }
+
+        let mut map = serializer.serialize_map(Some(len))?;
+        for (idx, file) in self.files.iter().enumerate() {
+            let suffix = mmcs_suffix(idx);
+            map.serialize_entry(&format!("mmcs-signature-hex{suffix}"), &encode_hex(&file.signature))?;
+            map.serialize_entry(&format!("mmcs-owner{suffix}"), &file.object)?;
+            map.serialize_entry(&format!("mmcs-url{suffix}"), &file.url)?;
+            // the stored key is the real one behind a zero byte, exactly as in the `FILE` element
+            map.serialize_entry(&format!("decryption-key{suffix}"), &encode_hex(&[vec![0x00], file.key.clone()].concat()))?;
+            map.serialize_entry(&format!("file-size{suffix}"), &(file.size as u64))?;
+        }
+        if let Some(inline_attachment) = &self.inline_attachment {
+            map.serialize_entry("inline-attachment", inline_attachment)?;
+        }
+        if let Some(message_part) = &self.message_part {
+            map.serialize_entry("message-part", message_part)?;
+        }
+        if self.files.is_empty() {
+            if let Some(file_size) = &self.file_size {
+                map.serialize_entry("file-size", file_size)?;
+            }
+        }
+        if let Some(uti_type) = &self.uti_type {
+            map.serialize_entry("uti-type", uti_type)?;
+        }
+        if let Some(mime_type) = &self.mime_type {
+            map.serialize_entry("mime-type", mime_type)?;
+        }
+        if let Some(name) = &self.name {
+            map.serialize_entry("name", name)?;
+        }
+        map.end()
+    }
+}
+
+/// `file-size` as it comes off the wire. Apple writes it as a string in the `FILE` element this dict
+/// is copied from and as an integer here, so both have to be read. It is not [NumOrString] because
+/// that one's `Num` is a `u32`, which is narrower than the `usize` a file's size is kept in.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawFileSize {
+    Num(u64),
+    String(String),
+}
+
+/// One file's five keys as they come off the wire, before they are decoded together.
+#[derive(Default)]
+struct PartialMMCSFile {
+    signature: Option<String>,
+    object: Option<String>,
+    url: Option<String>,
+    key: Option<String>,
+    size: Option<RawFileSize>,
+}
+
+impl PartialMMCSFile {
+    fn into_file<E: de::Error>(self, idx: usize) -> Result<MMCSFile, E> {
+        let suffix = mmcs_suffix(idx);
+        let missing = |key: &str| E::custom(format!("attachment user info has mmcs-url{suffix} but no {key}{suffix}"));
+        // decode_hex indexes in pairs, so an odd-length string would panic rather than error
+        let hex = |value: String, key: &str| {
+            if value.len() % 2 != 0 {
+                return Err(E::custom(format!("{key}{suffix} is not a whole number of bytes")))
+            }
+            decode_hex(&value).map_err(|e| E::custom(format!("bad {key}{suffix}: {e}")))
+        };
+
+        let signature = hex(self.signature.ok_or_else(|| missing("mmcs-signature-hex"))?, "mmcs-signature-hex")?;
+        let stored_key = hex(self.key.ok_or_else(|| missing("decryption-key"))?, "decryption-key")?;
+        let Some((_zero, key)) = stored_key.split_first() else {
+            return Err(E::custom(format!("decryption-key{suffix} is empty")))
+        };
+        let size = match self.size.ok_or_else(|| missing("file-size"))? {
+            RawFileSize::Num(size) => size as usize,
+            RawFileSize::String(size) => size.parse()
+                .map_err(|e| E::custom(format!("bad file-size{suffix}: {e}")))?,
+        };
+
+        Ok(MMCSFile {
+            signature,
+            object: self.object.ok_or_else(|| missing("mmcs-owner"))?,
+            url: self.url.ok_or_else(|| missing("mmcs-url"))?,
+            key: key.to_vec(),
+            size,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for MMCSAttachmentMeta {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MetaVisitor;
+
+        impl<'de> de::Visitor<'de> for MetaVisitor {
+            type Value = MMCSAttachmentMeta;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an attachment user info dict")
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<MMCSAttachmentMeta, A::Error> {
+                let mut meta = MMCSAttachmentMeta::default();
+                let mut files: HashMap<usize, PartialMMCSFile> = HashMap::new();
+
+                while let Some(key) = map.next_key::<String>()? {
+                    if let Some((stem, idx)) = split_mmcs_key(&key) {
+                        let file = files.entry(idx).or_default();
+                        match stem {
+                            "mmcs-signature-hex" => file.signature = Some(map.next_value()?),
+                            "mmcs-owner" => file.object = Some(map.next_value()?),
+                            "mmcs-url" => file.url = Some(map.next_value()?),
+                            "decryption-key" => file.key = Some(map.next_value()?),
+                            "file-size" => file.size = Some(map.next_value()?),
+                            _ => unreachable!("{stem} is not one of MMCS_FILE_KEYS"),
+                        }
+                        continue
+                    }
+                    match key.as_str() {
+                        "inline-attachment" => meta.inline_attachment = Some(map.next_value()?),
+                        "message-part" => meta.message_part = Some(map.next_value()?),
+                        "uti-type" => meta.uti_type = Some(map.next_value()?),
+                        "mime-type" => meta.mime_type = Some(map.next_value()?),
+                        "name" => meta.name = Some(map.next_value()?),
+                        // apple writes plenty of keys we don't model (width, height, datasize...)
+                        _ => { map.next_value::<de::IgnoredAny>()?; },
+                    }
+                }
+
+                // `mmcs-url` is what marks a file as present, so the files are the run that starts
+                // at 0 -- the same rule `parse_parts` reads the `FILE` element by. An inline
+                // attachment has no file at all, and its bare `file-size` is the inline data's own
+                // length: the one `file-size` that doesn't belong to a file.
+                let mut idx = 0;
+                while let Some(file) = files.remove(&idx) {
+                    if file.url.is_none() {
+                        if idx == 0 {
+                            // inline data, so the size is small enough for NumOrString's u32
+                            meta.file_size = file.size.map(|size| match size {
+                                RawFileSize::Num(size) => NumOrString::Num(size as u32),
+                                RawFileSize::String(size) => NumOrString::String(size),
+                            });
+                        }
+                        break
+                    }
+                    meta.files.push(file.into_file::<A::Error>(idx)?);
+                    idx += 1;
+                }
+                if !files.is_empty() {
+                    let mut stranded = files.keys().collect::<Vec<_>>();
+                    stranded.sort();
+                    warn!("attachment user info numbers files {stranded:?} with nothing at {idx}; ignoring them");
+                }
+
+                Ok(meta)
+            }
+        }
+
+        deserializer.deserialize_map(MetaVisitor)
+    }
+}
+
 
 impl Into<Option<MMCSAttachmentMeta>> for &Attachment {
     fn into(self) -> Option<MMCSAttachmentMeta> {
         match &self.a_type {
-            AttachmentType::Inline(_inline) => Some(MMCSAttachmentMeta { 
-                mmcs_signature_hex: None, 
-                decryption_key: None, 
-                mmcs_owner: None, 
-                mmcs_url: None, 
+            AttachmentType::Inline(_inline) => Some(MMCSAttachmentMeta {
+                files: vec![],
 
                 inline_attachment: Some("ia-0".to_string()),
                 message_part: Some("0".to_string()),
 
-                file_size: Some(NumOrString::Num(_inline.len() as u32)), 
-                uti_type: Some(self.uti_type.clone()), 
+                file_size: Some(NumOrString::Num(_inline.len() as u32)),
+                uti_type: Some(self.uti_type.clone()),
                 mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
             }),
-            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta { 
-                mmcs_signature_hex: Some(encode_hex(&mmcs.signature)), 
-                decryption_key: Some(encode_hex(&mmcs.key)), 
-                mmcs_owner: Some(mmcs.object.clone()), 
-                mmcs_url: Some(mmcs.url.clone()), 
+            // every stored quality, in the order the attachment lists them -- the same order the
+            // `FILE` element numbers them in
+            AttachmentType::MMCS(mmcs) => Some(MMCSAttachmentMeta {
+                files: mmcs.clone(),
 
                 inline_attachment: None,
                 message_part: None,
 
-                file_size: Some(NumOrString::Num(mmcs.size as u32)), 
-                uti_type: Some(self.uti_type.clone()), 
+                file_size: None,
+                uti_type: Some(self.uti_type.clone()),
                 mime_type: Some(self.mime.clone()),
                 name: Some(self.name.clone())
-            })
+            }),
         }
     }
 }

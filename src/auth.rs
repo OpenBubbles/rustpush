@@ -799,7 +799,9 @@ impl<S: RequestState> SignedRequest<S> {
             .send().await?)
     }
 
-    pub async fn send_apns(self, aps: &APSConnectionResource, topic: &'static str) -> Result<Vec<u8>, PushError> {
+    // if you call this while you are reading the APS state, it can trigger a APS connection refresh
+    // which will try to write lock the state, which will cause a deadlock
+    pub async fn send_apns_i_am_not_reading_the_aps_state(self, aps: &APSConnectionResource, topic: &'static str) -> Result<Vec<u8>, PushError> {
         let url = get_bag(IDS_BAG, self.bag).await?;
 
         let msg_id = rand::thread_rng().gen::<[u8; 16]>();

@@ -188,8 +188,8 @@ pub enum PushError {
     PCSRecordKeyMissing,
     #[error("Circle is over!")]
     CircleOver,
-    #[error("Too many requests!")]
-    TooManyRequests,
+    #[error("Too many requests! Retry after {0:?}s")]
+    TooManyRequests(Option<u32>),
     #[error("PCS Master key not found!")]
     MasterKeyNotFound,
     #[error("Resource Stalled!")]
