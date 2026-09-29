@@ -43,6 +43,7 @@ use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, 
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio_rustls::client;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use std::io::{Write, Read};
 use std::fmt::{Debug, Display, Write as FmtWrite};
@@ -218,6 +219,24 @@ fn build_proxy() -> Client {
         .build().unwrap()
 }
 
+pub static REQWEST_NO_TIMEOUT: LazyLock<Client> = LazyLock::new(|| {
+    // return build_proxy();
+    let mut headers = HeaderMap::new();
+    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+
+
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .default_headers(headers.clone())
+        .http1_title_case_headers()
+        .connect_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleIncRootCertificate.cer")).unwrap())
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G2.cer")).unwrap())
+        .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G3.cer")).unwrap())
+        .build().unwrap()
+});
+
 
 pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     // return build_proxy();
@@ -229,6 +248,9 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
         .use_rustls_tls()
         .default_headers(headers.clone())
         .http1_title_case_headers()
+        .connect_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .timeout(Duration::from_secs(180))
         .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleIncRootCertificate.cer")).unwrap())
         .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G2.cer")).unwrap())
         .add_root_certificate(Certificate::from_der(include_bytes!("../certs/root/AppleRootCA-G3.cer")).unwrap())
@@ -885,9 +907,9 @@ impl EntitlementAuthState {
 
 pub trait Resource: Send + Sync + Sized {
     // resolve when resource is done, on a timeout of RESOURCE_GENERATE_TIMEOUT (currently 5 minutes)
-    fn generate(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send;
+    fn generate(self: &Arc<Self>) -> impl std::future::Future<Output = Result<AbortOnDropHandle<()>, PushError>> + Send;
 
-    fn generate_unwind_safe(self: &Arc<Self>) -> impl std::future::Future<Output = Result<JoinHandle<()>, PushError>> + Send {
+    fn generate_unwind_safe(self: &Arc<Self>) -> impl std::future::Future<Output = Result<AbortOnDropHandle<()>, PushError>> + Send {
         async {
             std::panic::AssertUnwindSafe(self.generate())
                 .catch_unwind().await
@@ -960,7 +982,7 @@ pub enum ResourceState {
 }
 
 impl<T: Resource + 'static> ResourceManager<T> {
-    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, generate_timeout: Duration, running_resource: Option<JoinHandle<()>>) -> Arc<ResourceManager<T>> {
+    pub fn new<B: BackoffBuilder + 'static>(name: &'static str, resource: Arc<T>, backoff: B, generate_timeout: Duration, running_resource: Option<AbortOnDropHandle<()>>) -> Arc<ResourceManager<T>> {
         let (retry_send, _) = broadcast::channel::<Result<(), ResourceFailure>>(9999);
         let (sig_send, mut sig_recv) = mpsc::channel(1);
         let (retry_now_send, mut retry_now_recv) = mpsc::channel(1);
@@ -979,7 +1001,7 @@ impl<T: Resource + 'static> ResourceManager<T> {
             resource_state: watch::channel(if running_resource.is_some() { ResourceState::Generated } else { ResourceState::Generating }).0,
         });
 
-        let mut current_resource = running_resource.unwrap_or_else(|| tokio::spawn(async {}));
+        let mut current_resource = running_resource.unwrap_or_else(|| AbortOnDropHandle::new(tokio::spawn(async {})));
 
         let resource_name = manager.name;
         let resource_state = manager.resource_state.clone();

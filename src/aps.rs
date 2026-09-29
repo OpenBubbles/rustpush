@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split}, net::{TcpListener, TcpStream}, select, sync::{broadcast::{self, Receiver, Sender, error::RecvError}, mpsc}, task::{self, JoinHandle}};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client::TlsStream, rustls::pki_types::ServerName};
 use async_recursion::async_recursion;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::{OSConfig, PushError, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, BinaryReadExt, DebugMutex, DebugRwLock, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, decode_hex, encode_hex, get_bag, plist_to_bin}};
 
@@ -1257,7 +1258,7 @@ async fn open_socket() -> Result<(TlsStream<TcpStream>, Option<APSPackedEncoder>
 }
 
 impl Resource for APSConnectionResource {
-    async fn generate(self: &Arc<Self>) -> Result<JoinHandle<()>, PushError> {
+    async fn generate(self: &Arc<Self>) -> Result<AbortOnDropHandle<()>, PushError> {
         info!("Generating APS");
         let (socket, encoder, mut decoder) = match open_socket().await {
             Ok(e) => e,
@@ -1277,7 +1278,7 @@ impl Resource for APSConnectionResource {
         info!("Locked socket");
 
         let maintenance_self = self.clone();
-        let maintenence_handle = task::spawn(async move {
+        let maintenence_handle = AbortOnDropHandle::new(task::spawn(async move {
             loop {
                 match APSMessage::read_from_stream(&mut read, &mut decoder).await {
                     Ok(Some(msg)) => {
@@ -1291,7 +1292,7 @@ impl Resource for APSConnectionResource {
                     }
                 };
             }
-        });
+        }));
 
         if let Err(err) = self.clone().do_connect().await {
             error!("failed to connect {err}!");
@@ -1516,22 +1517,21 @@ impl APSConnectionResource {
         Err(PushError::SendTimedOut)
     }
 
-    async fn get_manager(&self) -> APSConnection {
-        self.manager.lock().await.as_ref().unwrap().upgrade().unwrap()
+    async fn get_manager(&self) -> Option<APSConnection> {
+        self.manager.lock().await.as_ref().and_then(|manager| manager.upgrade())
     }
 
     async fn do_reload(&self) {
-        self.get_manager().await.request_update().await;
+        let Some(manager) = self.get_manager().await else { return };
+        manager.request_update().await;
     }
 
     pub async fn send(&self, message: APSMessage) -> Result<(), PushError> {
         info!("Attempting to send");
         // during init can be none
-        let manager_lock = self.manager.lock().await;
-        if let Some(manager_lock) = &*manager_lock {
-            manager_lock.upgrade().unwrap().ensure_not_failed()?;
+        if let Some(manager) = self.get_manager().await {
+            manager.ensure_not_failed()?;
         }
-        drop(manager_lock);
 
         let mut socket_guard = self.socket.lock().await;
         let socket = socket_guard.as_mut().ok_or(PushError::NotConnected)?;

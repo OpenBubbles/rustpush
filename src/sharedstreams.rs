@@ -7,6 +7,7 @@ use openssl::sha::sha1;
 use plist::{Date, Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio_util::task::AbortOnDropHandle;
 use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState, aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{Container, FileContainer, MMCSConfig, PreparedPut, authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs}, util::{DebugMutex, DebugRwLock, REQWEST, Resource, ResourceManager, base64_encode, decode_hex, encode_hex, plist_to_string}};
 use rand::Rng;
 use uuid::Uuid;
@@ -875,7 +876,7 @@ impl<P, F> SyncController<P, F>
 impl<P, F> Resource for SyncController<P, F>
     where P: AnisetteProvider + Send + Sync + 'static,
         F: FilePackager + Send + Sync + 'static {
-    async fn generate(self: &std::sync::Arc<Self>) -> Result<tokio::task::JoinHandle<()>, PushError> {
+    async fn generate(self: &std::sync::Arc<Self>) -> Result<AbortOnDropHandle<()>, PushError> {
         info!("Syncing now!");
         
         let mut locked_receiver = self.foreground_locked.subscribe();
@@ -892,7 +893,7 @@ impl<P, F> Resource for SyncController<P, F>
         
         let respawn_ref = self.clone();
         let sync_interval = self.sync_interval;
-        Ok(tokio::spawn(async move {
+        Ok(AbortOnDropHandle::new(tokio::spawn(async move {
             select! {
                 _timeout = tokio::time::sleep(sync_interval) => {
                     let mut dirty_map = respawn_ref.dirty_map.lock().await;
@@ -903,7 +904,7 @@ impl<P, F> Resource for SyncController<P, F>
                 },
                 _watch = respawn_ref.watch_filesystem() => {}
             }
-        }))
+        })))
     }
 }
 

@@ -13,6 +13,7 @@ use rand::Rng;
 use async_recursion::async_recursion;
 use tokio::select;
 use rand::RngCore;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
@@ -360,7 +361,7 @@ pub type IdentityManager = Arc<ResourceManager<IdentityResource>>;
 
 impl Resource for IdentityResource {
 
-    async fn generate(self: &std::sync::Arc<Self>) -> Result<tokio::task::JoinHandle<()>, PushError> {
+    async fn generate(self: &std::sync::Arc<Self>) -> Result<AbortOnDropHandle<()>, PushError> {
         info!("Reregistering now!");
 
         let mut users_lock = self.users.write().await;
@@ -390,9 +391,9 @@ impl Resource for IdentityResource {
         info!("Successfully reregistered!");
 
         let my_ref = self.clone();
-        Ok(tokio::spawn(async move {
+        Ok(AbortOnDropHandle::new(tokio::spawn(async move {
             my_ref.schedule_rereg().await
-        }))
+        })))
 
     }
 }
@@ -424,12 +425,12 @@ impl IdentityResource {
         });
 
         let task_resource = resource.clone();
-        let cancel = tokio::spawn(async move {
+        let cancel = AbortOnDropHandle::new(tokio::spawn(async move {
             if !needs_refresh {
                 task_resource.schedule_rereg().await
             }
             // return indicates reregister
-        });
+        }));
 
         let resource = ResourceManager::new(
             "Identity",

@@ -69,6 +69,7 @@ rtc-stun = { path = "./third_party/rtc/rtc-stun" }
 rustls_psk = { package = "rustls", path = "./third_party/rustls/rustls" }
 mio = { version = "1.2.2", features = ["os-poll", "net"] }
 sansio = "1.0.1"
+tokio-util = { version = "0.7.19", features = ["rt"] }
 typed-arena = "2.0.2"
 
 [patch.crates-io]

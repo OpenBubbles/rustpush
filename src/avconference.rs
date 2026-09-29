@@ -704,6 +704,8 @@ pub struct AVSessionSSRC {
     srtp_contexts: HashMap<u32, MultiMkiContext>,
     codec: Option<FTQualityZipper>,
     fec_data: BTreeMap<u32, HashMap<u8, FECData>>,
+
+    participant_active: bool,
 }
 
 enum SSRCState {
@@ -887,6 +889,7 @@ impl AVSessionState {
                 srtp_contexts: HashMap::new(),
                 codec: None,
                 fec_data: BTreeMap::new(),
+                participant_active: true,
             });
         }
         map
@@ -1092,6 +1095,10 @@ impl QuickRelayPreKey {
 enum IncomingFrameCommand {
     Packet(rtc_rtp::Header, GlobalPacket),
     Keys(HashMap<u32, AVSessionSSRC>),
+    // Does not fire if the call is empty. This is done to prevent
+    // potential spurious empty active participants from killing all media.
+    // The purpose of this is to prevent codecs from piling up, each one takes 24mb per stream.
+    ParticipantStateNotEmpty(u64, bool),
 }
 
 pub struct AudioParser<'t>(pub &'t [u8]);
@@ -1628,6 +1635,17 @@ impl IncomingFrameHandler {
                         }
                         warn!("Got avc, replaying {} packets", packets_process.len());
                         packets_process
+                    },
+                    IncomingFrameCommand::ParticipantStateNotEmpty(participant, state) => {
+                        for ssrc in ssrc_map.values_mut() {
+                            if ssrc.id.participant != participant { continue }
+                            if !state {
+                                ssrc.codec = None;
+                            }
+                            ssrc.participant_active = state;
+                        }
+                        info!("CLEANUP: media handler dropped ssrcs of participant {participant}");
+                        vec![]
                     }
                 };
                 counter = counter.wrapping_add(1);
@@ -1675,6 +1693,8 @@ impl IncomingFrameHandler {
                         },
                         SSRCState::Valid => (ssrc_map.get_mut(&ssrc.unwrap().0).unwrap(), ssrc.unwrap().1, mki.unwrap()),
                     };
+
+                    if !ssrc.participant_active { continue }
 
                     // info!("Header {:?} {} {}", header, recv.packet_id, duration_since_epoch().as_secs_f64());
                     let tracked_packets = if let Some(prev_seq) = ssrc_seq.get_mut(&header.ssrc) {
@@ -1951,6 +1971,14 @@ impl IncomingFrameHandler {
             let _ = self.target_audio.try_send(IncomingFrameCommand::Keys(keys));
         } else {
             let _ = self.target_video.try_send(IncomingFrameCommand::Keys(keys));
+        }
+    }
+
+    fn participant_state(&self, participant: u64, state: bool) {
+        for (target, audio) in [(&self.target_audio, true), (&self.target_video, false)] {
+            if let Err(e) = target.try_send(IncomingFrameCommand::ParticipantStateNotEmpty(participant, state)) {
+                warn!("Failed to queue participant removal (audio {audio}): {e}");
+            }
         }
     }
     
@@ -3969,6 +3997,14 @@ impl AVSession {
                             session.frame_handler.stats.timing_targets.write().unwrap().retain(|a, _| set.contains(a));
                             lock.active_participants = set.clone();
                             let _ = session.control_sender.try_send(AVControlCommand::ActiveParticipants(set.clone()));
+                            if !set.is_empty() {
+                                for removed in old_participants.difference(&set) {
+                                    session.frame_handler.participant_state(*removed, false);
+                                }
+                                for added in set.difference(&old_participants) {
+                                    session.frame_handler.participant_state(*added, true);
+                                }
+                            }
                         }
                         drop(lock);
                         if old_participants.len() == 1 && set.len() > 1 {

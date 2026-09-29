@@ -3,7 +3,7 @@ use std::{collections::HashSet, path::PathBuf, pin::Pin, process::id, sync::Arc,
 use log::{debug, error, info, warn};
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use tokio::{select, sync::{broadcast, Mutex}, task::JoinHandle};
+use tokio::{select, sync::{Mutex, broadcast}, task::{JoinHandle, JoinSet}};
 use uuid::Uuid;
 
 use crate::{aps::{get_message, APSConnection, APSInterestToken}, ids::{identity_manager::{IDSSendMessage, MessageTarget, SendJob}, user::{IDSNGMIdentity, IDSService}, CertifiedContext}, imessage::messages::ErrorMessage, util::{bin_deserialize_opt_vec, duration_since_epoch, encode_hex, plist_to_bin, ungzip}, APSMessage, ConversationData, IDSUser, Message, MessageInst, NormalMessage, OSConfig, PushError};
@@ -118,6 +118,7 @@ pub struct IMClient {
     pub identity: IdentityManager,
     os_config: Arc<dyn OSConfig>,
     _interest_token: APSInterestToken,
+    _tasks: JoinSet<()>,
 }
 
 impl IMClient {
@@ -125,9 +126,10 @@ impl IMClient {
         let interest = conn.request_topics(&["com.apple.private.alloy.sms", "com.apple.madrid"]).await;
         let _ = Self::setup_conn(&conn).await;
 
+        let mut tasks = JoinSet::new();
         let mut to_refresh = conn.generated_signal.subscribe();
         let reconn_conn = Arc::downgrade(&conn);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 match to_refresh.recv().await {
                     Ok(()) => {
@@ -144,7 +146,7 @@ impl IMClient {
 
         let mut to_refresh = identity.generated_signal.subscribe();
         let my_ident_ref = identity.resource.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 match to_refresh.recv().await {
                     Ok(()) => {
@@ -161,6 +163,7 @@ impl IMClient {
             conn,
             os_config: os_config.clone(),
             identity,
+            _tasks: tasks,
         }
     }
 

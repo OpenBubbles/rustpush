@@ -2036,6 +2036,23 @@ impl MutliplexMessenger {
     }
 }
 
+struct MultiplexFinishGuard(Option<Arc<MultiplexEndpoint>>);
+
+impl MultiplexFinishGuard {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for MultiplexFinishGuard {
+    fn drop(&mut self) {
+        if let Some(endpoint) = self.0.take() {
+            endpoint.messenger.send(MultiplexMessage::Finish);
+            info!("CLEANUP: link setup abandoned, finishing multiplex");
+        }
+    }
+}
+
 struct MultiplexEndpoint {
     inner: UdpSocket,
     channel_id: AtomicU16,
@@ -3178,6 +3195,8 @@ impl GlobalLink {
 
         let qr_addr = SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::from_octets(target_ip), response.relay_port));
         multiplex_endpoint.clone().start(data_callback.clone(), internal_send.clone(), packet_parser.clone(), poll, message_receiver, is_initiator, qr_addr, response.session_id.clone().into());
+        // makes sure the multiplex endpoint is dropped if the connect response fails.
+        let finish_guard = MultiplexFinishGuard(Some(multiplex_endpoint.clone()));
 
         let mut sending_states = HashMap::new();
         let (mut connection, connected) = response.connect(&mut sending_states, multiplex_endpoint.clone(), link_state.clone()).await?;
@@ -3231,6 +3250,8 @@ impl GlobalLink {
             // also used as a flag to determine whether we are already connected to QR.
             avc_pod: std::sync::RwLock::new(None),
         });
+
+        finish_guard.disarm();
 
         let keepalive = Arc::downgrade(&me);
         tokio::spawn(async move {

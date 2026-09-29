@@ -1,6 +1,6 @@
 use std::{io::Cursor, collections::HashMap};
 
-use crate::{aps::get_message, error::PushError, mmcsp::{self, authorize_get_response, authorize_put::put_data::{Chunk, FordDesc}, authorize_put_response::{upload_target::ChunkIdentifier, UploadTarget}, Container as ProtoContainer, FordChunk, FordChunkItem, FordItem, HttpRequest}, util::{decode_hex, encode_hex, plist_to_bin, REQWEST}, APSConnectionResource};
+use crate::{APSConnectionResource, aps::get_message, error::PushError, mmcsp::{self, Container as ProtoContainer, FordChunk, FordChunkItem, FordItem, HttpRequest, authorize_get_response, authorize_put::put_data::{Chunk, FordDesc}, authorize_put_response::{UploadTarget, upload_target::ChunkIdentifier}}, util::{REQWEST, REQWEST_NO_TIMEOUT, decode_hex, encode_hex, plist_to_bin}};
 use aes::Aes256;
 use aes_siv::siv::CmacSiv;
 use hkdf::Hkdf;
@@ -290,7 +290,7 @@ impl MMCSPutContainer {
             let request = self.target.request.clone().unwrap();
             let user_agent = self.user_agent.clone();
             let task = tokio::spawn(async move {
-                let response = transfer_mmcs_container(&REQWEST, &request, Some(body), &user_agent).await?;
+                let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &request, Some(body), &user_agent).await?;
                 Ok::<_, PushError>(response)
             });
             self.finalize = Some(task);
@@ -971,7 +971,7 @@ impl MMCSGetContainer {
     // opens an HTTP stream if not already open
     async fn ensure_stream(&mut self) -> Result<(), PushError> {
         if self.response.is_none() {
-            let response = transfer_mmcs_container(&REQWEST, &self.container.request.as_ref().unwrap(), None, &self.user_agent).await?;
+            let response = transfer_mmcs_container(&REQWEST_NO_TIMEOUT, &self.container.request.as_ref().unwrap(), None, &self.user_agent).await?;
             self.confirm = Some(MMCSReceipt::Get(confirm_for_resp(&response, &get_container_url(&self.container.request.as_ref().unwrap()), &self.container.cl_auth_p2, None)));
             self.response = Some(response);
         }

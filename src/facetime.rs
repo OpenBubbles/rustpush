@@ -1006,7 +1006,10 @@ impl FTClient {
             &QueryOptions { required_for_message: true, result_expected: true }
         ).await?;
 
-        let builder_session = session.clone();
+        let mut builder_session = session.clone();
+        // The send job below is detached and runs until every target acks or its retries run out
+        // (up to ~21 min). It only builds payloads, so it must not keep the call's AVSession alive.
+        builder_session.connection = None;
         let my_participant = builder_session.participants.values().find(|p| &p.token == &base64_encoded).ok_or(PushError::NoParticipantTokenIndex)?.clone();
 
         let targets = self.identity.cache.lock().await.get_participants_targets(&topic, &handle, &relevant_people);
@@ -1608,8 +1611,8 @@ impl FTClient {
                         session.start_time = Some((UNIX_TO_2001 + Duration::from_secs_f64(report.timebase)).as_millis() as u64);
                     }
 
-                    let ring = (message.r#type() == ConversationMessageType::Invitation && sender != target) || 
-                            (message.r#type() == ConversationMessageType::Unknown && session.participants.is_empty() /* no one else has joined */);
+                    let ring = (message.r#type() == ConversationMessageType::Invitation || 
+                            (message.r#type() == ConversationMessageType::Unknown && session.participants.is_empty() /* no one else has joined */)) && sender != target;
 
                     session.is_ringing_inaccurate = ring;
 
