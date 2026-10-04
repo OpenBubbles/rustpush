@@ -782,6 +782,8 @@ pub struct AVSessionState {
     u1_clean_streak: usize,
     /// Rate index that most recently failed, and when it did.
     u1_failed_rung: Option<(usize, Instant)>,
+    /// The q13 slope of the previous U1 report, in q13 per second, so overuse takes two in a row.
+    u1_previous_q13_slope: Option<f64>,
 }
 
 impl AVSessionState {
@@ -3904,6 +3906,7 @@ impl AVSession {
                 quality_bump_failures: 0,
                 u1_clean_streak: 0,
                 u1_failed_rung: None,
+                u1_previous_q13_slope: None,
                 active_participants: HashSet::new(),
                 current_video_bitrate: BITRATE_TABLE.len() / 2,
             }),
@@ -4709,16 +4712,60 @@ impl AVSession {
                 let u1 = self.u1.load(Ordering::Relaxed);
 
                 if is_audio && u1 && !report.history.is_empty() {
-                    let (q13_sample_count, first_q13, latest_q13) = report.history.iter()
+                    let (first_q13, latest_q13) = report.history.iter()
                         .filter_map(|feedback| feedback.q13_one_way_delay)
-                        .fold((0usize, None, None), |(count, first, _), q13| {
-                            (count + 1, first.or(Some(q13)), Some(q13))
-                        });
-                    // Ignore small sample-to-sample jitter when deciding whether Q13 is rising.
-                    let q13_rising = first_q13.zip(latest_q13)
-                        .map(|(first, latest)| latest > first.saturating_add(128))
-                        .unwrap_or_default();
+                        .fold((None, None), |(first, _), q13| (first.or(Some(q13)), Some(q13)));
                     let latest_q13 = latest_q13.unwrap_or_default();
+
+                    // How fast the delay is growing, not how high it is: a least-squares slope of q13
+                    // against the time each measured packet was sent, over this report's own entries
+                    // (~20ms apart, so 10-25 points per 500ms report). A level is a property of the
+                    // network -- a link that sits at a high one-way delay is not congested by it --
+                    // while a slope is a queue filling, on any network.
+                    //
+                    // In q13 per second; `delay_ms` makes 1000 of them ~122ms of added delay a second.
+                    // Thresholds from two calls on a tester's log (1096 reports): p95 was 339, p98 823.
+                    // Every report at >=1000 but one sat inside a climb, and the three freezes in those
+                    // calls led with 1156 (then 3287), 2560 and -- for the one that crept instead of
+                    // jumping -- 982 and 769, two reports before a step up into it.
+                    const Q13_SLOPE_MIN_SAMPLES: usize = 4;
+                    // Rising: not clean, and so no step up. That is what would have held the creeping
+                    // one: under the old level rule q13 was ~1000 and "not rising" when it stepped up.
+                    const Q13_SLOPE_RISING: f64 = 500.0;
+                    // Overuse: one rung down, before loss arrives -- but only on a slope that stays up,
+                    // this report at OVERUSE and the one before it RISING. A queue that is filling
+                    // fills report after report: the freezes ran 1156 -> 3287 -> 3642 and 573 -> 417
+                    // -> 2560 -> 5068. A link that is only unstable spikes and drains at once: on a
+                    // known-flaky network at 1-1.5Mbps, single reports of 2620, 1768 and 1792 sat
+                    // between 17, None, -51 before and -1602, -1236, -541 after, and firing on each
+                    // one cut a rate the link was not short of. The size of one report's slope does
+                    // not separate the two -- 2560 was real, 2620 was not -- and two in a row does.
+                    const Q13_SLOPE_OVERUSE: f64 = 1000.0;
+                    let mut previous_sequence = None;
+                    let mut origin = None;
+                    let q13_points = report.history.iter()
+                        .filter_map(|feedback| Some((feedback.feedback_sequence, feedback.q13_one_way_delay?)))
+                        // A replayed entry repeats the sequence -- and the q13 -- of the packet it
+                        // measured. Counting it again would weight that one packet several times.
+                        .filter(|(sequence, _)| previous_sequence.replace(*sequence) != Some(*sequence))
+                        .map(|(sequence, q13)| {
+                            let origin = *origin.get_or_insert(sequence);
+                            // 1024 ticks a second (measured against wall time over whole calls), and a
+                            // report is short enough that a wrap is a small step, not a jump.
+                            (sequence.wrapping_sub(origin) as i16 as f64 / 1024.0, q13 as f64)
+                        })
+                        .collect::<Vec<_>>();
+                    let q13_slope = (q13_points.len() >= Q13_SLOPE_MIN_SAMPLES).then(|| {
+                        let count = q13_points.len() as f64;
+                        let mean_x = q13_points.iter().map(|(x, _)| x).sum::<f64>() / count;
+                        let mean_y = q13_points.iter().map(|(_, y)| y).sum::<f64>() / count;
+                        let (sxy, sxx) = q13_points.iter().fold((0.0, 0.0), |(sxy, sxx), (x, y)| {
+                            (sxy + (x - mean_x) * (y - mean_y), sxx + (x - mean_x) * (x - mean_x))
+                        });
+                        (sxx > 0.0).then(|| sxy / sxx)
+                    }).flatten();
+                    let q13_rising = q13_slope.is_some_and(|slope| slope >= Q13_SLOPE_RISING);
+                    let q13_slope_per_sec = q13_slope.map(|slope| slope.round() as i64);
 
                     // AFRC replays the most recent loss entry when there is no new one. Collapse
                     // consecutive identical entries so one damaged frame is not treated as
@@ -4784,16 +4831,22 @@ impl AVSession {
                         loss_drop_tiers.min(2)
                     };
 
-                    // Delay is the early signal, and it earns its place: measured over a real call,
-                    // q13 at >=10% loss ran p90=5289 against p90=453 when loss was zero, and
-                    // `>=2000 && rising` was followed by >=10% loss within ~3s on 6 of 10
-                    // occurrences, against a 1.3% base rate. It leads the loss by about a second.
-                    //
-                    // Requiring *both* absolute elevation and a rising trend is what keeps the
-                    // absolute threshold safe on other networks: a link that simply sits at a high
-                    // one-way delay (cellular, satellite) reads high but not rising, so it does not
-                    // trip. Only a link whose delay is climbing -- a queue actually filling -- does.
-                    let high_q13 = latest_q13 >= 2000;
+                    let mut state = self.state.lock().await;
+
+                    // See `Q13_SLOPE_OVERUSE`. A thin previous report (no slope) does not count as
+                    // rising, so a spike after one needs a second report to confirm it.
+                    let previous_q13_slope = state.u1_previous_q13_slope;
+                    let q13_overuse = q13_slope.is_some_and(|slope| slope >= Q13_SLOPE_OVERUSE)
+                        && previous_q13_slope.is_some_and(|slope| slope >= Q13_SLOPE_RISING);
+                    state.u1_previous_q13_slope = q13_slope;
+                    let previous_q13_slope_per_sec = previous_q13_slope.map(|slope| slope.round() as i64);
+
+                    // Delay is the early signal: measured over a real call, q13 at >=10% loss ran
+                    // p90=5289 against p90=453 when loss was zero, and it leads the loss by about a
+                    // second. The early warning is the slope (see `Q13_SLOPE_OVERUSE`); the level
+                    // only sizes the cut once loss has confirmed the overload, because how deep the
+                    // queue is says how much there is to drain -- and mid-collapse, with the queue
+                    // already draining, the slope reads falling while packets are still being lost.
                     let q13_drop_tiers = if sustained_packet_loss {
                         match latest_q13 {
                             8000.. => 4,
@@ -4802,22 +4855,19 @@ impl AVSession {
                             2000.. => 1,
                             _ => 0,
                         }
-                    } else if high_q13 && q13_rising {
-                        // Early warning only, so a single rung: right about 60% of the time, which
-                        // justifies acting but not over-correcting.
+                    } else if q13_overuse {
+                        // Early warning only, so a single rung.
                         1
                     } else {
                         0
                     };
                     let drop_tiers = loss_drop_tiers.max(q13_drop_tiers);
 
-                    let mut state = self.state.lock().await;
-
                     // A single clean report means nothing -- the loss signal reads zero repeatedly
                     // mid-collapse. Only a run of them is evidence the path is actually healthy.
                     let report_is_clean = loss <= U1_LOSS_IGNORE
                         && video_samples != 0
-                        && !(high_q13 && q13_rising);
+                        && !q13_rising;
                     state.u1_clean_streak = if report_is_clean { state.u1_clean_streak + 1 } else { 0 };
 
                     // A rate that recently failed is not retried until the memory expires. A clean
@@ -4833,8 +4883,9 @@ impl AVSession {
                     let blocked_by_ceiling = failed_rung
                         .is_some_and(|rung| state.current_video_bitrate + 1 >= rung);
 
-                    let wants_upgrade = q13_sample_count >= 2
-                        && !high_q13
+                    // A slope at all, so a report too thin to say whether the delay is growing is not
+                    // read as one where it is not.
+                    let wants_upgrade = q13_slope.is_some()
                         && !q13_rising
                         && no_recent_packet_loss
                         && !blocked_by_ceiling
@@ -4870,7 +4921,7 @@ impl AVSession {
                     };
 
                     info!(
-                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 first={first_q13:?} latest={latest_q13} rising={q13_rising}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
+                        "U1 send rate bucket {bucket} held_for={held_for:?}: rate={}kbps(rung {}) q13 first={first_q13:?} latest={latest_q13} slope={q13_slope_per_sec:?}/s previous={previous_q13_slope_per_sec:?}/s rising={q13_rising} overuse={q13_overuse}, video loss={video_packets_lost}/{video_packets_expected} ({video_loss_fraction:?}) damaged={damaged_video_frames}/{video_samples} sustained={sustained_packet_loss} no_recent_loss={no_recent_packet_loss}, clean_streak={}/{} failed_rung={failed_rung:?} bump_failures={}",
                         BITRATE_TABLE[state.current_video_bitrate],
                         state.current_video_bitrate,
                         state.u1_clean_streak,
