@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, ops::Deref, sync
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{Bottle, CloudKitRecord, CreateSubscriptionRequest, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, Identifier, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, Subscription, TlkShare, ViewKeys, Voucher, ot_bottle::OtAuthenticatedCiphertext, record::{Field, Reference, reference}, request_operation::header::{ContainerEnvironment, IsolationLevel}, response_operation, view_keys::ViewKey};
+use cloudkit_proto::{Bottle, CloudKitRecord, CreateSubscriptionRequest, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, Identifier, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, Subscription, TlkShare, ViewKeys, Voucher, ot_bottle::OtAuthenticatedCiphertext, record::{field::value::Type as FieldType, Field, Reference, reference}, request_operation::header::{ContainerEnvironment, IsolationLevel}, response_operation, view_keys::ViewKey};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
@@ -271,8 +271,26 @@ pub struct CuttlefishTlkShare {
 }
 
 impl CuttlefishTlkShare {
-    fn data_for_signing(&self) -> Vec<u8> {
-        [
+    // Known CKKS tlkshare fields. Extra CloudKit fields (notably tlkOwnershipProof)
+    // must be appended to the signed payload in sorted key order, matching Apple's
+    // CKKSTLKShare dataForSigning:.
+    const KNOWN_SIGNING_FIELDS: &[&str] = &[
+        "sender",
+        "receiver",
+        "receiverPublicEncryptionKey",
+        "curve",
+        "epoch",
+        "poisoned",
+        "signature",
+        "version",
+        "parentkeyref",
+        "parentKeyRef",
+        "wrappedkey",
+        "wrappedKey",
+    ];
+
+    fn data_for_signing(&self, fields: &[Field]) -> Vec<u8> {
+        let mut data = [
             &self.version.to_le_bytes()[..],
             self.receiver.as_bytes(),
             self.sender.as_bytes(),
@@ -280,7 +298,52 @@ impl CuttlefishTlkShare {
             &self.curve.to_le_bytes()[..],
             &self.epoch.to_le_bytes()[..],
             &self.poisoned.to_le_bytes()[..],
-        ].concat()
+        ].concat();
+
+        let mut extras: Vec<(&str, &Field)> = fields.iter().filter_map(|field| {
+            let name = field.identifier.as_ref()?.name.as_deref()?;
+            if Self::KNOWN_SIGNING_FIELDS.contains(&name) || name.starts_with("server_") {
+                return None;
+            }
+            Some((name, field))
+        }).collect();
+        extras.sort_by(|a, b| a.0.cmp(b.0));
+
+        for (name, field) in extras {
+            if let Some(value) = field.value.as_ref() {
+                if let Some(bytes) = extra_field_signing_bytes(value) {
+                    info!("Including extra TLK share field {name} in signature ({} bytes)", bytes.len());
+                    data.extend_from_slice(&bytes);
+                } else {
+                    debug!("Skipping extra TLK share field {name} (unsupported CloudKit type)");
+                }
+            }
+        }
+
+        data
+    }
+}
+
+fn extra_field_signing_bytes(value: &cloudkit_proto::record::field::Value) -> Option<Vec<u8>> {
+    match value.r#type {
+        Some(t) if t == FieldType::StringType as i32 => {
+            Some(value.string_value.as_ref()?.as_bytes().to_vec())
+        }
+        Some(t) if t == FieldType::BytesType as i32 => {
+            value.bytes_value.clone()
+        }
+        Some(t) if t == FieldType::Int64Type as i32 => {
+            Some(value.signed_value?.to_le_bytes().to_vec())
+        }
+        Some(t) if t == FieldType::DateType as i32 => {
+            // NSISO8601DateFormatter default (InternetDateTime, GMT): yyyy-MM-dd'T'HH:mm:ssZ
+            let secs = value.date_value.as_ref()?.time?;
+            let unix = 978307200.0 + secs;
+            let dt = DateTime::<Utc>::from_timestamp(unix.trunc() as i64, 0)?;
+            Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string().into_bytes())
+        }
+        // Skip CKReference, NSArray, CLLocation, CKAsset, and other types Apple ignores.
+        _ => None,
     }
 }
 
@@ -1801,13 +1864,17 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 warn!("Missing key!");
                 continue;
             };
-            let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
+            let record_fields = &share_record.inner.as_ref().unwrap().record_field;
+            let item = CuttlefishTlkShare::from_record(record_fields);
 
             let Some(sending_peer) = state.state.get(&item.sender) else {  
                 warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
                 continue
             };
-            sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
+            if let Err(e) = sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(record_fields), &base64_decode(&item.signature)) {
+                warn!("TLK share signature verification failed for {}: {e}", share.service());
+                continue;
+            }
 
 
             let decoded = KeyedArchive::expand(&base64_decode(&item.wrappedkey))?;
