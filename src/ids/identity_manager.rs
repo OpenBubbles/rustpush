@@ -346,6 +346,7 @@ impl KeyCache {
 }
 
 pub struct IdentityResource {
+    // Always lock the cache first, then the user list, then APS state. Do not take the cache lock while either of the other two is held.
     pub cache: DebugMutex<KeyCache>,
     pub users: DebugRwLock<Vec<IDSUser>>,
     pub identity: IDSNGMIdentity,
@@ -382,7 +383,6 @@ impl Resource for IdentityResource {
         debug!("Register success!");
         // drop, not downgrade, to process any readers holding cache lock right now
         drop(users_lock);
-
 
         let mut cache_lock = self.cache.lock().await;
         cache_lock.verity(&self.aps, &self.users.read().await, self.services).await;
@@ -454,13 +454,20 @@ impl IdentityResource {
     }
 
     pub async fn get_possible_handles(&self) -> Result<HashSet<String>, PushError> {
-        let users_locked = self.users.read().await;
-        let state = self.aps.state.read().await;
-        let mut possible_handles = HashSet::new();
-        for user in &*users_locked {
-            let data = user.get_handle_data(&*state).await?;
+        // The cache lock must be taken before the user list lock, so finish this fetch and release both locks before updating the cache.
+        let fetched = {
+            let users_locked = self.users.read().await;
+            let state = self.aps.state.read().await;
+            let mut fetched = Vec::new();
+            for user in &*users_locked {
+                fetched.push(user.get_handle_data(&*state).await?);
+            }
+            fetched
+        };
 
-            let mut cache_lock = self.cache.lock().await;
+        let mut possible_handles = HashSet::new();
+        let mut cache_lock = self.cache.lock().await;
+        for data in fetched {
             for handle in data {
                 for (alias, attributes) in handle.aliases {
                     for (service, _) in attributes.allowed_services {
@@ -530,12 +537,11 @@ impl IdentityResource {
         users.iter().find(|user| user.registration["com.apple.madrid"].handles.contains(&handle.to_string())).ok_or(PushError::HandleNotFound(handle.to_string()))
     }
 
-    pub async fn user_by_handle<'t>(&self, service: &str, users: &'t Vec<IDSUser>, mut handle: &str) -> Result<&'t IDSUser, PushError> {
-        let cache_lock = self.cache.lock().await;
-        if let Some(real) = cache_lock.cache.get(service).and_then(|service| service.get(handle)).and_then(|s| s.real_handle.as_ref()) {
-            handle = real.as_str();
-        }
-        Self::user_by_real_handle(users, handle)
+    fn resolve_real_handle(cache: &HashMap<String, HashMap<String, CachedHandle>>, topic: &str, handle: &str) -> String {
+        cache.get(topic)
+            .and_then(|service| service.get(handle))
+            .and_then(|cached| cached.real_handle.clone())
+            .unwrap_or_else(|| handle.to_string())
     }
 
     pub async fn register_pseudonym(&self, services: &[&str], handle: &str, pseud: &str, exp: f64) {
@@ -660,6 +666,7 @@ impl IdentityResource {
         Ok(response)
     }
 
+    // The caller already holds the cache lock, so the user list and APS state locks taken here come after it.
     pub async fn ensure_private_self(&self, cache_lock: &mut KeyCache, handle: &str, refresh: bool) -> Result<(), PushError> {
         let my_cache = cache_lock.cache.get_mut("com.apple.madrid").unwrap().get_mut(handle).unwrap();
         if my_cache.private_data.len() != 0 && !refresh {
@@ -684,6 +691,7 @@ impl IdentityResource {
     }
 
     pub async fn get_sms_targets(&self, handle: &str, refresh: bool) -> Result<Vec<PrivateDeviceInfo>, PushError> {
+        // Takes the cache lock first. ensure_private_self then takes the user list and APS state locks while it is held.
         let mut cache_lock = self.cache.lock().await;
         self.ensure_private_self(&mut cache_lock, handle, refresh).await?;
         let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
@@ -697,6 +705,7 @@ impl IdentityResource {
     }
 
     pub async fn token_to_uuid(&self, handle: &str, token: &[u8]) -> Result<String, PushError> {
+        // Takes the cache lock first. ensure_private_self then takes the user list and APS state locks while it is held.
         let mut cache_lock = self.cache.lock().await;
         let private_self = &cache_lock.cache["com.apple.madrid"].get(handle).unwrap().private_data;
         if let Some(found) = private_self.iter().find(|i| i.token == token) {
@@ -726,8 +735,13 @@ impl IdentityResource {
        drop(key_cache);
        for chunk in fetch.chunks(18) {
            debug!("Fetching keys for chunk {:?}", chunk);
+           // Copy the real handle out so the cache lock is released before the user list lock is taken.
+           let real_handle = {
+               let cache_lock = self.cache.lock().await;
+               Self::resolve_real_handle(&cache_lock.cache, topic, handle)
+           };
            let users = self.users.read().await;
-           let results = match self.user_by_handle(topic, &users, handle).await?.query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
+           let results = match Self::user_by_real_handle(&users, &real_handle)?.query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
                    if let PushError::LookupFailed(IDSError(6005)) = err {
@@ -739,6 +753,8 @@ impl IdentityResource {
                    return Err(err)
                }
            };
+           drop(users);
+           // Release the user list lock before taking the cache lock again. The cache lock has to come first.
            debug!("Got keys for {:?}", chunk);
 
            let mut key_cache = self.cache.lock().await;
@@ -1256,5 +1272,42 @@ impl InnerSendJob {
         }
         info!("Sending done! {}", encode_hex(&uuid));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cached_handle(real_handle: Option<&str>) -> CachedHandle {
+        CachedHandle {
+            keys: HashMap::new(),
+            env_hash: [0; 20],
+            private_data: Vec::new(),
+            real_handle: real_handle.map(str::to_string),
+            expiry: None,
+        }
+    }
+
+    #[test]
+    fn resolve_real_handle_follows_pseudonym() {
+        let mut service = HashMap::new();
+        service.insert("alias".to_string(), cached_handle(Some("real@example.com")));
+        let mut cache = HashMap::new();
+        cache.insert("com.apple.madrid".to_string(), service);
+
+        assert_eq!(
+            IdentityResource::resolve_real_handle(&cache, "com.apple.madrid", "alias"),
+            "real@example.com"
+        );
+    }
+
+    #[test]
+    fn resolve_real_handle_keeps_unmapped_handle() {
+        let cache = HashMap::new();
+        assert_eq!(
+            IdentityResource::resolve_real_handle(&cache, "com.apple.madrid", "tel:+15555550100"),
+            "tel:+15555550100"
+        );
     }
 }

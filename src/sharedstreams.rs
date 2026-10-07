@@ -222,9 +222,8 @@ pub struct SharedStreamClient<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> SharedStreamClient<P> {
-    async fn get_headers(&self) -> Result<HeaderMap, PushError> {
-        let state_lock = self.state.read().await;
-
+    // dsid comes from the caller. This function waits on the network, so it must not take the state lock.
+    async fn get_headers(&self, dsid: &str) -> Result<HeaderMap, PushError> {
         let mme_token = self.token_provider.get_mme_token("mmeAuthToken").await?;
 
         let mut map = HeaderMap::new();
@@ -235,9 +234,7 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
         map.insert("x-apple-i-device-type", "1".parse().unwrap());
         map.insert("Accept", "*/*".parse().unwrap());
         map.insert("X-Apple-I-Locale", "en_US".parse().unwrap());
-        map.insert("Authorization", format!("X-MobileMe-AuthToken {}", base64_encode(format!("{}:{}", state_lock.dsid, mme_token).as_bytes())).parse().unwrap());
-        
-        drop(state_lock);
+        map.insert("Authorization", format!("X-MobileMe-AuthToken {}", base64_encode(format!("{}:{}", dsid, mme_token).as_bytes())).parse().unwrap());
 
         let mut base_headers = self.anisette.lock().await.get_headers().await?.clone();
 
@@ -249,12 +246,15 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
     }
 
     pub async fn get_album<T: DeserializeOwned>(&self, album: &str, url: &str, enter: impl Serialize) -> Result<T, PushError> {
-        let state = self.state.read().await;
-        let location = state.albums.iter().find(|a| a.albumguid == album).unwrap().albumlocation.clone().expect("Not a confirmed location?");
-        drop(state);
+        // Copy the location and dsid so this read lock is released before get_headers and the HTTP request.
+        let (location, dsid) = {
+            let state = self.state.read().await;
+            let location = state.albums.iter().find(|a| a.albumguid == album).unwrap().albumlocation.clone().expect("Not a confirmed location?");
+            (location, state.dsid.clone())
+        };
 
         let resp = REQWEST.post(format!("{}{}", location, url))
-            .headers(self.get_headers().await?)
+            .headers(self.get_headers(&dsid).await?)
             .header("Content-Type", "text/plist")
             .body(plist_to_string(&enter)?)
             .send().await?;
@@ -269,14 +269,16 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
     }
 
     pub async fn request_me(&self, url: &str, enter: impl Serialize) -> Result<Vec<u8>, PushError> {
-        let state_lock = self.state.read().await;
-        let resp = REQWEST.post(format!("{}/{}/sharedstreams/{}", state_lock.host, state_lock.dsid, url))
-            .headers(self.get_headers().await?)
+        // Clone the host and dsid so this read lock is released before get_headers and the HTTP request.
+        let (host, dsid) = {
+            let state_lock = self.state.read().await;
+            (state_lock.host.clone(), state_lock.dsid.clone())
+        };
+        let resp = REQWEST.post(format!("{}/{}/sharedstreams/{}", host, dsid, url))
+            .headers(self.get_headers(&dsid).await?)
             .header("Content-Type", "text/plist")
             .body(plist_to_string(&enter)?)
             .send().await?;
-
-        drop(state_lock);
 
         let mut state_lock = self.state.write().await;
         if let Some(host) = resp.headers().get("X-Apple-MME-Host") {
