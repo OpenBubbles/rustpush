@@ -268,6 +268,8 @@ pub struct CuttlefishTlkShare {
     epoch: i64,
     version: i64,
     signature: String,
+    #[cloudkit(rename = "tlkOwnershipProof")]
+    tlk_ownership_proof: Option<Vec<u8>>,
 }
 
 impl CuttlefishTlkShare {
@@ -280,8 +282,33 @@ impl CuttlefishTlkShare {
             &self.curve.to_le_bytes()[..],
             &self.epoch.to_le_bytes()[..],
             &self.poisoned.to_le_bytes()[..],
-        ].concat()
+        ]
+        .concat()
     }
+}
+
+fn verify_signature_with_optional_proof(
+    key: &EcKey<Public>,
+    dig: MessageDigest,
+    data: &[u8],
+    proof: Option<&[u8]>,
+    sig: &[u8],
+) -> Result<bool, PushError> {
+    let pkey = PKey::from_ec_key(key.clone())?;
+    let verify = |data: &[u8]| -> Result<bool, PushError> {
+        let mut verifier = Verifier::new(dig, &pkey)?;
+        verifier.update(data)?;
+        Ok(verifier.verify(sig)?)
+    };
+
+    if verify(data)? {
+        return Ok(true);
+    }
+    if let Some(proof) = proof {
+        let data_with_proof = [data, proof].concat();
+        return verify(&data_with_proof);
+    }
+    Ok(false)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -709,11 +736,23 @@ impl EncodedPeer {
     }
 
     fn verify_signature_dig(&self, dig: MessageDigest, data: &[u8], sig: &[u8]) -> Result<(), PushError> {
-        let key = PKey::from_ec_key(self.get_signing_key()?)?;
-        
-        let mut verifier = Verifier::new(dig, &key)?;
-        verifier.update(data)?;
-        if !verifier.verify(sig)? {
+        self.verify_signature_dig_with_optional_proof(dig, data, None, sig)
+    }
+
+    fn verify_signature_dig_with_optional_proof(
+        &self,
+        dig: MessageDigest,
+        data: &[u8],
+        proof: Option<&[u8]>,
+        sig: &[u8],
+    ) -> Result<(), PushError> {
+        if !verify_signature_with_optional_proof(
+            &self.get_signing_key()?,
+            dig,
+            data,
+            proof,
+            sig,
+        )? {
             warn!("Signature verification failed");
             return Err(PushError::BadMsg)
         }
@@ -1807,7 +1846,12 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 warn!("missing sender {} in state! {:?}", item.sender, state.state.keys().collect::<Vec<_>>());
                 continue
             };
-            sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
+            sending_peer.verify_signature_dig_with_optional_proof(
+                MessageDigest::sha256(),
+                &item.data_for_signing(),
+                item.tlk_ownership_proof.as_deref(),
+                &base64_decode(&item.signature),
+            )?;
 
 
             let decoded = KeyedArchive::expand(&base64_decode(&item.wrappedkey))?;
@@ -2345,5 +2389,74 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         let dec = decrypt(Cipher::aes_128_cbc(), &derived_key, Some(&payloads[1][..16]), &payloads[3])?;
 
         Ok(dec)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::verify_signature_with_optional_proof;
+    use openssl::{
+        ec::{EcGroup, EcKey},
+        hash::MessageDigest,
+        nid::Nid,
+        pkey::{PKey, Private},
+        sign::Signer,
+    };
+
+    fn sign(key: &EcKey<Private>, data: &[u8]) -> Vec<u8> {
+        let pkey = PKey::from_ec_key(key.clone()).unwrap();
+        let mut signer = Signer::new(MessageDigest::sha256(), &pkey).unwrap();
+        signer.update(data).unwrap();
+        signer.sign_to_vec().unwrap()
+    }
+
+    #[test]
+    fn verifies_tlk_share_with_or_without_ownership_proof() {
+        let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
+        let private_key = EcKey::generate(&group).unwrap();
+        let public_key = EcKey::from_public_key(&group, private_key.public_key()).unwrap();
+        let data = b"tlk share signing data";
+        let proof = [0x42; 32];
+
+        let proofless_signature = sign(&private_key, data);
+        assert!(verify_signature_with_optional_proof(
+            &public_key,
+            MessageDigest::sha256(),
+            data,
+            Some(&proof),
+            &proofless_signature,
+        )
+        .unwrap());
+
+        let data_with_proof = [data.as_slice(), &proof].concat();
+        let proof_signature = sign(&private_key, &data_with_proof);
+        assert!(verify_signature_with_optional_proof(
+            &public_key,
+            MessageDigest::sha256(),
+            data,
+            Some(&proof),
+            &proof_signature,
+        )
+        .unwrap());
+        assert!(!verify_signature_with_optional_proof(
+            &public_key,
+            MessageDigest::sha256(),
+            data,
+            None,
+            &proof_signature,
+        )
+        .unwrap());
+
+        let mut invalid_signature = proof_signature;
+        invalid_signature[0] ^= 1;
+        assert!(!verify_signature_with_optional_proof(
+            &public_key,
+            MessageDigest::sha256(),
+            data,
+            Some(&proof),
+            &invalid_signature,
+        )
+        .unwrap());
     }
 }
