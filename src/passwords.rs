@@ -55,6 +55,7 @@ pub struct PasswordManager<P: AnisetteProvider> {
     pub conn: APSConnection,
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
+    // Always lock this PasswordManager state first, then the CloudKit container keys, then Keychain state.
     pub state: DebugRwLock<PasswordState>,
     update_state: Box<dyn Fn(&PasswordState) + Send + Sync>,
     notif_watcher: CloudKitNotifWatcher,
@@ -1293,6 +1294,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     }
 
     async fn sync_zones(&self, container: &CloudKitOpenContainer<'_, P>, zones_to_fetch: &[RecordZoneIdentifier]) -> Result<(), PushError> {
+        // This holds PasswordManager state while the CloudKit work may take the container keys lock and then the Keychain state lock.
         let mut groups = self.state.write().await;
         
         let zone_records = FetchRecordChangesOperation::do_sync(&container, &zones_to_fetch.iter().map(|identifier| {

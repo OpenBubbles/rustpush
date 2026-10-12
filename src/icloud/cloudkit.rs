@@ -1373,6 +1373,7 @@ pub struct CloudKitOpenContainer<'t, T: AnisetteProvider> {
     container: &'t CloudKitContainer<'t>,
     pub user_id: String,
     pub client: Arc<CloudKitClient<T>>,
+    // Always lock PasswordManager state first, then these CloudKit container keys, then Keychain state.
     pub keys: DebugMutex<HashMap<String, PCSZoneConfig>>,
     pub database_type: cloudkit_proto::request_operation::header::Database,
 }
@@ -1438,6 +1439,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
     }
 
     pub async fn get_zone_encryption_config_sev(&self, zone_ids: &[(cloudkit_proto::RecordZoneIdentifier, Option<ShareInfo>)], client: &KeychainClient<T>, pcs_service: &PCSService<'_>, sync_keychain: bool) -> Result<Vec<Result<PCSZoneConfig, PushError>>, PushError> {
+        // This holds the container keys lock while sync_keychain may take the Keychain state lock. The PasswordManager state lock, when held by the caller, comes before both.
         let mut cached_keys = self.keys.lock().await;
         let mut get_needed = zone_ids.iter().filter(|(zone_id, share)| {
             let zone_name = zone_id.value.as_ref().unwrap().name().to_string();
