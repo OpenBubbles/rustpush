@@ -1040,17 +1040,23 @@ pub struct KeychainClientState {
 
 impl KeychainClientState {
     pub fn new(dsid: String, adsid: String, delegate: &MobileMeDelegateResponse) -> Option<KeychainClientState> {
-        Some(KeychainClientState {
+        let host = delegate.config.get("com.apple.Dataclass.KeychainSync")?.as_dictionary().unwrap().get("escrowProxyUrl")?.as_string().unwrap().to_string();
+        
+        Some(Self::new_with_host(dsid, adsid, host))
+    }
+
+    pub fn new_with_host(dsid: String, adsid: String, host: String) -> KeychainClientState {
+        KeychainClientState {
             dsid,
             adsid,
-            host: delegate.config.get("com.apple.Dataclass.KeychainSync")?.as_dictionary().unwrap().get("escrowProxyUrl")?.as_string().unwrap().to_string(),
+            host,
             state_token: None,
             state: HashMap::new(),
             user_identity: None,
             current_bottle: None,
             keystore: KeychainKeyStore(vec![]),
             items: HashMap::new(),
-        })
+        }
     }
 
     // filter out custodian recovery keys
