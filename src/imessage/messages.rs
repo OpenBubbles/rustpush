@@ -377,7 +377,7 @@ impl MessageParts {
     fn parse_sms(raw: &RawSmsIncomingMessage) -> MessageParts {
         fn parse_data(idx: usize, corresponding: &RawSmsIncomingMessageData) -> IndexedMessagePart {
             let typ = if corresponding.mime_type == "text/plain" {
-                MessagePart::Text(String::from_utf8(corresponding.data.clone().into()).unwrap(), Default::default())
+                MessagePart::Text(String::from_utf8_lossy(corresponding.data.as_ref()).into_owned(), Default::default())
             } else {
                 MessagePart::Attachment(Attachment {
                     a_type: AttachmentType::Inline(corresponding.data.clone().into()),
@@ -396,18 +396,21 @@ impl MessageParts {
         }
 
         if raw.format.starts_with("s:") {
-            MessageParts(raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
+            let ordered: Option<Vec<_>> = raw.format.split("|").skip(1).enumerate().map(|(idx, part)| {
                 let corresponding = if part.starts_with("(null)") {
-                    raw.content.iter().find(|i| i.content_id.is_none()).unwrap()
+                    raw.content.iter().find(|i| i.content_id.is_none())
                 } else {
                     let filename = part.split("(").next().unwrap().to_lowercase();
-                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.to_lowercase()).as_ref() == Some(&filename)).unwrap()
+                    raw.content.iter().find(|i| i.content_location.as_ref().map(|i| i.to_lowercase()).as_ref() == Some(&filename))
                 };
-                parse_data(idx, corresponding)
-            }).collect())
-        } else {
-            MessageParts(raw.content.iter().enumerate().map(|(idx, part)| parse_data(idx, part)).collect())
+                corresponding.map(|c| parse_data(idx, c))
+            }).collect();
+            if let Some(parts) = ordered {
+                return MessageParts(parts)
+            }
         }
+        // fh didn't match k, fall back to k order
+        MessageParts(raw.content.iter().enumerate().map(|(idx, part)| parse_data(idx, part)).collect())
     }
 
     // parse XML parts
@@ -2945,5 +2948,67 @@ impl MessageInst {
 impl fmt::Display for MessageInst {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{}] '{}'", self.sender.clone().unwrap_or("unknown".to_string()), self.message)
+    }
+}
+
+#[cfg(test)]
+mod sms_incoming_tests {
+    use super::*;
+
+    const TEXT: &str = "קוד האימות שלך הוא 482913";
+
+    fn text_part(content_id: Option<&str>, location: Option<&str>) -> Value {
+        let mut part = Dictionary::from_iter([
+            ("type", Value::String("text/plain".to_string())),
+            ("data", Value::Data(TEXT.as_bytes().to_vec())),
+        ]);
+        if let Some(id) = content_id { part.insert("content-id".to_string(), Value::String(id.to_string())); }
+        if let Some(loc) = location { part.insert("content-location".to_string(), Value::String(loc.to_string())); }
+        Value::Dictionary(part)
+    }
+
+    fn full_payload(sender: &str) -> Dictionary {
+        Dictionary::from_iter([
+            ("re", Value::Array(vec![])),
+            ("h", Value::String(sender.to_string())),
+            ("fco", Value::Integer(1.into())),
+            ("co", Value::String("+972501234567".to_string())),
+            ("w", Value::Date(SystemTime::now().into())),
+            ("fh", Value::String("s:|(null)(0)".to_string())),
+            ("cs", Value::String("8C3F9A41-1D7E-4F7B-9E0A-2C6B1A7D5E33".to_string())),
+            ("r", Value::Boolean(true)),
+            ("k", Value::Array(vec![text_part(None, Some("text_0000.txt"))])),
+            ("_ssc", Value::Integer(0.into())),
+            ("l", Value::Integer(0.into())),
+            ("sV", Value::String("1".to_string())),
+            ("_sc", Value::Integer(0.into())),
+            ("m", Value::String("sms".to_string())),
+            ("ic", Value::Integer(1.into())),
+            ("g", Value::String("5B1C4E0A-3F9D-4C2B-8E7A-1D6F0B9C2A44".to_string())),
+        ])
+    }
+
+    #[test]
+    fn full_payload_parses() {
+        let raw: RawSmsIncomingMessage = plist::from_value(&Value::Dictionary(full_payload("Maccabi-OTP"))).unwrap();
+        assert_eq!(raw.sender, "Maccabi-OTP");
+        assert_eq!(MessageParts::parse_sms(&raw).raw_text(), TEXT);
+    }
+
+    #[test]
+    fn minimal_payload_parses() {
+        let minimal = full_payload("Google").into_iter().filter(|(k, _)| ["h", "k", "g", "w"].contains(&k.as_str())).collect();
+        let raw: RawSmsIncomingMessage = plist::from_value(&Value::Dictionary(minimal)).unwrap();
+        assert_eq!(raw.sender, "Google");
+        assert_eq!(MessageParts::parse_sms(&raw).raw_text(), TEXT);
+    }
+
+    #[test]
+    fn mismatched_format_keeps_text() {
+        let mut full = full_payload("Maccabi-OTP");
+        full.insert("fh".to_string(), Value::String("s:|nosuchfile.txt(0)".to_string()));
+        full.insert("k".to_string(), Value::Array(vec![text_part(Some("cid0"), Some("text_0000.txt"))]));
+        let raw: RawSmsIncomingMessage = plist::from_value(&Value::Dictionary(full)).unwrap();
+        assert_eq!(MessageParts::parse_sms(&raw).raw_text(), TEXT);
     }
 }

@@ -312,33 +312,37 @@ struct RawSmsIncomingMessageData {
 
 #[derive(Serialize, Deserialize)]
 struct RawSmsIncomingMessage {
-    #[serde(rename = "re")]
+    #[serde(rename = "re", default)]
     participants: Vec<String>, // empty for single sms chats
     #[serde(rename = "h")]
     sender: String,
+    #[serde(default)]
     fco: u32, // always seems to be 1
-    #[serde(rename = "co")]
+    #[serde(rename = "co", default)]
     recieved_number: String, // number that recieved the message
     #[serde(rename = "w")]
     recieved_date: plist::Date,
-    #[serde(rename = "fh")]
+    #[serde(rename = "fh", default)]
     format: String,
     #[serde(rename = "b")]
     mime_type: Option<String>,
-    #[serde(rename = "cs")]
+    #[serde(rename = "cs", default)]
     constant_uuid: String, // some uuid
+    #[serde(default)]
     r: bool, // always true
     #[serde(rename = "k")]
     content: Vec<RawSmsIncomingMessageData>,
-    #[serde(rename = "_ssc")]
+    #[serde(rename = "_ssc", default)]
     ssc: u32, // always 0
+    #[serde(default)]
     l: u32, //always 0,
-    #[serde(rename = "sV")]
+    #[serde(rename = "sV", default)]
     version: String,
     #[serde(rename = "_sc")]
     sc: Option<u32>, // always 0
-    #[serde(rename = "m")]
+    #[serde(rename = "m", default)]
     mode: String, // sms or mms
+    #[serde(default)]
     ic: u32, // always 1
     n: Option<String>, // always 310 (missing)
     #[serde(rename = "g")]
