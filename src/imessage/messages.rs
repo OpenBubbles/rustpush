@@ -2580,6 +2580,23 @@ impl MessageInst {
                 return wrapper.to_message(None, Message::MarkUnread);
             }
         }
+        // A forwarded SMS/RCS message was read on another of the account's devices.
+        // Apple sends command 147 on the SMS forwarding service with the read
+        // message's guid in "g" (plus the read time in "e", and "fR" on some).
+        // rustpush sends 147 (MessageReadOnDevice) but had no decoder for incoming
+        // ones, so the notice was dropped and the message stayed unread. Deliver it
+        // as a Read for message "g".
+        if wrapper.command == 147 {
+            #[derive(Deserialize)]
+            struct RawSmsReadOnDevice {
+                g: String,
+            }
+            if let Ok(loaded) = plist::from_value::<RawSmsReadOnDevice>(&value) {
+                let mut msg = wrapper.to_message(None, Message::Read)?;
+                msg.id = loaded.g.to_uppercase();
+                return Ok(msg);
+            }
+        }
         let shared_profile = if let Ok(loaded) = plist::from_value::<RawShareProfileMessage>(&value) {
             let shared_profile = ShareProfileMessage {
                 cloud_kit_decryption_record_key: loaded.cloud_kit_decryption_record_key.clone().into(),
