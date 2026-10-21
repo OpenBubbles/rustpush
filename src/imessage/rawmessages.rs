@@ -277,7 +277,10 @@ struct RawSmsOutgoingInnerMessage {
     #[serde(rename = "sV")]
     version: String, // always 1
     guid: String, // same as outside encryption
-    #[serde(rename = "replyToGuid")]
+    // Reflected RCS/SMS replies carry the replied-to message guid here. The wire
+    // name is "replyToGUID" (capital GUID) on RCS; the older "replyToGuid" is kept
+    // as an alias so both parse.
+    #[serde(rename = "replyToGUID", alias = "replyToGuid")]
     reply_to_guid: Option<String>,
     #[serde(rename = "plain-body")]
     plain_body: String,
@@ -342,7 +345,14 @@ struct RawSmsIncomingMessage {
     ic: u32, // always 1
     n: Option<String>, // always 310 (missing)
     #[serde(rename = "g")]
-    guid: String
+    guid: String,
+    // RCS replies: the replied-to message is referenced here. "thread-identifier"
+    // has the "r:<part>:<guid>" shape (same as iMessage); "thread-originator-guid"
+    // is the bare guid. Absent on non-reply texts.
+    #[serde(rename = "thread-identifier")]
+    thread_identifier: Option<String>,
+    #[serde(rename = "thread-originator-guid")]
+    thread_originator_guid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

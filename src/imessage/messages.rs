@@ -1876,6 +1876,21 @@ fn remove_prefix(participants: &[String]) -> Vec<String> {
         p.replace("mailto:", "").replace("tel:", "")).collect()
 }
 
+// Parse a reply/thread identifier of the form "r:<part...>:<guid>" into
+// (guid, part). iMessage and the RCS relay both use this shape (e.g.
+// "r:0:0:14:<guid>"); the guid is the segment containing a '-'. Returns
+// None if there is no guid-looking segment. Mirrors the inline iMessage parse
+// but never panics on malformed input.
+fn split_reply_thread(to: &str) -> Option<(String, String)> {
+    let mut parts: Vec<&str> = to.split(':').collect();
+    if parts.is_empty() { return None; }
+    parts.remove(0); // remove the leading "r"
+    let guididx = parts.iter().position(|p| p.contains('-'))?;
+    let guid = parts[guididx].to_string();
+    parts.remove(guididx);
+    Some((guid, parts.join(":")))
+}
+
 pub fn add_prefix(participants: &[String]) -> Vec<String> {
     participants.iter().map(|p| if p.contains("@") {
         format!("mailto:{}", p)
@@ -2353,6 +2368,9 @@ impl MessageInst {
                                 ic: 1,
                                 n: Some("310".to_string()),
                                 guid: self.id.clone(),
+                                thread_identifier: normal.reply_guid.as_ref().map(|g|
+                                    format!("r:{}:{}", normal.reply_part.as_deref().unwrap_or("0"), g)),
+                                thread_originator_guid: normal.reply_guid.clone(),
                             };
 
                             let payload = plist_to_bin(&raw).unwrap();
@@ -2785,6 +2803,16 @@ impl MessageInst {
             let system_recv: SystemTime = loaded.recieved_date.clone().into();
             let parts = MessageParts::parse_sms(&loaded);
             let normalized_sender = normalize_sms_handle(&loaded.sender);
+            // RCS reply: prefer thread-identifier (carries the part), fall back to
+            // the bare thread-originator-guid with part 0.
+            let (reply_guid, reply_part) = if let Some((g, p)) =
+                loaded.thread_identifier.as_deref().and_then(split_reply_thread) {
+                (Some(g), Some(p))
+            } else if let Some(g) = loaded.thread_originator_guid.clone() {
+                (Some(g), Some("0".to_string()))
+            } else {
+                (None, None)
+            };
             let mut msg = wrapper.to_message(
                 Some(ConversationData {
                     participants: if loaded.participants.len() > 0 {
@@ -2804,8 +2832,8 @@ impl MessageInst {
                 Message::Message(NormalMessage {
                     parts,
                     effect: None, // losers
-                    reply_guid: None, // losers
-                    reply_part: None, // losers
+                    reply_guid,
+                    reply_part,
                     service: MessageType::SMS { // shame
                         is_phone: false, // if we are recieving a incoming message (over apns), we must not be the phone
                         using_number: normalize_sms_handle(&loaded.recieved_number),
@@ -2828,6 +2856,9 @@ impl MessageInst {
             }, |xml| {
                 MessageParts::parse_parts(xml, None)
             });
+            // Reflected RCS reply sent from another of the account's devices: thread
+            // it off the replied-to message, part 0 (the payload carries only the guid).
+            let reply_to_guid = loaded.message.reply_to_guid.clone();
             return wrapper.to_message(Some(ConversationData {
                 participants: loaded.participants.iter().map(|p| format!("tel:{}", p.phone_number)).chain(std::iter::once(wrapper.sender.clone().unwrap())).collect(),
                 cv_name: None, // ha sms sux, can't believe these losers don't have an iPhone
@@ -2836,8 +2867,8 @@ impl MessageInst {
             }), Message::Message(NormalMessage {
                 parts,
                 effect: None, // losers
-                reply_guid: None, // losers
-                reply_part: None, // losers
+                reply_guid: reply_to_guid.clone(),
+                reply_part: reply_to_guid.map(|_| "0".to_string()),
                 service: MessageType::SMS { // shame
                     is_phone: false, // if we are recieving a outgoing message, we must not be the phone
                     using_number: wrapper.sender.clone().unwrap(),
