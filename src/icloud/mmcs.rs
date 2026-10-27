@@ -1111,7 +1111,6 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
             let mut cipher = CmacSiv::<Aes256>::new_from_slice(&result).unwrap();
             // first byte is 4 if initial key is 256 bit, 3 otherwise
             let data = cipher.decrypt::<&[&[u8]], &&[u8]>(&[&ford[1..17], &ford[..1]], &ford[17..]).unwrap();
-            println!("{}", encode_hex(&data));
 
             let chunks = FordChunk::decode(Cursor::new(&data))?;
             let item = chunks.item.expect("Ford chunks missing?");
@@ -1121,10 +1120,6 @@ pub async fn get_mmcs(config: &MMCSConfig, authorized: AuthorizedOperation, file
 
                 ford_keymap.insert(chunk.meta.as_ref().unwrap().checksum.clone(), (ford.key, ford.chunk_len));
             }
-
-            let mut total_hasher = Sha1::new();
-            total_hasher.update(&ford);
-            println!("{}", encode_hex(&total_hasher.finish()))
         }
     }
 
