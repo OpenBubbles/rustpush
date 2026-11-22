@@ -2223,7 +2223,7 @@ impl MessageInst {
 
                 let raw = RawReactMessage {
                     text: text,
-                    amrln: if react.to_part.is_none() { u64::MAX } else { react.to_text.len() as u64 },
+                    amrln: if react.to_part.is_none() { u64::MAX } else { (react.to_text.encode_utf16().count() as u64).max(1) },
                     amrlc: 0,
                     amt: react.reaction.get_cmd(),
                     participants: conversation.participants.clone(),
